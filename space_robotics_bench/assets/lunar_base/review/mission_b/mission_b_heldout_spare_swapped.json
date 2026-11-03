@@ -1,0 +1,172 @@
+{
+ "scenario": "heldout_spare_swapped",
+ "destination": "pdu_1",
+ "sim_time_s": 402.2,
+ "wall_time_s": 920.4,
+ "final": {
+  "scenario": "heldout_spare_swapped",
+  "destination": "pdu_1",
+  "oru_on": "pdu_1_shelf/shelf",
+  "crate_on": "depot_stand/slot_0",
+  "delivered": true,
+  "success": true
+ },
+ "phases": [
+  {
+   "t": 1.5,
+   "phase": "undock: check the destination shelf first",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_1",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 1.5,
+   "phase": "drive to pdu_1 inspection pose",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_1",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 40.0,
+   "phase": "inspect PDU_1 spares shelf",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_1",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 98.0,
+   "phase": "inspect the depot stand",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_1",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 100.5,
+   "phase": "manifest says STAND SLOT_0, but the spare ORU is on STAND SLOT_1",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_1",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 123.9,
+   "phase": "pick spare ORU from STAND SLOT_1",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_1",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 165.7,
+   "phase": "carry",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 173.7,
+   "phase": "deliver the spare ORU to PDU_1",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 275.3,
+   "phase": "place spare ORU on PDU_1 SHELF",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 344.9,
+   "phase": "drive to pdu_1 inspection pose",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "pdu_1_shelf/shelf",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": true,
+    "success": false
+   }
+  },
+  {
+   "t": 359.9,
+   "phase": "verify delivery: ORU on the shelf",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "pdu_1_shelf/shelf",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": true,
+    "success": false
+   }
+  },
+  {
+   "t": 361.9,
+   "phase": "return to dock",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "pdu_1_shelf/shelf",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": true,
+    "success": false
+   }
+  },
+  {
+   "t": 400.2,
+   "phase": "mission complete",
+   "mission": {
+    "scenario": "heldout_spare_swapped",
+    "destination": "pdu_1",
+    "oru_on": "pdu_1_shelf/shelf",
+    "crate_on": "depot_stand/slot_0",
+    "delivered": true,
+    "success": true
+   }
+  }
+ ]
+}

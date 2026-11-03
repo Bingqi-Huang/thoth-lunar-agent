@@ -1,0 +1,498 @@
+"""HAL adapter that publishes ``ActionChunk`` on ROS.
+
+`ROSPublishingHAL` satisfies ``openral_hal.protocol.HAL`` but **does
+not drive motors directly**:
+
+* ``send_action`` serialises the ``openral_core.Action`` into
+  ``openral_msgs/ActionChunk`` and publishes on
+  ``/openral/candidate_action`` with RELIABLE / VOLATILE / KL=1 QoS.
+* ``read_state`` returns the latest ``JointState`` cached from a
+  ``/joint_states`` subscription on a host ``rclpy.lifecycle.LifecycleNode``.
+* ``connect`` / ``disconnect`` open / close that publisher + subscription
+  on the host node — the adapter holds no rclpy node of its own (composing
+  into the host's executor keeps QoS / lifecycle / shutdown in one place
+  per CLAUDE.md §6.1).
+
+Single change to the in-process hot path: ``DeployRunner._tick_impl`` still
+calls ``hal.send_action(action)`` — only the sink moves from motors to a
+ROS topic, behind which sits ``safety_node`` → ``<robot>_hal_node``.
+
+``trace_id`` is sourced from the active OTel context; ``rskill_id`` /
+``rskill_revision`` are set per goal by ``rskill_runner_node`` (an
+injected getter avoids tight-coupling).
+"""
+
+from __future__ import annotations
+
+import itertools
+import threading
+import time
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any
+
+import structlog
+from openral_core.exceptions import ROSConfigError, ROSEStopRequested, ROSRuntimeError
+from openral_core.schemas import Action, ControlMode, JointState, RobotDescription
+from openral_observability import propagation
+
+if TYPE_CHECKING:
+    from rclpy.lifecycle import LifecycleNode
+
+__all__ = ["ROSPublishingHAL"]
+
+log = structlog.get_logger(__name__)
+
+# How often the action-applied wait re-reads ``safety_abort_getter`` while
+# blocked. The wait is also woken by every ``/openral/action_applied``
+# message, but a latched safety stop produces silence — nothing to wake on —
+# so the poll is what bounds how long a safety abort stays invisible.
+_SAFETY_ABORT_POLL_S = 0.05
+
+
+def _row_major_flatten(rows: list[list[float]] | None) -> list[float]:
+    """Flatten a (H, N) action chunk into a row-major flat array.
+
+    Returns an empty list when ``rows`` is ``None`` (the action carries no
+    target in this control mode); callers gate on the per-control-mode
+    field selection.
+    """
+    if not rows:
+        return []
+    return list(itertools.chain.from_iterable(rows))
+
+
+def _flatten_rows(rows: list[list[float]] | None, horizon: int) -> tuple[list[float], int, int]:
+    """Flatten ``list[list[float]]`` rows + return ``(flat, n_dof, horizon)``.
+
+    Slot-dispatch helper for ROSPublishingHAL._action_to_chunk dispatch on
+    joint-mode payloads. Raises ``ROSConfigError`` when the
+    payload is empty (a joint action with no target is a programming
+    error — the slot dispatcher / legacy path always populates it).
+    """
+    if not rows:
+        raise ROSConfigError(
+            "ROSPublishingHAL: joint-mode Action has empty payload (rows is None or [])"
+        )
+    flat = _row_major_flatten(rows)
+    n_dof = len(rows[0]) if rows[0] else 0
+    return flat, n_dof, int(horizon or len(rows))
+
+
+def _flatten_tuple_rows(
+    rows: Sequence[tuple[float, ...]] | None, horizon: int, *, expected_n: int
+) -> tuple[list[float], int, int]:
+    """Flatten a sequence of fixed-width float tuples.
+
+    Slot-dispatch helper for cartesian / twist Action payloads. The slot
+    dispatcher upstream guarantees each row has exactly ``expected_n``
+    components; this check is a runtime guard against future drift.
+    """
+    if not rows:
+        raise ROSConfigError(
+            "ROSPublishingHAL: cartesian/twist Action has empty payload (rows is None or [])"
+        )
+    bad = [(i, len(r)) for i, r in enumerate(rows) if len(r) != expected_n]
+    if bad:
+        raise ROSConfigError(
+            f"ROSPublishingHAL: cartesian/twist rows must have width {expected_n}; "
+            f"got rows with widths {bad!r}"
+        )
+    flat: list[float] = []
+    for row in rows:
+        flat.extend(float(v) for v in row)
+    return flat, expected_n, int(horizon or len(rows))
+
+
+# Wire-format encoding for `ActionChunk.control_mode` is owned by
+# `openral_core.CONTROL_MODE_TO_UINT8` — single source of truth shared
+# with the panda_mobile lifecycle node's `_on_safe_action` decoder.
+from openral_core import CONTROL_MODE_TO_UINT8 as _CONTROL_MODE_TO_UINT8  # noqa: E402
+
+
+class ROSPublishingHAL:
+    """HAL adapter that publishes ``ActionChunk`` and caches ``/joint_states``.
+
+    Implements the structural ``openral_hal.protocol.HAL`` Protocol
+    without inheriting from it (the Protocol is ``runtime_checkable`` —
+    any class with the right shape passes).
+
+    Args:
+        node: The host ``rclpy.lifecycle.LifecycleNode`` that owns the
+            adapter's publisher / subscription. ``connect`` /
+            ``disconnect`` are no-ops outside this node's lifecycle.
+        description: The ``RobotDescription`` for the robot this
+            adapter represents. Surfaced via the ``HAL.description``
+            attribute consumed by `DeployRunner` for span attributes
+            and per-joint limit lookups.
+        skill_id_getter: Zero-arg callable returning the in-flight
+            skill id (filled into ``ActionChunk.rskill_id``). The
+            ``rskill_runner_node`` swaps this per goal.
+        skill_revision_getter: Zero-arg callable returning the
+            in-flight skill revision (filled into
+            ``ActionChunk.rskill_revision``).
+        joint_state_topic: Topic to subscribe for cached
+            ``read_state()``. Defaults to ``/joint_states``.
+        candidate_action_topic: Topic to publish ``ActionChunk`` on.
+            Defaults to ``/openral/candidate_action``.
+        safety_abort_getter: Zero-arg callable returning a short reason
+            string when the **owning node** already knows a safety stop is
+            latched, or ``None`` when it is not. The adapter opens no
+            safety subscription of its own — the owning node injects the
+            fact it already holds (``rskill_runner_node`` passes the newest
+            latched ``/openral/safety_status`` — ``drop_reason`` + ``detail``,
+            so the reason names the actual fault — OR-ed with its
+            ``/openral/estop`` latch), the same injection pattern as
+            ``skill_id_getter``. Without it, a latched safety stop is
+            indistinguishable from a dead HAL: both stop
+            ``/openral/action_applied``, and the adapter reports only the
+            apply-timeout (CLAUDE.md §1.4). Must be non-blocking — it is
+            called while the adapter's applied-condition lock is held.
+    """
+
+    description: RobotDescription
+
+    def __init__(
+        self,
+        *,
+        node: LifecycleNode,
+        description: RobotDescription,
+        skill_id_getter: Callable[[], str] = lambda: "",
+        skill_revision_getter: Callable[[], str] = lambda: "",
+        tick_index_getter: Callable[[], int] = lambda: 0,
+        joint_state_topic: str = "/joint_states",
+        candidate_action_topic: str = "/openral/candidate_action",
+        action_applied_topic: str = "/openral/action_applied",
+        safety_abort_getter: Callable[[], str | None] = lambda: None,
+        action_applied_timeout_s: float = 5.0,
+    ) -> None:
+        """Store references; opens no ROS resources until ``connect``."""
+        self._node = node
+        self.description = description
+        self._skill_id_getter = skill_id_getter
+        self._skill_revision_getter = skill_revision_getter
+        # Stamps every emitted ActionChunk with the current 1-based
+        # inference-tick index so a recorder can group a tick's slot chunks.
+        self._tick_index_getter = tick_index_getter
+        self._joint_state_topic = joint_state_topic
+        self._candidate_action_topic = candidate_action_topic
+        self._action_applied_topic = action_applied_topic
+        self._safety_abort_getter = safety_abort_getter
+        if action_applied_timeout_s <= 0.0:
+            raise ROSConfigError("ROSPublishingHAL: action_applied_timeout_s must be positive")
+        self._action_applied_timeout_s = action_applied_timeout_s
+        self._publisher: Any = None
+        self._subscription: Any = None
+        self._applied_subscription: Any = None
+        self._applied_condition = threading.Condition()
+        self._last_applied_tick: int = 0
+        self._published_group_tick: int | None = None
+        self._published_group_count: int = 0
+        # Cached JointState; populated on every /joint_states callback.
+        # ``read_state`` raises ROSRuntimeError if this is still ``None``
+        # when called (matches the HAL Protocol contract — connect-then-
+        # read sequence is enforced).
+        self._last_state: JointState | None = None
+        self._connected: bool = False
+
+    # ── HAL Protocol ─────────────────────────────────────────────────────────
+
+    def connect(self) -> None:
+        """Open the publisher on candidate_action + subscriber on joint_states."""
+        if self._connected:
+            return
+        from openral_msgs.msg import ActionChunk  # type: ignore[import-not-found,unused-ignore]
+        from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+        from sensor_msgs.msg import JointState as RosJointState
+        from std_msgs.msg import UInt64
+
+        # The slot dispatcher publishes N chunks per policy
+        # tick (arm CARTESIAN_DELTA + gripper GRIPPER_POSITION, etc.).
+        # KEEP_LAST=1 + back-to-back publishes => the kernel's subscriber
+        # buffer holds only the most recent and silently drops the
+        # earlier per-tick chunks. A four-slot mobile-manipulator tick plus
+        # predictive collision work can backlog beyond depth=10; depth=50
+        # holds 12 complete ticks while remaining bounded.
+        chunk_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            depth=50,
+        )
+        state_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            depth=5,
+        )
+        try:
+            self._publisher = self._node.create_publisher(
+                ActionChunk, self._candidate_action_topic, chunk_qos
+            )
+            self._subscription = self._node.create_subscription(
+                RosJointState,
+                self._joint_state_topic,
+                self._on_joint_state,
+                state_qos,
+            )
+            self._applied_subscription = self._node.create_subscription(
+                UInt64,
+                self._action_applied_topic,
+                self._on_action_applied,
+                chunk_qos,
+            )
+        except Exception as exc:  # reason: surface as typed error
+            raise ROSConfigError(f"ROSPublishingHAL.connect failed: {exc!r}") from exc
+        self._connected = True
+        log.info(
+            "ros_publishing_hal.connected",
+            candidate_action_topic=self._candidate_action_topic,
+            joint_state_topic=self._joint_state_topic,
+        )
+
+    def disconnect(self) -> None:
+        """Close the publisher + subscription. Idempotent."""
+        if not self._connected:
+            return
+        if self._subscription is not None:
+            self._node.destroy_subscription(self._subscription)
+            self._subscription = None
+        if self._applied_subscription is not None:
+            self._node.destroy_subscription(self._applied_subscription)
+            self._applied_subscription = None
+        if self._publisher is not None:
+            self._node.destroy_publisher(self._publisher)
+            self._publisher = None
+        self._connected = False
+
+    def read_state(self) -> JointState:
+        """Return the latest cached ``JointState`` from ``/joint_states``."""
+        if not self._connected:
+            raise ROSRuntimeError("ROSPublishingHAL.read_state called before connect")
+        if self._last_state is None:
+            raise ROSRuntimeError(
+                f"no /joint_states message received yet on {self._joint_state_topic!r}"
+            )
+        return self._last_state
+
+    def send_action(self, action: Action) -> None:
+        """Publish ``ActionChunk`` on ``/openral/candidate_action``.
+
+        Does NOT touch motors — the ``safety_node`` (F5) republishes the
+        chunk on ``/openral/safe_action``, which the per-robot HAL
+        lifecycle node consumes and forwards to the underlying
+        controller.
+        """
+        if not self._connected:
+            raise ROSRuntimeError("ROSPublishingHAL.send_action called before connect")
+        chunk = self._action_to_chunk(action)
+        self._publisher.publish(chunk)
+        chunk_message: Any = chunk
+        self._wait_for_group_applied(action, tick_index=int(chunk_message.tick_index))
+
+    def begin_goal(self) -> None:
+        """Reset goal-local partial-group state."""
+        self._published_group_tick = None
+        self._published_group_count = 0
+
+    def _wait_for_group_applied(self, action: Action, *, tick_index: int | None = None) -> None:
+        """Apply backpressure after publishing the last slot of an atomic tick.
+
+        Raises:
+            ROSEStopRequested: When ``safety_abort_getter`` reports a
+                latched safety stop while this wait is blocked. A latched
+                kernel drops the chunk instead of republishing it on
+                ``/openral/safe_action``, so ``/openral/action_applied``
+                simply goes silent — waiting out the full timeout and
+                reporting it as one would bury the safety stop behind a
+                generic apply-timeout (CLAUDE.md §1.4).
+            ROSRuntimeError: When the group is still unapplied at the
+                deadline and no safety stop is latched.
+
+        Note:
+            Grouped-dispatch wait only: ``tick_group_size <= 1`` returns
+            below without blocking, so a single-surface policy never reaches
+            this safety check. The ungrouped path's seam is polled by
+            ``rskill_runner_node`` via
+            ``RskillRunnerNode._safety_abort_reason`` before each tick;
+            don't add a check to the early return — this adapter stays a
+            sink, and a per-publish gate here would duplicate the kernel's
+            own decision.
+        """
+        group_size = int(action.tick_group_size)
+        if group_size <= 1:
+            return
+        tick = int(action.tick_index if tick_index is None else tick_index)
+        if tick <= 0:
+            raise ROSConfigError("ROSPublishingHAL: grouped action requires a positive tick_index")
+        if self._published_group_tick is None:
+            self._published_group_tick = tick
+        elif self._published_group_tick != tick:
+            raise ROSRuntimeError(
+                "ROSPublishingHAL: started tick "
+                f"{tick} before publishing all {group_size} slots for "
+                f"tick {self._published_group_tick}"
+            )
+        self._published_group_count += 1
+        if self._published_group_count < group_size:
+            return
+        if self._published_group_count > group_size:
+            raise ROSRuntimeError(
+                f"ROSPublishingHAL: tick {tick} published more than {group_size} slots"
+            )
+        self._published_group_tick = None
+        self._published_group_count = 0
+        deadline = time.monotonic() + self._action_applied_timeout_s
+        with self._applied_condition:
+            while self._last_applied_tick < tick:
+                safety_reason = self._safety_abort_getter()
+                if safety_reason:
+                    log.error(
+                        "ros_publishing_hal.safety_abort",
+                        tick=tick,
+                        reason=safety_reason,
+                        action_applied_topic=self._action_applied_topic,
+                    )
+                    raise ROSEStopRequested(
+                        f"ROSPublishingHAL: safety stop latched ({safety_reason}) while "
+                        f"waiting for action group tick {tick} to be applied"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise ROSRuntimeError(
+                        f"ROSPublishingHAL: action group tick {tick} was not applied within "
+                        f"{self._action_applied_timeout_s:g} s"
+                    )
+                self._applied_condition.wait(timeout=min(remaining, _SAFETY_ABORT_POLL_S))
+
+    def _on_action_applied(self, msg: Any) -> None:  # noqa: ANN401  # reason: ROS message untyped
+        tick = int(msg.data)
+        with self._applied_condition:
+            self._last_applied_tick = max(self._last_applied_tick, tick)
+            self._applied_condition.notify_all()
+
+    def estop(self) -> None:
+        """Trigger an emergency stop.
+
+        Per CLAUDE.md §10, this raises ``ROSEStopRequested`` so the
+        safety supervisor boundary can record + brake. The owning
+        lifecycle node also publishes ``std_msgs/Empty`` on
+        ``/openral/estop`` (see ``rskill_runner_node.estop``) — defense
+        in depth.
+        """
+        raise ROSEStopRequested("ROSPublishingHAL.estop()")
+
+    # ── Internals ───────────────────────────────────────────────────────────
+
+    def _on_joint_state(self, msg: object) -> None:
+        """Cache the latest ``sensor_msgs/JointState`` as a Pydantic snapshot."""
+        # Use ``getattr`` to stay decoupled from the rosidl class shape
+        # (which carries no py.typed marker).
+        name = list(getattr(msg, "name", []) or [])
+        position = list(getattr(msg, "position", []) or [])
+        velocity = list(getattr(msg, "velocity", []) or [])
+        effort = list(getattr(msg, "effort", []) or [])
+        self._last_state = JointState(
+            name=name,
+            position=position,
+            velocity=velocity,
+            effort=effort,
+            stamp_ns=time.time_ns(),
+        )
+
+    def _action_to_chunk(self, action: Action) -> object:
+        """Serialise the typed ``Action`` into ``openral_msgs/ActionChunk``.
+
+        The wire format is mode-agnostic (``flat`` +
+        ``n_dof`` + ``control_mode``); this dispatcher chooses the
+        per-mode source field on the Pydantic ``Action`` and
+        flattens it into the ActionChunk's ``flat`` array. The HAL
+        decodes the flat array per its ``control_mode`` (the
+        panda_mobile HAL already does this for JOINT_POSITION +
+        BODY_TWIST, CARTESIAN_DELTA, and GRIPPER_POSITION).
+
+        ``n_dof`` carries the per-row width — for cartesian / twist
+        modes that's 6, for gripper modes it's 1, for joint modes
+        it's the joint count.
+        """
+        from openral_msgs.msg import ActionChunk
+
+        flat, n_dof, horizon = self._flatten_action_payload(action)
+
+        chunk = ActionChunk()
+        # rosidl-generated message classes carry no py.typed marker, so
+        # the per-field assignments are duck-typed.
+        chunk.control_mode = _CONTROL_MODE_TO_UINT8[action.control_mode]
+        chunk.horizon = int(horizon)
+        chunk.flat = flat
+        chunk.n_dof = int(n_dof) & 0xFF
+        chunk.ee_name = action.ee_name or ""
+        chunk.frame_id = action.frame_id or ""
+        chunk.cartesian_delta_scale = list(action.cartesian_delta_scale or ())
+        chunk.confidence = float(action.confidence)
+        chunk.rskill_id = self._skill_id_getter()
+        chunk.rskill_revision = self._skill_revision_getter()
+        chunk.tick_index = int(self._tick_index_getter()) & 0xFFFFFFFF
+        chunk.tick_group_size = int(action.tick_group_size) & 0xFFFF
+        # ADR-0102 — empty list = "whole-vector action in description.joints
+        # order", the pre-0102 meaning that every single-slot skill still has.
+        chunk.joint_names = list(action.joint_names or ())
+        # trace_id is the join key. Source it from the
+        # active OTel span context via the existing W3C helper so the
+        # field stays in lock-step with the OTel parent.
+        chunk.trace_id = propagation.current_traceparent() or ""
+        return chunk
+
+    @staticmethod
+    def _flatten_action_payload(  # noqa: PLR0911  # reason: one early return per control-mode payload shape
+        action: Action,
+    ) -> tuple[list[float], int, int]:
+        """Dispatch on ``control_mode`` to extract (flat, n_dof, horizon).
+
+        Centralises the per-mode shape rules so the test
+        surface lives next to the serialiser. Raises
+        ``ROSConfigError`` for modes without a defined
+        serialisation (today: ``CARTESIAN_POSE`` carries a
+        ``Pose6D`` not a flat tuple — encode separately when the
+        first consumer needs it; ``FOOT_PLACEMENT`` /
+        ``DEX_HAND_JOINT`` deferred to humanoid work).
+        """
+        mode = action.control_mode
+        # ── Joint modes (matrix [H, N]) ────────────────────────────
+        if mode in (ControlMode.JOINT_POSITION, ControlMode.JOINT_TRAJECTORY):
+            return _flatten_rows(action.joint_targets, action.horizon)
+        if mode is ControlMode.JOINT_VELOCITY:
+            return _flatten_rows(action.joint_velocities, action.horizon)
+        if mode is ControlMode.JOINT_TORQUE:
+            return _flatten_rows(action.joint_torques, action.horizon)
+        # ── Cartesian delta / twist (list of 6-tuples) ─────────────
+        if mode is ControlMode.CARTESIAN_DELTA:
+            return _flatten_tuple_rows(action.cartesian_delta, action.horizon, expected_n=6)
+        if mode is ControlMode.CARTESIAN_TWIST:
+            return _flatten_tuple_rows(action.cartesian_twist, action.horizon, expected_n=6)
+        # ── Body twist (list of 6-tuples) ──────────────────────────
+        if mode is ControlMode.BODY_TWIST:
+            return _flatten_tuple_rows(action.body_twist, action.horizon, expected_n=6)
+        # ── Gripper (flat list of 1-D commands per horizon step) ───
+        if mode in (ControlMode.GRIPPER_BINARY, ControlMode.GRIPPER_POSITION):
+            gripper = list(action.gripper or [])
+            if not gripper:
+                raise ROSConfigError(
+                    f"ROSPublishingHAL: {mode.value} action has empty gripper payload"
+                )
+            horizon = action.horizon or len(gripper)
+            return [float(v) for v in gripper], 1, int(horizon)
+        # ── Sim-only composite mux flag, 1-D per step ──
+        if mode is ControlMode.COMPOSITE_MODE:
+            composite = list(action.composite_mode or [])
+            if not composite:
+                raise ROSConfigError(
+                    "ROSPublishingHAL: composite_mode action has empty composite_mode payload"
+                )
+            horizon = action.horizon or len(composite)
+            return [float(v) for v in composite], 1, int(horizon)
+        # ── Modes deliberately unsupported on the F1 wire ──────────
+        raise ROSConfigError(
+            f"ROSPublishingHAL does not serialise {action.control_mode!r} actions yet. "
+            "Supported: joint_position, joint_velocity, joint_torque, joint_trajectory, "
+            "cartesian_delta, cartesian_twist, body_twist, gripper_binary, "
+            "gripper_position, composite_mode. cartesian_pose / foot_placement / "
+            "dex_hand_joint are tracked but not yet wired to the typed wire format."
+        )

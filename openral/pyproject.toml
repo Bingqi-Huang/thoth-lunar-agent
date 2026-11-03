@@ -1,0 +1,398 @@
+[project]
+name = "openral-workspace"
+version = "0.3.1"
+description = "OpenRAL — open-source robot agent harness for VLA models"
+requires-python = ">=3.10,<3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "OpenRAL Contributors" }]
+dependencies = [
+    "matplotlib>=3.10.9",
+    "pillow>=12.2.0",
+    "qwen-vl-utils>=0.0.14", # reason: lerobot Robometer/TOPReward Qwen3-VL video processors run in-process in reward_monitor_node; needed by deploy sim/run.
+    # torchvision is otherwise purely transitive (lerobot / timm / open-clip),
+    # and `[tool.uv.sources]` only binds *direct* requirements — so without this
+    # line the aarch64 index pin below is a silent no-op and aarch64 keeps the
+    # PyPI torchvision, whose `_C.so` links libtorch_cpu only (`ops.nms` on a
+    # CUDA tensor then raises NotImplementedError). Marker-scoped so x86_64 /
+    # macOS / Windows resolution is byte-identical to before.
+    "torchvision; platform_machine == 'aarch64' and sys_platform == 'linux'",
+    # reason: `RobotDescription.motion_planning` includes a MoveIt config's move_group launch inside
+    # `deploy_e2e.launch.py`; moveit_configs_utils -> urdf_parser_py imports lxml, which the venv did
+    # not carry, so the whole deploy launch died with "No module named 'lxml'" (research repo F50).
+    "lxml>=5.0",
+]
+
+[tool.uv.workspace]
+members = ["python/*"]
+
+[tool.uv]
+# egl-probe is a transitive dep of robomimic→hf-libero→lerobot[libero].
+# It probes EGL at *build* time and fails on systems without EGL headers
+# during `uv sync`. The sim-* recipes set MUJOCO_GL=egl at *runtime* (which
+# uses libEGL.so directly, not egl-probe), so excluding the build-time probe
+# does not affect rendering.
+override-dependencies = [
+    "egl-probe; python_version == '3.99'",  # impossible marker → never installed
+    # torch pins `nvidia-cuda-nvrtc-cu12==12.8.93`, whose newest target is
+    # sm_120. GB10 / Jetson Thor are sm_121, so every kernel torch compiles at
+    # RUNTIME through the nvrtc jiterator dies with "invalid value for
+    # --gpu-architecture" — `torch.sum` is precompiled and fine, `torch.prod` is
+    # jitted and is not. Precompiled SASS is unaffected, so this stays hidden
+    # until an in-process policy happens to hit a jiterator op. 12.9.86 knows
+    # sm_121. Same fix the sidecars carry via `uv pip install --overrides`
+    # (tools/sidecar_requirements/aarch64-nvrtc-override.txt); `uv sync` has no
+    # `--overrides`, so it is expressed here instead.
+    # BOTH linux branches must be listed: an override replaces every requirement
+    # for the package it names, so an aarch64-only line would leave x86_64 with
+    # no nvrtc at all rather than falling back to torch's own pin. The `!=` line
+    # restates that pin exactly, so x86_64 resolution is unchanged.
+    "nvidia-cuda-nvrtc-cu12==12.9.86; platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "nvidia-cuda-nvrtc-cu12==12.8.93; platform_machine != 'aarch64' and sys_platform == 'linux'",
+    # `openral-hal` caps `torch<2.10`, which is correct on x86 — torchcodec
+    # ships per-torch-minor ABI builds (0.9.x <-> 2.9) and a floating torch
+    # there produces `undefined symbol` on every dataset-codec call. That
+    # coupling does not exist on aarch64: torchcodec's own marker is
+    # x86_64/AMD64-only, so it is never installed here.
+    #
+    # The cap has to go on aarch64 because of the cu130 move above. torch
+    # 2.9.1+cu130 does exist for aarch64 — but torchvision 0.24.1, its ABI
+    # partner, does **not**: that index carries aarch64 torchvision only from
+    # 0.27.0. torchvision is ABI-locked to a torch minor and does not float
+    # with it, so leaving it alone resolves 0.24.1 against a newer torch and
+    # every import dies on `operator torchvision::nms does not exist`. Move
+    # both or neither. 2.13/0.28 is the pair `openral-pro` already runs on a
+    # Jetson Thor. x86_64 keeps the validated torch/torchcodec pair untouched.
+    # BOTH branches, for the reason the nvrtc pair above states: an override
+    # replaces every requirement for the package it names, so aarch64-only
+    # lines would leave x86_64 with *no* torch constraint at all rather than
+    # falling back to openral-hal's cap. Verified the hard way — with only the
+    # aarch64 lines, `uv lock` collapsed every platform onto 2.13.0+cu130 while
+    # torchcodec stayed at 0.9.1, which is the `undefined symbol` pairing the
+    # cap exists to prevent.
+    #
+    # The x86_64 torchvision cap is `<0.25`, not `<0.26`, and the difference is
+    # the whole point. On master nothing constrained torchvision here: **its own
+    # metadata** did the work, because 0.25.0 declares `torch==2.10.*` and the
+    # `torch<2.10` cap made the resolver backtrack to 0.24.1 — the ABI partner
+    # of torch 2.9. Adding a `torch` override destroys that mechanism, because
+    # an override replaces every requirement for the package it names, including
+    # *torchvision's own* `torch==2.10.*`. torchvision 0.25.0 then happily
+    # resolves against torch 2.9.1 and every `import torchvision` dies with
+    # `operator torchvision::nms does not exist`. Caught by CI's full-suite lane
+    # (~30 collection errors) on the first push of this branch, exactly the
+    # failure the aarch64 comment above describes — the override just moved it
+    # to the other architecture.
+    #
+    # So on x86_64 these lines are not decoration restating a status quo: they
+    # are now the *only* thing holding the pair together, and they have to
+    # reproduce what torchvision's metadata used to enforce. Bump them together
+    # with the torch cap, never separately.
+    # The non-linux lines exist for the same reason, one level further out: an
+    # override set that names only linux markers leaves macOS / Windows with no
+    # requirement for torch **at all** — not the status quo, but the package
+    # dropped from the resolution entirely. Verified: with only the two linux
+    # pairs, `torch` and `torchvision` vanish from every darwin / win32 /
+    # emscripten resolution-marker in the lock, where master resolved 2.10.0 +
+    # 0.25.0. The bounds restate that pair exactly — pinned on both sides, not
+    # merely capped, because a one-sided cap lets uv merge the non-linux fork
+    # into the x86_64-linux one (2.9.1 + 0.24.1 satisfies both) and silently
+    # downgrade macOS as a side effect of a Jetson fix. Bounded rather than left
+    # open because, per the paragraph above, the torch override has already
+    # taken away torchvision's ability to enforce the pairing itself.
+    "torch>=2.13,<2.14; platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "torch<2.10; platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "torch>=2.10,<2.11; sys_platform != 'linux'",
+    "torchvision>=0.28,<0.29; platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "torchvision<0.25; platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "torchvision>=0.25,<0.26; sys_platform != 'linux'",
+]
+# torchcodec ships per-torch-minor builds (0.9.x ↔ torch 2.9, 0.10.x ↔
+# torch 2.10). The workspace resolves torch 2.9.1 on linux/x86_64, but an
+# unconstrained torchcodec resolves to 0.10.0 whose libtorchcodec_core*.so
+# link against torch 2.10's c10 ABI — every lerobot dataset codec call then
+# dies with ``undefined symbol: _ZN3c1013MessageLogger6streamB5cxx11Ev``
+# even with FFmpeg correctly installed (CI test-selective, python/dataset
+# round-trip tests). Marker mirrors the lockfile's torch==2.9.1 resolution
+# split so the platforms that resolve torch 2.10 keep the matching 0.10.
+# NOTE: this is a dev-workspace constraint only — it is NOT carried in wheel
+# metadata. The same ABI pairing is pinned for *published* installs in
+# python/hal/pyproject.toml (torch<2.10 + torchcodec<0.10, linux-scoped), so a
+# clean `pip install openral-cli` (no lockfile) does not float torch to 2.10.
+constraint-dependencies = [
+    "torchcodec<0.10; (platform_machine == 'x86_64' or platform_machine == 'AMD64') and sys_platform == 'linux'",
+]
+# RoboCasa pins robosuite>=1.5 while LIBERO (`lerobot[libero]`)
+# pins robosuite==1.4. The two extras groups cannot coexist in a single
+# resolved environment. Telling uv up-front lets `uv sync --group libero`
+# and `uv sync --group robocasa` each resolve cleanly and produces a
+# better error than the default solver-conflict message when both are
+# requested together.
+# PY310-HUMBLE PATCH: the libero/robocasa conflict pair is gone with the groups
+# themselves (see the note above [dependency-groups]).
+
+# PyPI's aarch64 torch wheel is CPU-only (the x86_64 one is CUDA-enabled), so a
+# plain `just sync` on an aarch64 GPU host (GB10 / DGX Spark, Jetson Thor,
+# GH200) leaves every *in-process* policy — SmolVLA, ACT, diffusion, pi05,
+# GR00T N1.7, MolmoAct2, the Robometer reward model — silently running on CPU.
+# download.pytorch.org's cu128 index does publish `manylinux_2_28_aarch64`
+# builds for torch 2.9.x and torchvision 0.24.x, so pin those two to it on
+# aarch64-linux only. `explicit = true` means the index is consulted *only* for
+# packages that name it below, so nothing else can drift onto it.
+#
+# This has to be an index pin rather than the `--torch-backend=cu128` the
+# sidecars use: that flag exists only on `uv pip`, not on `uv sync` / `uv lock`.
+#
+# cu130, not cu128. cu128 was chosen originally because it reuses the
+# `nvidia-*-cu12` runtime packages already in the x86_64 lock, and it is
+# sufficient on GB10 (sm_121), whose `sm_120` cubins run — verified there.
+# Jetson Thor breaks that: it is `sm_110`, a different Blackwell family, and
+# cu128 ships neither `sm_110` SASS nor a `compute_*` entry to JIT from, so
+# *every* CUDA op fails with "no kernel image is available for execution on the
+# device". No compiler shim helps, because nothing is compiled — the precompiled
+# kernels simply are not there. cu130 carries sm_110 and both parts work.
+# See docs/reference/aarch64-support.md.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu130", marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
+]
+# Only declare workspace sources for packages that actually exist under python/.
+# Future packages (re-add when directories land under python/):
+#   openral-dispatcher
+openral-core = { workspace = true }
+openral-hal = { workspace = true }
+openral-sensors = { workspace = true }
+openral-rskill = { workspace = true }
+openral-world-state = { workspace = true }
+openral-cli = { workspace = true }
+openral-detect = { workspace = true }
+openral-sim = { workspace = true }
+openral-observability = { workspace = true }
+openral-runner = { workspace = true } # reason: inference runner — InferenceRunner + SensorReader + clock
+openral-reasoner = { workspace = true } # reason: S2 reasoner — LLMClient + Reasoner Protocols + Plan/ToolCall schemas
+openral-wam = { workspace = true } # reason: CLAUDE.md §6.3 World Action Model layer — WorldModel Protocol + Rollout schema
+openral-dataset = { workspace = true } # reason: rosbag2 ↔ LeRobotDataset v3 bridge — RolloutRecorder + LeRobotDatasetSink + Rosbag2Sink + Rosbag2ToLeRobotConverter
+openral-state-adapter = { workspace = true } # reason: layout adapter registry — per-checkpoint state-vector assemblers
+
+# robosuite is pinned to the ARISE-Initiative master branch at commit
+# 5ce6643 (2026-08-06). RoboCasa 1.0.1 passes `load_model_on_init`,
+# which the previous 232ce7d pin did not accept.
+# Putting the pin here so the lockfile honestly reflects what we ship,
+# and so `uv sync --group robocasa` lands directly on the right tree
+# (no version mismatch to swap). See the explanatory comment on the
+# `robosuite` line in `[dependency-groups] robocasa = [...]` for the
+# mink/numpy resolution reasoning.
+#
+# Bumping the rev: pick the latest stable upstream master commit
+# (https://github.com/ARISE-Initiative/robosuite/commits/master) that
+# still has `mink` under `extras_require` (NOT in `install_requires`),
+# update this rev, the explanatory comment in
+# `[dependency-groups] robocasa = [...]`, AND `_ROBOSUITE_PIN` in
+# `python/sim/src/openral_sim/_deps.py` (the editable-clone steps pin to
+# the same SHA so they don't overwrite this `uv sync` install with
+# floating master — issue #44), regenerate the lockfile, and re-run
+# `just sim-audit robocasa_pnp` to confirm no regression.
+robosuite = { git = "https://github.com/ARISE-Initiative/robosuite.git", rev = "5ce6643f3092639d08f7b0f90ed1c6a84f50552c" }
+
+[dependency-groups]
+# PY310-HUMBLE PATCH: the following dependency groups were removed from this
+# fork: dataset, sim, libero, metaworld, maniskill3, simpler-env, robocasa,
+# gr00t, lowering.
+#
+# Every one of them resolves `lerobot` (directly, or through
+# `openral-dataset[lerobot]`), and lerobot declares `requires-python >= 3.12` in
+# every published version — so `uv lock` cannot produce a solution for any of
+# them on the ROS 2 Humble interpreter this fork targets. See the research
+# repo's docs/upstream_pins.md for the full reasoning.
+#
+# Nothing is lost for this project: they provide alternative simulators (LIBERO,
+# MetaWorld, ManiSkill3, SimplerEnv, RoboCasa), the rosbag2 <-> LeRobotDataset
+# imitation-learning bridge, and in-process VLA policies. This project runs on
+# Space Robotics Bench, records its own run artifacts, and reaches any learned
+# policy out-of-process. The sidecar groups (sidecar-wire, rldx, behavior-groot,
+# isaacsim, robotwin, rlbench, lingbot, locateanything, qwen-vlm) are untouched
+# and still resolve — they carry only pyzmq + msgpack on this side of the wire.
+dev = [
+    "pytest>=8,<10", # reason: test runner. Cap <10: stay within the validated major. The former <9 cap guarded against the pytest 9.0.3 collection regression (module-level pytest.importorskip / pytest.skip(allow_module_level=True) emitted "ERROR: found no collectors" and conflated SKIPPED entries under the first module, hiding skip reasons in tests/sim/); fixed by 9.1.x — the full suite incl. tests/unit/test_sim_collection.py passes on 9.1.1 (see PR #29's CI run).
+    "pytest-asyncio>=0.23", # reason: async test support
+    "pytest-cov>=5", # reason: coverage reports
+    "hypothesis>=6.100", # reason: schema fuzz testing
+    # PY310-HUMBLE PATCH: tomllib is stdlib only from Python 3.11; five test
+    # files (test_install_command.py, test_lockstep_versions.py, and three
+    # detector-adapter tests) do `import tomllib` unconditionally. tomli is the
+    # pre-3.11 backport with the same API; already resolves transitively via
+    # mypy's toml extra, declared explicitly so that stays true regardless.
+    "tomli>=2.0.1; python_version < '3.11'",
+    "ruff>=0.6", # reason: linting and formatting
+    "mypy>=1.11", # reason: strict type checking
+    "pyright>=1.1", # reason: secondary type checker
+    "pre-commit>=3.7", # reason: git hooks
+    "mkdocs-material>=9.5", # reason: documentation site
+    "mkdocstrings[python]>=0.25", # reason: API reference generation
+    "jsonschema>=4.23",
+    "lark>=1.3.1",
+    "catkin-pkg>=1.0", # reason: ament_cmake_core invokes the build-time interpreter (the workspace venv when `just ros2-build` is run) with `catkin_pkg.*` during configure. Provided by apt's python3-catkin-pkg on the *system* Python, but the venv interpreter can't see it — install into the venv so colcon resolves it through the same Python that runs the lifecycle nodes.
+    "empy<5", # reason: ament_cmake_core's template substitutions import the `em` module (provided by empy 3.x, NOT 4.x — 4.x renamed the module to `empy` and dropped `em`). Same rationale as `catkin-pkg`: needed by the configure step under the workspace venv.
+    "onnxscript>=0.1.0", # reason: required by torch.onnx new exporter (torch>=2.1), tested in test_runtime.py
+    "onnxruntime>=1.17", # reason: ONNXRuntime backend tested in tests/unit/test_runtime.py::TestONNXRuntime
+    "types-pyyaml>=6", # reason: type stubs for PyYAML (consumed by openral_core.schemas under mypy --strict)
+    "opentelemetry-exporter-otlp-proto-http>=1.27", # reason: integration test for `openral dashboard` ships a real OTLP/HTTP exporter against the embedded receiver
+    "mujoco>=3.8.0",
+    "robot-descriptions>=2.0.0",
+    "types-protobuf>=7.34.1.20260518",
+]
+clip = [
+    # Open-vocabulary object matching via OpenCLIP ViT-B/32 (MIT
+    # code + weights). Optional / compute-gated: SpatialMemory works on label +
+    # pose + recency without it. torch is already pulled by dev/sim.
+    "open-clip-torch>=2.24",
+]
+opencv = [
+    "opencv-python>=4.8",  # reason: optional OpenCV camera/detector tests; matches openral-runner[opencv]
+]
+sidecar-wire = [
+    # Shared node-side transport for externally provisioned sidecars. The model
+    # / simulator side runs in its own venv; OpenRAL only needs ZMQ framing here.
+    "pyzmq>=25",
+    "msgpack>=1",
+]
+rldx = [
+    # Opt-in RLDX-1 sidecar adapter. The RLDX-1 inference server
+    # (`tools/rldx_sidecar.py`) runs in its OWN Python 3.10 venv.
+    { include-group = "sidecar-wire" },
+]
+behavior-groot = [
+    # OpenRAL-side wire for the official BEHAVIOR-1K Isaac-GR00T runtime.
+    # The pinned wensi-ai/Isaac-GR00T behavior checkout + checkpoint stay in
+    # their own externally-provisioned Python 3.10 venv.
+    { include-group = "sidecar-wire" },
+]
+isaacsim = [
+    # Opt-in NVIDIA Isaac Sim scene backend.
+    #
+    # The Isaac Lab env (`tools/isaac_sidecar.py`) runs in its OWN Python 3.11
+    # venv that this group does NOT touch — Isaac Sim ships per-interpreter
+    # wheels (5.x→py3.11) and its Omniverse Kit components are proprietary /
+    # non-redistributable (CLAUDE.md §1.9), so they are externally provisioned.
+    { include-group = "sidecar-wire" },
+]
+robotwin = [
+    # Opt-in RoboTwin 2.0 SAPIEN dual-arm benchmark backend.
+    #
+    # Same shape as the `isaacsim` / `rldx` groups: the RoboTwin SAPIEN env
+    # (`tools/robotwin_sidecar.py`, wrapping LeRobot's `robotwin` env) runs in its
+    # OWN Python 3.10 venv that this group does NOT touch — RoboTwin pins
+    # SAPIEN + CuRobo + mplib + pytorch3d against Python 3.10 / CUDA 12.1,
+    # incompatible with this repo's Python 3.12, and ships multi-GB assets, so it is
+    # externally provisioned (CLAUDE.md §1.9), never pinned here.
+    { include-group = "sidecar-wire" },
+]
+rlbench = [
+    # Opt-in RLBench (CoppeliaSim/PyRep) benchmark backend + the
+    # 3D Diffuser Actor keyframe policy.
+    #
+    # Both the RLBench scene (`tools/rlbench_sidecar.py`) and the 3D Diffuser
+    # Actor policy (`tools/rlbench_3dda_sidecar.py`) run in their OWN Python 3.10
+    # venv that this group does NOT touch — CoppeliaSim is proprietary (free EDU),
+    # never redistributable (CLAUDE.md §1.9), and the released 3D policies pin the
+    # MohitShridhar/RLBench@peract fork + an Ada-compatible torch build. All of
+    # that is externally provisioned.
+    { include-group = "sidecar-wire" },
+]
+lingbot = [
+    # Opt-in Robbyant LingBot-VLA 2.0 dual-arm policy adapter.
+    #
+    # Same shape as the `rldx` / `robotwin` groups: the 6.38 B LingBot-VLA 2.0
+    # server (`tools/lingbot_vla2_sidecar.py`, wrapping the upstream `lingbotvla`
+    # package) runs in its OWN auto-provisioned Python 3.12 venv that this group
+    # does NOT touch — `lingbotvla` pins transformers==4.57.3 + custom Triton MoE
+    # kernels, incompatible with this repo's transformers>=5 (CLAUDE.md §3).
+    # (Its upstream torch==2.8.0 pin is overridden to 2.9.1 by the boot helper,
+    # which has no aarch64 wheel — docs/reference/aarch64-support.md.)
+    # Apache-2.0 code + weights.
+    { include-group = "sidecar-wire" },
+    "websockets>=15",
+]
+locateanything = [
+    # Opt-in LocateAnything-3B open-vocab VLM detector.
+    #
+    # The model itself runs in its OWN transformers==4.57.1 venv
+    # (`tools/locateanything_sidecar.py`, provisioned separately); what we
+    # install here is the detector-node-side sidecar transport.
+    { include-group = "sidecar-wire" },
+]
+qwen-vlm = [
+    # Opt-in Qwen3.5-4B scene VLM for the reasoner's query_scene tool.
+    #
+    # The model itself runs in its OWN sidecar venv
+    # (`tools/qwen_vlm_sidecar.py`, provisioned separately); what we install
+    # here is the node-side sidecar transport.
+    { include-group = "sidecar-wire" },
+]
+omdet = [
+    # Opt-in OmDet-Turbo in-process
+    # open-vocabulary detector (rskills/omdet-turbo-indoor, engine: zeroshot_hf).
+    #
+    # Unlike locateanything, OmDet-Turbo is a first-class transformers
+    # architecture (AutoModelForZeroShotObjectDetection), so it loads under the
+    # workspace's own transformers and runs IN PROCESS — no sidecar venv. The
+    # backend (openral_runner.backends.gstreamer.omdet_turbo_detector) lazily
+    # imports torch + transformers; this group provides them. Required by the
+    # `deploy sim --object-detector-manifest <…omdet-turbo-indoor…>` leg.
+    "transformers>=5.4.0,<5.6.0",  # reason: AutoModelForZeroShotObjectDetection (OmDet-Turbo). Pinned to match the sim / vla groups so a multi-group sync resolves to one transformers version.
+    "torch>=2.2",           # reason: OmDet-Turbo forward pass + .to(device); CUDA when available, CPU fallback for GPU-less hosts / deploy sim.
+    "pillow>=10.0",         # reason: BGR frame -> RGB PIL.Image for the processor.
+    "timm>=1.0",            # reason: OmDet-Turbo's Swin backbone loads via TimmBackbone under transformers 5.3; also used to rebuild the backbone at the processor's 640² input (the pretrained checkpoint is pinned to 224² — see _fit_timm_backbone_to_processor).
+]
+sam2 = [
+    # Opt-in SAM 2.1 in-process promptable segmenter
+    # (rskills/rskill-sam2_1-any-grasped_object_mask-bf16, engine: sam2_hf).
+    #
+    # Like OmDet-Turbo and unlike the LocateAnything sidecar, SAM 2.1 is a
+    # first-class transformers architecture (Sam2Model / Sam2Processor), so it
+    # loads under the workspace's own transformers and runs IN PROCESS — no
+    # sidecar venv, no quantization. Measured 74 MiB of weights and a ~297 MiB
+    # peak on an RTX 4070 Laptop, which co-resides trivially with a VLA. The
+    # backend (openral_runner.backends.gstreamer.sam2_segmenter) lazily imports
+    # torch + transformers; this group provides them.
+    "transformers>=5.4.0,<5.6.0",  # reason: Sam2Model / Sam2Processor. Pinned to match the omdet / sim / vla groups so a multi-group sync resolves to one transformers version.
+    "torch>=2.2",           # reason: SAM 2.1 forward pass + .to(device); CUDA when available, CPU fallback for GPU-less hosts and pre-sm_70 dev boxes.
+    "pillow>=10.0",         # reason: BGR frame -> RGB PIL.Image for Sam2Processor.
+]
+onnx-export = [
+    "transformers>=4.45",  # reason: RTDetrForObjectDetection for ONNX export (one-time)
+    "torch>=2.2",          # reason: torch.onnx.export
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+# `-ra` surfaces every skip / xfail / error reason in the short summary so
+# module-level skips (e.g. CUDA not available, lerobot missing) cannot
+# silently disappear during collection — see tests/sim/conftest.py.
+# `--strict-markers` rejects typos in @pytest.mark.<name> decorators.
+# `-p no:launch_testing*` / `-p no:launch_ros` disable the ROS 2 pytest
+# entry-points (`launch_testing`, `launch_testing_ros_pytest_entrypoint`,
+# `launch_ros`) that get auto-discovered when /opt/ros/<distro>/lib/python3.12/
+# site-packages is on PYTHONPATH (any dev host that sourced setup.bash). Their
+# `pytest_launch_collect_makemodule` hook silently swallows collection of
+# normal `test_*.py` files ("found no collectors for …" → 0 tests collected)
+# so a bare `pytest tests/unit/test_X.py` invocation reports success while
+# running nothing. None of the in-tree tests use `launch_testing` (the
+# integration tests under tests/integration/ drive rclpy directly; the real
+# ROS launch-tests run under `colcon test` via `just ros2-test`, which has
+# its own pytest config), so it is safe to disable globally for the venv
+# pytest. This makes `just test` and `pytest <single-file>` agree.
+# --import-mode=importlib: avoids sys.path injection, eliminates ImportPathMismatchError
+# when python/*/tests/ sub-packages share the name "tests" with tests/ at repo root.
+addopts = "-ra --strict-markers --import-mode=importlib -p no:launch_testing -p no:launch_testing_ros -p no:launch_testing_ros_pytest_entrypoint -p no:launch_ros"
+markers = [
+    "sim: integration tests that load real HF weights and/or run a simulated robot (slow; opt-in via `pytest -m sim`)",
+    "slow: tests that take >5s on the reference host",
+]

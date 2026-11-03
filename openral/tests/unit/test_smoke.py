@@ -1,0 +1,75 @@
+"""Day-1 smoke test — the canonical pre-flight check.
+
+Distinct from ``test_schemas_fuzz.py`` (hypothesis property tests) and
+``test_rskill_manifest.py`` (RSkillManifest-specific checks, ``tests/README.md``
+§4-A.7):
+
+- First test contributors run (``pytest tests/unit/test_smoke.py``) to verify
+  the workspace installed correctly.
+- Uses only the public ``import openral_core as core`` surface, catching
+  package re-export regressions without touching internal modules.
+- Checks ``__version__`` against the installed distribution
+  (``importlib.metadata``) — a failure here means the install is broken, not
+  a missed bump. ``test_lockstep_versions.py`` owns the release-bump contract.
+"""
+
+from __future__ import annotations
+
+import importlib.metadata
+
+import openral_core as core
+
+
+def test_version_is_set() -> None:
+    """Verify the package version is set and matches the installed distribution."""
+    assert core.__version__ == importlib.metadata.version("openral-core")
+
+
+def test_can_construct_minimal_robot_description() -> None:
+    """Verify that a minimal RobotDescription can be constructed and round-tripped."""
+    desc = core.RobotDescription(
+        name="smoke_robot",
+        embodiment_kind=core.EmbodimentKind.MANIPULATOR,
+        joints=[
+            core.JointSpec(
+                name="j1",
+                joint_type=core.JointType.REVOLUTE,
+                parent_link="base_link",
+                child_link="link_1",
+            )
+        ],
+        capabilities=core.RobotCapabilities(
+            supported_control_modes=[core.ControlMode.JOINT_POSITION],
+            embodiment_tags=["smoke"],
+        ),
+        safety=core.SafetyEnvelope(),
+    )
+    dumped = desc.model_dump()
+    reloaded = core.RobotDescription.model_validate(dumped)
+    assert reloaded.name == "smoke_robot"
+
+
+def test_world_state_round_trip() -> None:
+    """Verify WorldState can be serialized and deserialized."""
+    ws = core.WorldState(
+        stamp_ns=1_000_000_000,
+        joint_state=core.JointState(
+            name=["j1"],
+            position=[0.0],
+            stamp_ns=1_000_000_000,
+        ),
+    )
+    dumped = ws.model_dump()
+    reloaded = core.WorldState.model_validate(dumped)
+    assert reloaded.stamp_ns == 1_000_000_000
+
+
+def test_action_minimal() -> None:
+    """Verify a minimal Action can be constructed."""
+    action = core.Action(
+        control_mode=core.ControlMode.JOINT_POSITION,
+        horizon=1,
+        joint_targets=[[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+    )
+    assert action.horizon == 1
+    assert action.confidence == 1.0

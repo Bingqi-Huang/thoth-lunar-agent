@@ -1,0 +1,5545 @@
+// SPDX-License-Identifier: Apache-2.0
+// Unit coverage for the allocation-free self-collision
+// core: hand-rolled forward kinematics + closed-form capsule-capsule
+// distance + non-adjacent-pair self-collision over a joint configuration.
+//
+// Ground truth is hand-computed analytically (no MuJoCo dependency here);
+// the MuJoCo-oracle cross-check lives in the sim-tier integration test that
+// wires this core into the live kernel. test_no_alloc-style counting proves
+// the hot path never allocates.
+
+// GCC 13 emits a bogus `-Wnonnull` from inside <vector> when this file is
+// built at -O3 (the Release build the x86 image uses): the fixtures below
+// assign brace-init-lists to `std::vector<Transform>`, and in
+// `_M_assign_aux`'s `else if (size() >= __len)` arm (bits/vector.tcc) a null
+// `_M_start` implies `size() == 0` and therefore `__len == 0`, so the flagged
+// `__builtin_memmove` sits in an unreachable block. `-Wnonnull` runs early in
+// the middle-end, before the pass that deletes that block, so it warns anyway
+// — upstream GCC PR 116851, still open, under root-cause PR 87489. Scoped to
+// the standard headers so `-Wnonnull` still covers this file's own code.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
+#include "openral_safety_kernel/collision.hpp"
+
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <iterator>
+#include <new>
+#include <set>
+#include <string>
+#include <vector>
+#pragma GCC diagnostic pop
+
+#include <gtest/gtest.h>
+
+namespace osk = openral_safety_kernel;
+
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+
+// Identity rigid transform.
+osk::Transform identity() { return osk::Transform{}; }
+
+// Pure translation.
+osk::Transform translate(double x, double y, double z) {
+  osk::Transform t;
+  t.t = {x, y, z};
+  return t;
+}
+
+}  // namespace
+
+// ── transform_from_xyz_rpy ────────────────────────────────────────────────────
+
+TEST(TransformFromXyzRpy, YawRotatesAboutZWithTranslation) {
+  const osk::Transform t = osk::transform_from_xyz_rpy(1.0, 2.0, 3.0, 0.0, 0.0, kPi / 2.0);
+  EXPECT_NEAR(t.t.x, 1.0, 1e-9);
+  EXPECT_NEAR(t.t.y, 2.0, 1e-9);
+  EXPECT_NEAR(t.t.z, 3.0, 1e-9);
+  // Rz(90) row-major.
+  EXPECT_NEAR(t.r[0], 0.0, 1e-9);
+  EXPECT_NEAR(t.r[1], -1.0, 1e-9);
+  EXPECT_NEAR(t.r[3], 1.0, 1e-9);
+  EXPECT_NEAR(t.r[4], 0.0, 1e-9);
+  EXPECT_NEAR(t.r[8], 1.0, 1e-9);
+}
+
+TEST(TransformFromXyzRpy, RollRotatesAboutX) {
+  const osk::Transform t = osk::transform_from_xyz_rpy(0.0, 0.0, 0.0, kPi / 2.0, 0.0, 0.0);
+  // Rx(90) row-major: [[1,0,0],[0,0,-1],[0,1,0]].
+  EXPECT_NEAR(t.r[0], 1.0, 1e-9);
+  EXPECT_NEAR(t.r[4], 0.0, 1e-9);
+  EXPECT_NEAR(t.r[5], -1.0, 1e-9);
+  EXPECT_NEAR(t.r[7], 1.0, 1e-9);
+  EXPECT_NEAR(t.r[8], 0.0, 1e-9);
+}
+
+// ── capsule_distance ──────────────────────────────────────────────────────────
+
+TEST(CapsuleDistance, ParallelCapsulesReportSurfaceGap) {
+  // Two vertical (local +Z) capsules 0.5 m apart on the x-axis; radii 0.1.
+  // Centerline distance 0.5; surface gap 0.5 - 0.1 - 0.1 = 0.3.
+  const double d = osk::capsule_distance(identity(), 0.1, 0.2, translate(0.5, 0.0, 0.0), 0.1, 0.2);
+  EXPECT_NEAR(d, 0.3, 1e-9);
+}
+
+TEST(CapsuleDistance, OverlappingCapsulesReportNegativeDistance) {
+  // Centerline 0.15, radii sum 0.2 → penetration of -0.05.
+  const double d = osk::capsule_distance(identity(), 0.1, 0.2, translate(0.15, 0.0, 0.0), 0.1, 0.2);
+  EXPECT_LT(d, 0.0);
+  EXPECT_NEAR(d, -0.05, 1e-9);
+}
+
+TEST(CapsuleDistance, EndCapToEndCapAlongAxis) {
+  // Same axis (z); A spans [-0.2, 0.2], B centered at z=1.0 spans [0.8, 1.2].
+  // Closest endcaps: A top (z=0.2) to B bottom (z=0.8) = 0.6 centerline,
+  // minus radii 0.1 + 0.1 → 0.4 surface gap.
+  const double d = osk::capsule_distance(identity(), 0.1, 0.2, translate(0.0, 0.0, 1.0), 0.1, 0.2);
+  EXPECT_NEAR(d, 0.4, 1e-9);
+}
+
+// ── forward_kinematics ────────────────────────────────────────────────────────
+
+TEST(ForwardKinematics, RevoluteAboutZRotatesChildFrame) {
+  // link0: fixed root at the origin. link1: revolute about local +Z, sitting
+  // 1 m along +x of the root; rotate it by +90°.
+  osk::CollisionModel m;
+  m.n_links = 2;
+  m.parent = {-1, 0};
+  m.joint_kind = {osk::JointKind::kFixed, osk::JointKind::kRevolute};
+  m.dof_index = {-1, 0};
+  m.origin = {identity(), translate(1.0, 0.0, 0.0)};
+  m.axis = {{0.0, 0.0, 1.0}, {0.0, 0.0, 1.0}};
+
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(2);
+
+  const std::vector<double> qpos = {kPi / 2.0};
+  osk::forward_kinematics(m, qpos.data(), qpos.size(), scratch);
+
+  // The joint origin point does not move (rotation is about its own axis).
+  EXPECT_NEAR(scratch.link_world[1].t.x, 1.0, 1e-9);
+  EXPECT_NEAR(scratch.link_world[1].t.y, 0.0, 1e-9);
+  EXPECT_NEAR(scratch.link_world[1].t.z, 0.0, 1e-9);
+  // Rotation is Rz(90): local +x maps to world +y.
+  // Row-major R: r[0]=cos=0, r[1]=-sin=-1, r[3]=sin=1, r[4]=cos=0, r[8]=1.
+  EXPECT_NEAR(scratch.link_world[1].r[0], 0.0, 1e-9);
+  EXPECT_NEAR(scratch.link_world[1].r[1], -1.0, 1e-9);
+  EXPECT_NEAR(scratch.link_world[1].r[3], 1.0, 1e-9);
+  EXPECT_NEAR(scratch.link_world[1].r[4], 0.0, 1e-9);
+  EXPECT_NEAR(scratch.link_world[1].r[8], 1.0, 1e-9);
+}
+
+// ── check_self_collision ──────────────────────────────────────────────────────
+
+namespace {
+
+// 3-link model with a capsule on each link; adjacent pairs (0,1) and (1,2)
+// are in the allowed-collision matrix (they touch by design).
+osk::CollisionModel three_capsule_model() {
+  osk::CollisionModel m;
+  m.n_links = 3;
+  m.parent = {-1, 0, 1};
+  m.joint_kind = {osk::JointKind::kFixed, osk::JointKind::kFixed, osk::JointKind::kFixed};
+  m.dof_index = {-1, -1, -1};
+  m.origin = {identity(), identity(), identity()};
+  m.axis = {{0, 0, 1}, {0, 0, 1}, {0, 0, 1}};
+  osk::Capsule c;
+  c.radius = 0.1;
+  c.half_length = 0.2;
+  c.origin = identity();
+  m.capsule_link = {0, 1, 2};
+  m.capsules = {c, c, c};
+  m.allowed_pairs = {{0, 1}, {1, 2}};
+  return m;
+}
+
+}  // namespace
+
+TEST(SelfCollision, DetectsOverlapBetweenNonAdjacentLinks) {
+  const auto m = three_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), translate(5.0, 0.0, 0.0), translate(0.05, 0.0, 0.0)};
+  // cap0 (x=0) vs cap2 (x=0.05): centerline 0.05, radii 0.2 → -0.15 overlap.
+  // pair (0,2) is NOT in the allowed matrix → must fire.
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_EQ(hit.link_b, 2);
+  EXPECT_NEAR(hit.min_distance, -0.15, 1e-9);
+}
+
+TEST(SelfCollision, IgnoresAllowedPair) {
+  auto m = three_capsule_model();
+  m.allowed_pairs = {{0, 1}, {1, 2}, {0, 2}};  // overlap of (0,2) is now allowed
+  osk::CollisionScratch s;
+  s.link_world = {identity(), translate(5.0, 0.0, 0.0), translate(0.05, 0.0, 0.0)};
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  EXPECT_FALSE(hit.hit);
+}
+
+TEST(SelfCollision, NoHitWhenSeparatedAndReportsMinDistance) {
+  const auto m = three_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), translate(5.0, 0.0, 0.0), translate(1.0, 0.0, 0.0)};
+  // Closest non-allowed pair (0,2): centerline 1.0, radii 0.2 → 0.8 gap.
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  EXPECT_FALSE(hit.hit);
+  EXPECT_NEAR(hit.min_distance, 0.8, 1e-9);
+}
+
+TEST(SelfCollision, MarginTreatsNearMissAsCollision) {
+  const auto m = three_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), translate(5.0, 0.0, 0.0), translate(1.0, 0.0, 0.0)};
+  // 0.8 surface gap < 1.0 margin → fire.
+  const auto hit = osk::check_self_collision(m, s, 1.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_EQ(hit.link_b, 2);
+}
+
+TEST(SelfCollision, MultipleCapsulesPerLinkAreCheckedIndependently) {
+  // link0 carries TWO capsules (one far, one near link1); link1 carries one.
+  // Only link0's near capsule overlaps link1 — and the two link0 capsules,
+  // sharing a link, must never self-collide.
+  osk::CollisionModel m;
+  m.n_links = 2;
+  m.parent = {-1, 0};
+  m.joint_kind = {osk::JointKind::kFixed, osk::JointKind::kFixed};
+  m.dof_index = {-1, -1};
+  m.origin = {identity(), identity()};
+  m.axis = {{0, 0, 1}, {0, 0, 1}};
+  osk::Capsule far_c;
+  far_c.radius = 0.1;
+  far_c.half_length = 0.2;
+  far_c.origin = translate(5.0, 0.0, 0.0);
+  osk::Capsule near_c;
+  near_c.radius = 0.1;
+  near_c.half_length = 0.2;
+  near_c.origin = translate(0.05, 0.0, 0.0);
+  osk::Capsule l1;
+  l1.radius = 0.1;
+  l1.half_length = 0.2;
+  l1.origin = identity();
+  m.capsule_link = {0, 0, 1};  // two capsules on link0, one on link1
+  m.capsules = {far_c, near_c, l1};
+
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity()};
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_EQ(hit.link_b, 1);
+  EXPECT_NEAR(hit.min_distance, -0.15, 1e-9);  // near capsule (x=0.05) vs link1 (x=0)
+}
+
+// ── check_world_collision ─────────────────────────────────────────────────────
+
+namespace {
+
+osk::CollisionModel one_capsule_model() {
+  osk::CollisionModel m;
+  m.n_links = 1;
+  m.parent = {-1};
+  m.joint_kind = {osk::JointKind::kFixed};
+  m.dof_index = {-1};
+  m.origin = {identity()};
+  m.axis = {{0, 0, 1}};
+  osk::Capsule c;
+  c.radius = 0.1;
+  c.half_length = 0.2;
+  c.origin = identity();
+  m.capsule_link = {0};
+  m.capsules = {c};
+  return m;
+}
+
+osk::WorldModel world_obstacle_at(double x) {
+  osk::WorldModel w;
+  osk::Capsule obs;
+  obs.radius = 0.1;
+  obs.half_length = 0.2;
+  obs.origin = translate(x, 0.0, 0.0);
+  w.capsules = {obs};
+  return w;
+}
+
+}  // namespace
+
+TEST(WorldCollision, DetectsRobotCapsuleVsWorldObstacle) {
+  const auto m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};  // robot capsule centered at the origin
+  const auto w = world_obstacle_at(0.15);
+  const auto hit = osk::check_world_collision(m, s, w, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);                    // robot link 0
+  EXPECT_EQ(hit.link_b, 0);                    // world obstacle 0
+  EXPECT_NEAR(hit.min_distance, -0.05, 1e-9);  // centerline 0.15, radii 0.2
+}
+
+TEST(WorldCollision, NoHitWhenSeparatedReportsMinDistance) {
+  const auto m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  const auto hit = osk::check_world_collision(m, s, world_obstacle_at(1.0), 0.0);
+  EXPECT_FALSE(hit.hit);
+  EXPECT_NEAR(hit.min_distance, 0.8, 1e-9);
+}
+
+TEST(WorldCollision, MarginTreatsNearMissAsCollision) {
+  const auto m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  const auto hit = osk::check_world_collision(m, s, world_obstacle_at(1.0), 1.0);
+  EXPECT_TRUE(hit.hit);
+}
+
+TEST(WorldCollision, EmptyWorldNeverHits) {
+  const auto m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  const osk::WorldModel empty;
+  const auto hit = osk::check_world_collision(m, s, empty, 0.0);
+  EXPECT_FALSE(hit.hit);
+}
+
+// ── check_voxel_collision ─────────────────────────────────────────────────────
+
+namespace {
+
+// 5x5x5 grid, 0.1 m voxels, origin (-0.25,-0.25,-0.25) so voxel (2,2,2)'s
+// centre sits at the base-frame origin.
+osk::VoxelGrid make_grid(const std::vector<std::uint8_t>& occ) {
+  osk::VoxelGrid g;
+  g.pose.t = {-0.25, -0.25, -0.25};
+  g.resolution = 0.1;
+  g.sx = 5;
+  g.sy = 5;
+  g.sz = 5;
+  g.occupancy = occ.data();
+  return g;
+}
+
+int voxel_index(int x, int y, int z) { return x + 5 * (y + 5 * z); }
+
+}  // namespace
+
+TEST(VoxelCollision, DetectsCapsuleOverlappingOccupiedVoxel) {
+  const auto m = one_capsule_model();  // capsule centred at origin, radius 0.1
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  std::vector<std::uint8_t> occ(125, 0);
+  occ[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;  // centre voxel at the origin
+  const auto hit = osk::check_voxel_collision(m, s, make_grid(occ), 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_EQ(hit.link_b, voxel_index(2, 2, 2));
+  EXPECT_LT(hit.min_distance, 0.0);
+}
+
+TEST(VoxelCollision, NoHitWhenAllFree) {
+  const auto m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  const std::vector<std::uint8_t> occ(125, 0);
+  const auto hit = osk::check_voxel_collision(m, s, make_grid(occ), 0.0);
+  EXPECT_FALSE(hit.hit);
+}
+
+TEST(VoxelCollision, NoHitWhenOccupiedVoxelIsFar) {
+  const auto m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  std::vector<std::uint8_t> occ(125, 0);
+  occ[static_cast<std::size_t>(voxel_index(4, 4, 4))] = 1;  // corner voxel, well clear
+  const auto hit = osk::check_voxel_collision(m, s, make_grid(occ), 0.0);
+  EXPECT_FALSE(hit.hit);
+}
+
+TEST(VoxelCollision, MarginTreatsNearMissAsCollision) {
+  const auto m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  std::vector<std::uint8_t> occ(125, 0);
+  occ[static_cast<std::size_t>(voxel_index(4, 4, 4))] = 1;
+  const auto hit = osk::check_voxel_collision(m, s, make_grid(occ), 1.0);
+  EXPECT_TRUE(hit.hit);
+}
+
+TEST(VoxelCollision, CubeCornerDoesNotUseCircumscribedSphere) {
+  const auto m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  const std::vector<std::uint8_t> occ = {1};
+  osk::VoxelGrid grid;
+  grid.pose.t = {0.09, 0.09, 0.20};  // centre=(0.14,0.14,0.25), side=0.1
+  grid.resolution = 0.1;
+  grid.sx = 1;
+  grid.sy = 1;
+  grid.sz = 1;
+  grid.occupancy = occ.data();
+  const auto hit = osk::check_voxel_collision(m, s, grid, 0.02);
+  EXPECT_FALSE(hit.hit)
+      << "the real voxel cube is >2 cm clear; a circumscribed sphere would false-hit";
+  EXPECT_GT(hit.min_distance, 0.02);
+}
+
+TEST(VoxelCollision, NullGridNeverHits) {
+  const auto m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  const osk::VoxelGrid empty;  // occupancy == nullptr
+  const auto hit = osk::check_voxel_collision(m, s, empty, 0.0);
+  EXPECT_FALSE(hit.hit);
+}
+
+// ── ADR-0095: base-frame alignment leaves the envelope untouched ──────────────
+
+namespace {
+
+// A PandaMobile-shaped arm root: a fixed base link plus one link carrying the
+// arm's first capsule, mounted `root_z` above `base_link` — the manifest's
+// `panda_joint1` origin. RoboCasa's pedestal makes that either 1.033 (the
+// pre-ADR-0095 root, which absorbed the 0.700 m pedestal inside the kernel) or
+// 0.333 (the Franka URDF value, once `base_link` itself is the arm mount).
+osk::CollisionModel arm_root_model(double root_z) {
+  osk::CollisionModel m;
+  m.n_links = 2;
+  m.parent = {-1, 0};
+  m.joint_kind = {osk::JointKind::kFixed, osk::JointKind::kFixed};
+  m.dof_index = {-1, -1};
+  m.origin = {identity(), translate(0.0, 0.0, root_z)};
+  m.axis = {{0, 0, 1}, {0, 0, 1}};
+  osk::Capsule c;
+  c.radius = 0.05;
+  c.half_length = 0.1;
+  c.origin = identity();
+  m.capsule_link = {1};
+  m.capsules = {c};
+  return m;
+}
+
+// One occupied row of counter cells, `origin_z` metres up the base frame.
+osk::VoxelGrid counter_grid(const std::vector<std::uint8_t>& occ, double origin_z) {
+  osk::VoxelGrid g;
+  g.pose.t = {-0.1, -0.1, origin_z};
+  g.resolution = 0.025;
+  g.sx = 8;
+  g.sy = 8;
+  g.sz = 8;
+  g.occupancy = occ.data();
+  return g;
+}
+
+}  // namespace
+
+TEST(VoxelCollision, BaseFrameAlignmentPreservesTheProtectiveEnvelope) {
+  // ADR-0095 lands two equal-and-opposite 0.700 m shifts in ONE commit: the
+  // grid's *content* drops by the RoboCasa pedestal height (it stops being
+  // world-referenced and becomes genuinely `base_link`-referenced), and the
+  // collision FK root drops by the same 0.700 m (1.033 -> 0.333). A
+  // capsule-vs-voxel distance depends only on their difference, so the
+  // kernel's decision — hit, evidence cell, and penetration depth — is
+  // bit-identical across the pair. The fix is a change of *origin*, never a
+  // relaxation: nothing here shrinks the envelope. Landing only one half
+  // would put the kernel 0.700 m out (hazard HZ-0095-1), which is exactly
+  // what the two configurations below would show if they disagreed.
+  constexpr double kPedestal = 0.700;
+  std::vector<std::uint8_t> occ(8 * 8 * 8, 0);
+  for (int iy = 0; iy < 8; ++iy) {
+    for (int ix = 0; ix < 8; ++ix) {
+      occ[static_cast<std::size_t>(ix + 8 * (iy + 8 * 2))] = 1;  // one counter row
+    }
+  }
+
+  osk::CollisionScratch before_scratch;
+  before_scratch.link_world.resize(2);
+  const auto before_model = arm_root_model(1.033);
+  const std::vector<double> qpos;
+  osk::forward_kinematics(before_model, qpos.data(), qpos.size(), before_scratch);
+  const auto before = osk::check_voxel_collision(before_model, before_scratch,
+                                                 counter_grid(occ, 0.15 + kPedestal), 0.01);
+
+  osk::CollisionScratch after_scratch;
+  after_scratch.link_world.resize(2);
+  const auto after_model = arm_root_model(0.333);
+  osk::forward_kinematics(after_model, qpos.data(), qpos.size(), after_scratch);
+  const auto after =
+      osk::check_voxel_collision(after_model, after_scratch, counter_grid(occ, 0.15), 0.01);
+
+  EXPECT_TRUE(before.hit) << "fixture must actually exercise a hit";
+  EXPECT_EQ(before.hit, after.hit);
+  EXPECT_EQ(before.link_a, after.link_a);
+  EXPECT_EQ(before.link_b, after.link_b) << "same evidence cell index";
+  EXPECT_NEAR(before.min_distance, after.min_distance, 1e-12);
+  EXPECT_NEAR(before.sweep_min_distance, after.sweep_min_distance, 1e-12);
+}
+
+TEST(VoxelCollision, HalfAppliedFrameAlignmentMovesTheKernelByThePedestal) {
+  // The atomicity requirement, stated as a test: keeping the pre-ADR-0095 FK
+  // root while the producer has already been fixed (or vice versa) leaves the
+  // arm a full pedestal height away from the obstacles it is checked against,
+  // so the counter row it should be 0.01 m from is not seen at all.
+  std::vector<std::uint8_t> occ(8 * 8 * 8, 0);
+  for (int iy = 0; iy < 8; ++iy) {
+    for (int ix = 0; ix < 8; ++ix) {
+      occ[static_cast<std::size_t>(ix + 8 * (iy + 8 * 2))] = 1;
+    }
+  }
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(2);
+  const auto stale_model = arm_root_model(1.033);  // producer fixed, kernel not
+  const std::vector<double> qpos;
+  osk::forward_kinematics(stale_model, qpos.data(), qpos.size(), scratch);
+  const auto hit = osk::check_voxel_collision(stale_model, scratch, counter_grid(occ, 0.15), 0.01);
+  EXPECT_FALSE(hit.hit) << "a half-applied ADR-0095 blinds the kernel to the counter";
+}
+
+// ── jacobian_dls_step (predictive Cartesian) ─────────────────────────
+
+namespace {
+
+// Planar 2R arm: two revolute-Z joints (link lengths 1 m) + a fixed EE link at
+// the tip. At q=[0,0] the EE sits at (2,0,0). EE link index = 2.
+osk::CollisionModel two_r_planar_arm() {
+  osk::CollisionModel m;
+  m.n_links = 3;
+  m.parent = {-1, 0, 1};
+  m.joint_kind = {osk::JointKind::kRevolute, osk::JointKind::kRevolute, osk::JointKind::kFixed};
+  m.dof_index = {0, 1, -1};
+  m.origin = {identity(), translate(1.0, 0.0, 0.0), translate(1.0, 0.0, 0.0)};
+  m.axis = {{0.0, 0.0, 1.0}, {0.0, 0.0, 1.0}, {0.0, 0.0, 0.0}};
+  return m;
+}
+
+}  // namespace
+
+TEST(JacobianDls, RealizesSmallTranslationTwistOn2RArm) {
+  const auto m = two_r_planar_arm();
+  osk::CollisionScratch s;
+  s.link_world.resize(3);
+  std::vector<double> q = {0.0, 0.0};
+  osk::forward_kinematics(m, q.data(), q.size(), s);
+  // EE starts at (2,0,0).
+  ASSERT_NEAR(s.link_world[2].t.x, 2.0, 1e-9);
+  ASSERT_NEAR(s.link_world[2].t.y, 0.0, 1e-9);
+
+  // Ask for a +1 cm EE translation along +y (no rotation).
+  const double twist[6] = {0.0, 0.01, 0.0, 0.0, 0.0, 0.0};
+  std::vector<double> dq(2, 0.0);
+  ASSERT_TRUE(osk::jacobian_dls_step(m, s, /*ee_link=*/2, twist, /*lambda=*/1e-4, dq.data(), 2));
+
+  q[0] += dq[0];
+  q[1] += dq[1];
+  osk::forward_kinematics(m, q.data(), q.size(), s);
+  // The reconstructed step must move the EE to ~(2, 0.01, 0) (small-angle exact
+  // for this non-singular config; loose tol absorbs DLS damping + linearization).
+  EXPECT_NEAR(s.link_world[2].t.x, 2.0, 1e-3);
+  EXPECT_NEAR(s.link_world[2].t.y, 0.01, 1e-3);
+}
+
+TEST(JacobianDls, FailsSafeOnInvalidEeLinkAndZeroesDq) {
+  const auto m = two_r_planar_arm();
+  osk::CollisionScratch s;
+  s.link_world.resize(3);
+  std::vector<double> q = {0.3, -0.2};
+  osk::forward_kinematics(m, q.data(), q.size(), s);
+  const double twist[6] = {0.01, 0.0, 0.0, 0.0, 0.0, 0.0};
+  std::vector<double> dq = {7.0, 7.0};  // sentinel — must be zeroed on failure
+  EXPECT_FALSE(osk::jacobian_dls_step(m, s, /*ee_link=*/99, twist, 1e-4, dq.data(), 2));
+  EXPECT_EQ(dq[0], 0.0);
+  EXPECT_EQ(dq[1], 0.0);
+}
+
+TEST(JacobianDls, BlockedDofIsExcludedFromTheSolution) {
+  // Blocking dof 0 must force the whole EE twist onto dof 1 (dq[0] stays 0).
+  const auto m = two_r_planar_arm();
+  osk::CollisionScratch s;
+  s.link_world.resize(3);
+  std::vector<double> q = {0.0, 0.3};
+  osk::forward_kinematics(m, q.data(), q.size(), s);
+  const double twist[6] = {0.0, 0.01, 0.0, 0.0, 0.0, 0.0};
+  std::vector<double> dq(2, 0.0);
+  const std::uint8_t blocked[2] = {1, 0};  // block dof 0
+  ASSERT_TRUE(osk::jacobian_dls_step(m, s, 2, twist, 1e-4, dq.data(), 2, blocked));
+  EXPECT_EQ(dq[0], 0.0);
+  EXPECT_NE(dq[1], 0.0);
+}
+
+TEST(JacobianDls, DampingKeepsStepBoundedNearSingularStretch) {
+  // Fully stretched (q=[0,0]) the 2R arm is singular for +x motion (cannot move
+  // the EE further along x). With damping the requested +x twist must yield a
+  // FINITE, bounded dq rather than blowing up.
+  const auto m = two_r_planar_arm();
+  osk::CollisionScratch s;
+  s.link_world.resize(3);
+  std::vector<double> q = {0.0, 0.0};
+  osk::forward_kinematics(m, q.data(), q.size(), s);
+  const double twist[6] = {0.05, 0.0, 0.0, 0.0, 0.0, 0.0};  // along the singular x
+  std::vector<double> dq(2, 0.0);
+  ASSERT_TRUE(osk::jacobian_dls_step(m, s, 2, twist, /*lambda=*/0.05, dq.data(), 2));
+  EXPECT_TRUE(std::isfinite(dq[0]));
+  EXPECT_TRUE(std::isfinite(dq[1]));
+  EXPECT_LT(std::fabs(dq[0]), 1.0);
+  EXPECT_LT(std::fabs(dq[1]), 1.0);
+}
+
+// ── allocation-free guarantee ─────────────────────────────────────────────────
+
+namespace {
+std::atomic<std::uint64_t> g_alloc_count{0};
+std::atomic<bool> g_count_enabled{false};
+}  // namespace
+
+void* operator new(std::size_t size) {
+  if (g_count_enabled.load(std::memory_order_relaxed)) {
+    g_alloc_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  void* p = std::malloc(size);
+  if (p == nullptr) {
+    throw std::bad_alloc{};
+  }
+  return p;
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
+namespace {
+
+// A hull that is exactly an axis-aligned box of half-size `h` about the origin
+// of the link frame, with the tangent 26-DOP that box implies. Ground truth for
+// this shape against an axis-aligned cell is closed-form, which is what lets
+// the GJK be checked against an exact number rather than against itself.
+osk::LinkHull axis_aligned_box_hull(const osk::Vec3& h, std::vector<osk::Vec3>& vertices) {
+  osk::LinkHull hull;
+  hull.vertex_first = static_cast<int>(vertices.size());
+  hull.vertex_count = 8;
+  for (int sx = -1; sx <= 1; sx += 2) {
+    for (int sy = -1; sy <= 1; sy += 2) {
+      for (int sz = -1; sz <= 1; sz += 2) {
+        vertices.push_back(osk::Vec3{sx * h.x, sy * h.y, sz * h.z});
+      }
+    }
+  }
+  const double hv[3] = {h.x, h.y, h.z};
+  for (int i = 0; i < osk::kDopAxes; ++i) {
+    double reach = 0.0;
+    for (int k = 0; k < 3; ++k) {
+      reach += std::fabs(osk::kDopAxis[i][k]) * hv[k];
+    }
+    hull.dop_lo[i] = -reach;
+    hull.dop_hi[i] = reach;
+  }
+  return hull;
+}
+
+}  // namespace
+
+TEST(NoAlloc, ForwardKinematicsAndSelfCollisionAreAllocationFree) {
+  // Build the model + pre-size scratch OUTSIDE the counted window.
+  osk::CollisionModel m;
+  m.n_links = 3;
+  m.parent = {-1, 0, 1};
+  m.joint_kind = {osk::JointKind::kFixed, osk::JointKind::kRevolute, osk::JointKind::kRevolute};
+  m.dof_index = {-1, 0, 1};
+  m.origin = {identity(), translate(0.0, 0.0, 0.3), translate(0.0, 0.0, 0.3)};
+  m.axis = {{0, 0, 1}, {0, 1, 0}, {0, 1, 0}};
+  osk::Capsule c;
+  c.radius = 0.05;
+  c.half_length = 0.15;
+  c.origin = identity();
+  m.capsule_link = {0, 1, 2};
+  m.capsules = {c, c, c};
+  // Boxes on links 0 and 2 exercise the box↔capsule AND box↔box paths under the
+  // counter; the wide-margin call below drives that box pair through
+  // `refine_self_pair`, the branch that puts two `TightPose` on the stack.
+  osk::Obb obb;
+  obb.half_extents = {0.05, 0.05, 0.05};
+  obb.origin = identity();
+  m.box_link = {0, 2};
+  m.boxes = {obb, obb};
+  // Tight geometry on those boxes drives the staged narrow phase -- the 26-DOP
+  // hoist, the GJK simplex and its witness -- under the same counter. GJK is
+  // the one routine here that could plausibly want a heap: its stack-only
+  // fixed-size simplex is a design constraint, not an accident, and this is
+  // where it is pinned.
+  std::vector<osk::Vec3> tight_verts;
+  m.hulls = {axis_aligned_box_hull(osk::Vec3{0.04, 0.04, 0.04}, tight_verts),
+             axis_aligned_box_hull(osk::Vec3{0.04, 0.04, 0.04}, tight_verts)};
+  m.hull_vertices = tight_verts;
+  m.box_hull = {0, 1};
+  m.allowed_pairs = {{0, 1}, {1, 2}};
+
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(m.n_links);
+
+  // Pre-built world obstacles + a voxel grid (allocated outside the counted window).
+  osk::WorldModel world;
+  osk::Capsule obs;
+  obs.radius = 0.05;
+  obs.half_length = 0.1;
+  obs.origin = translate(0.3, 0.0, 0.3);
+  world.capsules = {obs, obs};
+
+  std::vector<std::uint8_t> occ(8 * 8 * 8, 0);
+  occ[42] = 1;
+  osk::VoxelGrid grid;
+  grid.pose.t = {-0.4, -0.4, -0.4};
+  grid.resolution = 0.1;
+  grid.sx = 8;
+  grid.sy = 8;
+  grid.sz = 8;
+  grid.occupancy = occ.data();
+
+  const std::vector<double> qpos = {0.3, -0.4};
+
+  g_alloc_count.store(0, std::memory_order_relaxed);
+  g_count_enabled.store(true, std::memory_order_relaxed);
+  for (int i = 0; i < 10000; ++i) {
+    osk::forward_kinematics(m, qpos.data(), qpos.size(), scratch);
+    const auto self_hit = osk::check_self_collision(m, scratch, 0.0);
+    // A margin wide enough that every box pair fires, so the hull refinement
+    // runs rather than being skipped by the cheap bound.
+    const auto refined_hit = osk::check_self_collision(m, scratch, 1.0);
+    const auto world_hit = osk::check_world_collision(m, scratch, world, 0.0);
+    const auto voxel_hit = osk::check_voxel_collision(m, scratch, grid, 0.0);
+    (void)self_hit;
+    (void)refined_hit;
+    (void)world_hit;
+    (void)voxel_hit;
+  }
+  g_count_enabled.store(false, std::memory_order_relaxed);
+  EXPECT_EQ(g_alloc_count.load(std::memory_order_relaxed), 0U)
+      << "collision hot path allocated; the self-collision core must stay allocation-free.";
+}
+
+TEST(NoAlloc, AttachedCollisionChecksAreAllocationFree) {
+  // Robot: base + one movable link carrying a capsule.
+  osk::CollisionModel m;
+  m.n_links = 2;
+  m.parent = {-1, 0};
+  m.joint_kind = {osk::JointKind::kFixed, osk::JointKind::kRevolute};
+  m.dof_index = {-1, 0};
+  m.origin = {identity(), translate(0.0, 0.0, 0.2)};
+  m.axis = {{0, 0, 1}, {0, 1, 0}};
+  osk::Capsule c;
+  c.radius = 0.05;
+  c.half_length = 0.1;
+  c.origin = identity();
+  m.capsule_link = {1};
+  m.capsules = {c};
+
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(m.n_links);
+
+  // Pre-sized attached model (fixed capacity), a world obstacle and a voxel
+  // grid — all built OUTSIDE the counted window. One object owns one sphere
+  // primitive (flattened buffers presized to their caps).
+  osk::AttachedModel att;
+  att.objects.assign(4, osk::AttachedObject{});
+  att.primitives.assign(8, osk::AttachedPrimitive{});
+  att.touch_links.assign(8, 0);
+  att.objects[0].pose_in_link = translate(0.0, 0.0, 0.15);
+  att.objects[0].attach_link = 1;
+  att.objects[0].prim_first = 0;
+  att.objects[0].prim_count = 1;
+  att.objects[0].touch_first = 0;
+  att.objects[0].touch_count = 0;
+  att.primitives[0].kind = osk::AttachedShapeKind::kSphere;
+  att.primitives[0].radius = 0.08;
+  att.primitives[0].pose_in_object = identity();
+  // Attested support contact, so the witness latch actually walks its cell
+  // scan inside the counted window instead of short-circuiting.
+  att.objects[0].has_support_witness = true;
+  att.objects[0].support_point = {0.0, 0.0, 0.0};
+  att.objects[0].support_normal = {0.0, 0.0, 1.0};
+  att.objects[0].support_patch_radius = 0.2;
+  att.objects[0].support_max_penetration = 0.001;
+  att.n_objects = 1;
+  att.n_primitives = 1;
+
+  osk::WorldModel world;
+  osk::Capsule obs;
+  obs.radius = 0.05;
+  obs.half_length = 0.1;
+  obs.origin = translate(0.3, 0.0, 0.3);
+  world.capsules = {obs, obs};
+
+  std::vector<std::uint8_t> occ(8 * 8 * 8, 0);
+  occ[42] = 1;
+  osk::VoxelGrid grid;
+  grid.pose.t = {-0.4, -0.4, -0.4};
+  grid.resolution = 0.1;
+  grid.sx = 8;
+  grid.sy = 8;
+  grid.sz = 8;
+  grid.occupancy = occ.data();
+  std::vector<std::uint8_t> contact_mask(occ.size(), 0);
+  std::vector<double> contact_distance(occ.size(), std::numeric_limits<double>::infinity());
+  grid.attached_contact_mask = contact_mask.data();
+  grid.attached_contact_distance = contact_distance.data();
+  grid.attached_contact_stride = occ.size();
+  grid.support_witness_live = 0x1;
+
+  const std::vector<double> qpos = {0.3};
+
+  g_alloc_count.store(0, std::memory_order_relaxed);
+  g_count_enabled.store(true, std::memory_order_relaxed);
+  for (int i = 0; i < 10000; ++i) {
+    osk::forward_kinematics(m, qpos.data(), qpos.size(), scratch);
+    const auto self_hit = osk::check_attached_self_collision(m, att, scratch, 0.0);
+    const auto world_hit = osk::check_attached_world_collision(m, att, scratch, world, 0.0);
+    const auto voxel_hit = osk::check_attached_voxel_collision(m, att, scratch, grid, 0.0);
+    const bool contacts_active = osk::update_attached_voxel_contacts(
+        att, scratch, grid, contact_mask.data(), contact_distance.data(), contact_mask.size(),
+        contact_distance.size(), false);
+    const std::uint8_t live = osk::update_support_contact_witnesses(att, scratch, grid, 0x1, 0.0);
+    (void)self_hit;
+    (void)world_hit;
+    (void)voxel_hit;
+    (void)contacts_active;
+    (void)live;
+  }
+  g_count_enabled.store(false, std::memory_order_relaxed);
+  EXPECT_EQ(g_alloc_count.load(std::memory_order_relaxed), 0U)
+      << "attached-object collision checks allocated; the hot path must stay allocation-free.";
+}
+
+TEST(NoAlloc, JacobianDlsStepIsAllocationFree) {
+  // 2R arm + pre-sized scratch + caller-owned dq, all OUTSIDE the counted window.
+  osk::CollisionModel m;
+  m.n_links = 3;
+  m.parent = {-1, 0, 1};
+  m.joint_kind = {osk::JointKind::kRevolute, osk::JointKind::kRevolute, osk::JointKind::kFixed};
+  m.dof_index = {0, 1, -1};
+  m.origin = {identity(), translate(1.0, 0.0, 0.0), translate(1.0, 0.0, 0.0)};
+  m.axis = {{0.0, 0.0, 1.0}, {0.0, 0.0, 1.0}, {0.0, 0.0, 0.0}};
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(3);
+  std::vector<double> q = {0.2, -0.1};
+  std::vector<double> dq(2, 0.0);
+  const double twist[6] = {0.0, 0.01, 0.0, 0.0, 0.0, 0.0};
+  osk::forward_kinematics(m, q.data(), q.size(), scratch);
+
+  g_alloc_count.store(0, std::memory_order_relaxed);
+  g_count_enabled.store(true, std::memory_order_relaxed);
+  for (int i = 0; i < 10000; ++i) {
+    const bool ok = osk::jacobian_dls_step(m, scratch, 2, twist, 1e-4, dq.data(), 2);
+    (void)ok;
+  }
+  g_count_enabled.store(false, std::memory_order_relaxed);
+  EXPECT_EQ(g_alloc_count.load(std::memory_order_relaxed), 0U)
+      << "jacobian_dls_step allocated; the predictive Cartesian path must be allocation-free.";
+}
+
+// ── Box/OBB primitive (issue #84) ──────────────────────────────────
+//
+// A blocky link (SO-ARM100/101 `base`) carries an OBB instead of a capsule so
+// its flat faces don't over-report clearance. Ground truth here is hand-computed
+// analytically; the real-geometry reproduction (fat capsule false-E-stops the
+// SO-101 home pose, box clears) lives in the Python MuJoCo-oracle test.
+
+TEST(BoxCapsuleDistance, DisjointAlongFaceNormalIsExact) {
+  // Box [-0.05,0.05]^3 at the origin; capsule central segment at x=0.2 (well
+  // clear), running vertically. Nearest box face is x=+0.05 → segment↔box gap
+  // 0.2-0.05=0.15; minus the 0.02 capsule radius → 0.13.
+  const osk::Vec3 h{0.05, 0.05, 0.05};
+  const double d = osk::box_capsule_distance(identity(), h, translate(0.2, 0.0, 0.0), 0.02, 0.1);
+  EXPECT_NEAR(d, 0.13, 1e-6);
+}
+
+TEST(BoxCapsuleDistance, SegmentOnSurfaceGivesNegativeRadius) {
+  // Capsule segment lies on the box's +x face (x=0.05) → segment↔box gap 0;
+  // minus the radius → -0.02 (interpenetration by the radius).
+  const osk::Vec3 h{0.05, 0.05, 0.05};
+  const double d = osk::box_capsule_distance(identity(), h, translate(0.05, 0.0, 0.0), 0.02, 0.1);
+  EXPECT_NEAR(d, -0.02, 1e-6);
+}
+
+TEST(BoxCapsuleDistance, ClosestFeatureIsTopFace) {
+  // Capsule above the top face; nearest endpoint at z=0.1 → gap 0.1-0.05=0.05,
+  // minus radius 0.01 → 0.04.
+  const osk::Vec3 h{0.05, 0.05, 0.05};
+  const double d = osk::box_capsule_distance(identity(), h, translate(0.0, 0.0, 0.2), 0.01, 0.1);
+  EXPECT_NEAR(d, 0.04, 1e-6);
+}
+
+TEST(BoxBoxDistance, SeparatedAlongAxis) {
+  const osk::Vec3 h{0.05, 0.05, 0.05};
+  const double d = osk::box_box_distance(identity(), h, translate(0.2, 0.0, 0.0), h);
+  EXPECT_NEAR(d, 0.1, 1e-9);
+}
+
+TEST(BoxBoxDistance, OverlapIsNegative) {
+  const osk::Vec3 h{0.05, 0.05, 0.05};
+  const double d = osk::box_box_distance(identity(), h, translate(0.08, 0.0, 0.0), h);
+  EXPECT_LT(d, 0.0);
+  EXPECT_NEAR(d, -0.02, 1e-9);
+}
+
+TEST(BoxBoxDistance, RotatedBoxIsPositiveAndConservative) {
+  // B rotated 45° about z, centre 0.2 away. SAT max-gap stays a positive lower
+  // bound on the true (corner-to-face) distance — never under-reports.
+  const osk::Vec3 h{0.05, 0.05, 0.05};
+  const osk::Transform b = osk::transform_from_xyz_rpy(0.2, 0.0, 0.0, 0.0, 0.0, kPi / 4.0);
+  const double d = osk::box_box_distance(identity(), h, b, h);
+  EXPECT_GT(d, 0.0);
+  EXPECT_NEAR(d, 0.2 - 0.05 - 0.05 * std::sqrt(2.0), 1e-6);
+}
+
+namespace {
+// One box on link 0, one capsule on link 1 (non-adjacent, not allowed). Frames
+// are set directly on the scratch by each test.
+osk::CollisionModel box_plus_capsule_model() {
+  osk::CollisionModel m;
+  m.n_links = 2;
+  m.parent = {-1, 0};
+  m.joint_kind = {osk::JointKind::kFixed, osk::JointKind::kFixed};
+  m.dof_index = {-1, -1};
+  m.origin = {identity(), identity()};
+  m.axis = {{0, 0, 1}, {0, 0, 1}};
+  m.box_link = {0};
+  m.boxes = {osk::Obb{{0.055, 0.048, 0.036}, translate(0.0, 0.0, 0.05)}};
+  m.capsule_link = {1};
+  m.capsules = {osk::Capsule{0.05, 0.05, identity()}};
+  m.allowed_pairs = {};
+  return m;
+}
+}  // namespace
+
+TEST(SelfCollisionBox, BoxClearsDistantCapsule) {
+  // Capsule 0.13 m out (like the SO-101 home lower_arm): the tight box clears it
+  // where the old fat r=0.075 base capsule would have false-fired.
+  const auto m = box_plus_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), translate(0.13, 0.0, 0.10)};
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  EXPECT_FALSE(hit.hit);
+  EXPECT_GT(hit.min_distance, 0.0);
+}
+
+TEST(SelfCollisionBox, BoxFiresOnRealPenetration) {
+  // Capsule driven into the block → box↔capsule distance negative → hit.
+  const auto m = box_plus_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), translate(0.07, 0.0, 0.05)};
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_EQ(hit.link_b, 1);
+  EXPECT_LT(hit.min_distance, 0.0);
+}
+
+TEST(SelfCollisionBox, AllowedPairSkipsBoxCapsule) {
+  auto m = box_plus_capsule_model();
+  m.allowed_pairs = {{0, 1}};  // sanction the pair → never fires
+  osk::CollisionScratch s;
+  s.link_world = {identity(), translate(0.07, 0.0, 0.05)};
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  EXPECT_FALSE(hit.hit);
+}
+
+TEST(SelfCollisionBox, BoxBoxPairFiresAndClears) {
+  // Two blocky links: box↔box path exercised through check_self_collision.
+  osk::CollisionModel m;
+  m.n_links = 2;
+  m.parent = {-1, 0};
+  m.joint_kind = {osk::JointKind::kFixed, osk::JointKind::kFixed};
+  m.dof_index = {-1, -1};
+  m.origin = {identity(), identity()};
+  m.axis = {{0, 0, 1}, {0, 0, 1}};
+  m.box_link = {0, 1};
+  m.boxes = {osk::Obb{{0.05, 0.05, 0.05}, identity()}, osk::Obb{{0.05, 0.05, 0.05}, identity()}};
+  m.allowed_pairs = {};
+
+  osk::CollisionScratch s;
+  s.link_world = {identity(), translate(0.2, 0.0, 0.0)};
+  EXPECT_FALSE(osk::check_self_collision(m, s, 0.0).hit);  // 0.1 m apart
+  s.link_world = {identity(), translate(0.08, 0.0, 0.0)};
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  EXPECT_TRUE(hit.hit);  // overlapping
+}
+
+// ── Box link vs world / voxel (blocky links stay world-visible) ────
+
+namespace {
+osk::CollisionModel one_box_model() {
+  osk::CollisionModel m;
+  m.n_links = 1;
+  m.parent = {-1};
+  m.joint_kind = {osk::JointKind::kFixed};
+  m.dof_index = {-1};
+  m.origin = {identity()};
+  m.axis = {{0, 0, 1}};
+  m.box_link = {0};
+  m.boxes = {osk::Obb{{0.05, 0.05, 0.05}, identity()}};
+  return m;
+}
+}  // namespace
+
+TEST(WorldCollisionBox, BoxLinkIsCheckedAgainstWorldObstacle) {
+  const auto m = one_box_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  // Obstacle capsule (radius 0.1) at x=0.10: box +x face at 0.05 → gap 0.05,
+  // minus the obstacle radius → -0.05 (a hit the capsule-only loop would miss).
+  const auto hit = osk::check_world_collision(m, s, world_obstacle_at(0.10), 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_EQ(hit.link_b, 0);
+  EXPECT_NEAR(hit.min_distance, -0.05, 1e-6);
+  EXPECT_FALSE(osk::check_world_collision(m, s, world_obstacle_at(1.0), 0.0).hit);
+}
+
+TEST(VoxelCollisionBox, BoxLinkIsCheckedAgainstOccupiedVoxel) {
+  const auto m = one_box_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  std::vector<std::uint8_t> occ(8 * 8 * 8, 0);
+  osk::VoxelGrid grid;
+  grid.pose.t = {-0.4, -0.4, -0.4};
+  grid.resolution = 0.1;
+  grid.sx = 8;
+  grid.sy = 8;
+  grid.sz = 8;
+  grid.occupancy = occ.data();
+  // Empty grid: no hit.
+  EXPECT_FALSE(osk::check_voxel_collision(m, s, grid, 0.0).hit);
+  // Occupy the voxel centred at (0.05,0.05,0.05) — inside the box → hit.
+  const int i = 4;  // floor((0.05-(-0.4))/0.1)=4 ; centre (-0.4+4.5*0.1)=0.05
+  occ[static_cast<std::size_t>(i + 8 * (i + 8 * i))] = 1;
+  const auto hit = osk::check_voxel_collision(m, s, grid, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_LT(hit.min_distance, 0.0);
+}
+
+// ── Attached collision objects (grasped payload; ADR-0092) ─────────────
+//
+// A grasped payload is removed from world occupancy and re-checked as
+// collision-active robot geometry: against world obstacles, occupancy voxels,
+// and the robot's own links EXCEPT the attach link and explicit touch links
+// (the fingers legitimately holding it). Ground truth is hand-computed
+// analytically; the full FK + wire-ingest path is exercised in the sim tier.
+
+namespace {
+
+// One sphere primitive (posed in its object's frame).
+osk::AttachedPrimitive sphere_prim(double radius,
+                                   const osk::Transform& pose_in_object = osk::Transform{}) {
+  osk::AttachedPrimitive p;
+  p.kind = osk::AttachedShapeKind::kSphere;
+  p.radius = radius;
+  p.half_length = 0.0;
+  p.pose_in_object = pose_in_object;
+  return p;
+}
+
+// Append an object owning `prims` to `att`, keeping the flattened primitive /
+// touch-link buffers and the n_* counts consistent. `touch` names robot link
+// indices explicitly allowed to contact the object.
+void append_object(osk::AttachedModel& att, int attach_link, const osk::Transform& pose_in_link,
+                   const std::vector<osk::AttachedPrimitive>& prims,
+                   const std::vector<int>& touch = {}) {
+  osk::AttachedObject o;
+  o.pose_in_link = pose_in_link;
+  o.attach_link = attach_link;
+  o.prim_first = static_cast<int>(att.primitives.size());
+  o.prim_count = static_cast<int>(prims.size());
+  o.touch_first = static_cast<int>(att.touch_links.size());
+  o.touch_count = static_cast<int>(touch.size());
+  for (const auto& p : prims) {
+    att.primitives.push_back(p);
+  }
+  for (int t : touch) {
+    att.touch_links.push_back(t);
+  }
+  att.objects.push_back(o);
+  att.n_objects = att.objects.size();
+  att.n_primitives = att.primitives.size();
+}
+
+// Robot capsule `c` attached to link index `link`.
+void add_capsule(osk::CollisionModel& m, int link, double radius, double half_length,
+                 const osk::Transform& origin) {
+  osk::Capsule c;
+  c.radius = radius;
+  c.half_length = half_length;
+  c.origin = origin;
+  m.capsule_link.push_back(link);
+  m.capsules.push_back(c);
+}
+
+// A 4-link fixed-chain hand: 0=base, 1=hand (attach), 2=finger, 3=arm.
+osk::CollisionModel hand_model() {
+  osk::CollisionModel m;
+  m.n_links = 4;
+  m.parent = {-1, 0, 1, 0};
+  m.joint_kind = {osk::JointKind::kFixed, osk::JointKind::kFixed, osk::JointKind::kFixed,
+                  osk::JointKind::kFixed};
+  m.dof_index = {-1, -1, -1, -1};
+  m.origin = {identity(), identity(), identity(), identity()};
+  m.axis = {{0, 0, 1}, {0, 0, 1}, {0, 0, 1}, {0, 0, 1}};
+  return m;
+}
+
+}  // namespace
+
+TEST(AttachedSelfCollision, AllowedFingerContactIsNotAHit) {
+  osk::CollisionModel m = hand_model();
+  add_capsule(m, 2, 0.05, 0.0, identity());  // finger capsule at origin (overlaps payload)
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.1)}, {2});  // finger (link 2) may touch
+
+  const auto hit = osk::check_attached_self_collision(m, att, s, 0.0);
+  EXPECT_FALSE(hit.hit) << "a grasped payload legitimately overlaps its touch-link finger";
+}
+
+TEST(AttachedSelfCollision, AttachLinkIsAlwaysAllowed) {
+  osk::CollisionModel m = hand_model();
+  add_capsule(m, 1, 0.05, 0.0, identity());  // capsule on the ATTACH link itself
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.1)});  // no touch links
+
+  const auto hit = osk::check_attached_self_collision(m, att, s, 0.0);
+  EXPECT_FALSE(hit.hit) << "the attach link is implicitly allowed even without a touch entry";
+}
+
+TEST(AttachedSelfCollision, PayloadHittingNonTouchLinkIsRejected) {
+  osk::CollisionModel m = hand_model();
+  add_capsule(m, 2, 0.05, 0.0, identity());                // finger (touch) at origin
+  add_capsule(m, 3, 0.1, 0.0, translate(0.15, 0.0, 0.0));  // arm (non-touch) near payload
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.1)}, {2});  // only the finger is a touch link
+
+  const auto hit = osk::check_attached_self_collision(m, att, s, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);                    // attached object 0
+  EXPECT_EQ(hit.link_b, 3);                    // the non-touch arm link
+  EXPECT_NEAR(hit.min_distance, -0.05, 1e-9);  // centerline 0.15, radii 0.2
+}
+
+TEST(AttachedWorldCollision, PayloadVsWorldObstacleIsRejected) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.1)});
+
+  osk::WorldModel w;
+  osk::Capsule obs;
+  obs.radius = 0.1;
+  obs.half_length = 0.2;
+  obs.origin = translate(0.15, 0.0, 0.0);
+  w.capsules = {obs};
+
+  const auto hit = osk::check_attached_world_collision(m, att, s, w, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_EQ(hit.link_b, 0);
+  EXPECT_NEAR(hit.min_distance, -0.05, 1e-9);
+}
+
+TEST(AttachedWorldCollision, ClearPayloadReportsMinDistanceNoHit) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.1)});
+
+  osk::WorldModel w;
+  osk::Capsule obs;
+  obs.radius = 0.1;
+  obs.half_length = 0.2;
+  obs.origin = translate(1.0, 0.0, 0.0);
+  w.capsules = {obs};
+
+  const auto hit = osk::check_attached_world_collision(m, att, s, w, 0.0);
+  EXPECT_FALSE(hit.hit);
+  EXPECT_NEAR(hit.min_distance, 0.8, 1e-9);  // centerline 1.0 - 0.1 - 0.1
+}
+
+TEST(AttachedVoxelCollision, PayloadVsOccupiedVoxelIsRejected) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.1)});  // sphere at origin
+
+  // 5x5x5 grid, 0.1 m voxels, centre voxel (2,2,2) at the base-frame origin.
+  std::vector<std::uint8_t> occ(125, 0);
+  occ[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, make_grid(occ), 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_EQ(hit.link_b, voxel_index(2, 2, 2));
+  EXPECT_LT(hit.min_distance, 0.0);
+}
+
+TEST(AttachedVoxelCollision, FreeGridNeverHits) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.1)});
+  const std::vector<std::uint8_t> occ(125, 0);
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, make_grid(occ), 0.0);
+  EXPECT_FALSE(hit.hit);
+}
+
+TEST(AttachedVoxelCollision, ClearingThePayloadsOwnCellsKeepsThePayloadVsWorldCheck) {
+  // What the octomap bridge's payload clearing (`openral_octomap_bridge`,
+  // `clear_attached_payload_cells`) takes out of the grid, and what it must
+  // leave. The kernel is unchanged by that fix — this pins the property the fix
+  // rests on, from the kernel's side.
+  //
+  // A payload sphere of radius 0.11 m at the origin. Three occupied cells reach
+  // the kernel: (2,2,2) and (3,2,2), which lie inside the payload itself (its
+  // own pre-grasp occupancy, still in the map), and (4,2,2) at 0.09 m from the
+  // payload surface — a real obstacle, far enough out that the bridge's
+  // circumradius bound (0.0866 m at 0.1 m cells) does not reach it.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.11)});
+  constexpr double kMargin = 0.05;
+
+  std::vector<std::uint8_t> as_mapped(125, 0);
+  as_mapped[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;
+  as_mapped[static_cast<std::size_t>(voxel_index(3, 2, 2))] = 1;
+  as_mapped[static_cast<std::size_t>(voxel_index(4, 2, 2))] = 1;
+  const auto uncleared =
+      osk::check_attached_voxel_collision(m, att, s, make_grid(as_mapped), kMargin);
+  ASSERT_TRUE(uncleared.hit);
+  EXPECT_EQ(uncleared.link_b, voxel_index(2, 2, 2))
+      << "uncleared, the payload stops the robot against itself";
+
+  // The grid as the bridge now publishes it: the payload's own cells gone.
+  std::vector<std::uint8_t> cleared = as_mapped;
+  cleared[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 0;
+  cleared[static_cast<std::size_t>(voxel_index(3, 2, 2))] = 0;
+  const auto after = osk::check_attached_voxel_collision(m, att, s, make_grid(cleared), kMargin);
+  EXPECT_TRUE(after.hit) << "payload-vs-world is still checked, cell by cell";
+  EXPECT_EQ(after.link_b, voxel_index(4, 2, 2));
+  EXPECT_LE(after.min_distance, kMargin);
+  EXPECT_NEAR(after.min_distance, 0.04, 1e-9) << "and at the true clearance to that cell";
+
+  // And with nothing real beside it, the stop the clearing removes is the whole
+  // stop: the payload alone no longer trips the check it is the subject of.
+  std::vector<std::uint8_t> only_payload(125, 0);
+  only_payload[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;
+  only_payload[static_cast<std::size_t>(voxel_index(3, 2, 2))] = 1;
+  EXPECT_TRUE(osk::check_attached_voxel_collision(m, att, s, make_grid(only_payload), kMargin).hit);
+  const std::vector<std::uint8_t> free_grid(125, 0);
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, make_grid(free_grid), kMargin).hit);
+}
+
+TEST(AttachedVoxelCollision, AttachTimeContactAloneNeverExemptsAShallowCell) {
+  // The index-keyed non-deepening baseline is gone: a cell merely in contact
+  // at attach time (1 cm deep, well short of the embedded-residue threshold)
+  // buys the payload nothing. Only a support-contact witness can exempt this,
+  // and there is none here — fail-closed.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.06)});
+
+  std::vector<std::uint8_t> occ(125, 0);
+  std::vector<std::uint8_t> contact_mask(125, 0);
+  std::vector<double> contact_distance(125, std::numeric_limits<double>::infinity());
+  occ[static_cast<std::size_t>(voxel_index(3, 2, 2))] = 1;
+  auto grid = make_grid(occ);
+  grid.attached_contact_mask = contact_mask.data();
+  grid.attached_contact_distance = contact_distance.data();
+  grid.attached_contact_stride = occ.size();
+  grid.attached_contact_tolerance = 0.001;
+
+  EXPECT_TRUE(osk::update_attached_voxel_contacts(att, s, grid, contact_mask.data(),
+                                                  contact_distance.data(), contact_mask.size(),
+                                                  contact_distance.size(), true));
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_NEAR(hit.min_distance, -0.01, 1e-9);
+}
+
+TEST(AttachedVoxelCollision, EmbeddedResidueIsAllowedOnlyUntilSeparation) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.1)});
+
+  std::vector<std::uint8_t> occ(125, 0);
+  std::vector<std::uint8_t> contact_mask(125, 0);
+  std::vector<double> contact_distance(125, std::numeric_limits<double>::infinity());
+  occ[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;
+  auto grid = make_grid(occ);
+  grid.attached_contact_mask = contact_mask.data();
+  grid.attached_contact_distance = contact_distance.data();
+  grid.attached_contact_stride = occ.size();
+  grid.attached_contact_tolerance = 0.001;
+
+  EXPECT_TRUE(osk::update_attached_voxel_contacts(att, s, grid, contact_mask.data(),
+                                                  contact_distance.data(), contact_mask.size(),
+                                                  contact_distance.size(), true));
+  att.objects[0].pose_in_link = translate(0.02, 0.0, 0.0);
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  att.objects[0].pose_in_link = translate(0.3, 0.0, 0.0);
+  EXPECT_FALSE(osk::update_attached_voxel_contacts(att, s, grid, contact_mask.data(),
+                                                   contact_distance.data(), contact_mask.size(),
+                                                   contact_distance.size(), false));
+  att.objects[0].pose_in_link = identity();
+  EXPECT_TRUE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+}
+
+TEST(AttachedVoxelCollision, MultiObjectBaselinesUseDeclaredGridStride) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.06)});
+  append_object(att, 1, translate(0.2, 0.0, 0.0), {sphere_prim(0.06)});
+
+  std::vector<std::uint8_t> occ(125, 0);
+  std::vector<std::uint8_t> contact_mask(125, 0);
+  std::vector<double> contact_distance(250, std::numeric_limits<double>::infinity());
+  const auto first = static_cast<std::size_t>(voxel_index(2, 2, 2));
+  const auto second = static_cast<std::size_t>(voxel_index(4, 2, 2));
+  occ[first] = 1;
+  occ[second] = 1;
+  auto grid = make_grid(occ);
+  grid.attached_contact_mask = contact_mask.data();
+  grid.attached_contact_distance = contact_distance.data();
+  grid.attached_contact_stride = occ.size();
+
+  EXPECT_TRUE(osk::update_attached_voxel_contacts(att, s, grid, contact_mask.data(),
+                                                  contact_distance.data(), contact_mask.size(),
+                                                  contact_distance.size(), true));
+  EXPECT_NE(contact_mask[first] & 0x1U, 0U);
+  EXPECT_NE(contact_mask[second] & 0x2U, 0U);
+  EXPECT_TRUE(std::isfinite(contact_distance[first]));
+  EXPECT_TRUE(std::isfinite(contact_distance[occ.size() + second]));
+}
+
+TEST(AttachedObjects, MultipleObjectsAreAllChecked) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  // Attach link 1 at origin; attach link 3 shifted to x=1.0.
+  s.link_world = {identity(), identity(), identity(), translate(1.0, 0.0, 0.0)};
+
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.1)});  // object 0: at origin, clear
+  append_object(att, 3, identity(), {sphere_prim(0.1)});  // object 1: at x=1.0, overlaps obstacle
+
+  osk::WorldModel w;
+  osk::Capsule obs;
+  obs.radius = 0.1;
+  obs.half_length = 0.2;
+  obs.origin = translate(1.15, 0.0, 0.0);  // near object 1 only
+  w.capsules = {obs};
+
+  const auto hit = osk::check_attached_world_collision(m, att, s, w, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 1) << "the second attached object must be reached and reported";
+  EXPECT_EQ(hit.link_b, 0);
+}
+
+// ── Multiple primitives per attached object (Phase 1) ──────────────────
+
+TEST(AttachedMultiPrimitive, BothPrimitivesOnOneObjectAreChecked) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  // One object (attach link 1, identity object pose) owning TWO sphere
+  // primitives: A at the object origin (clear), B offset +x by 0.3 (near the
+  // obstacle). Only the second primitive collides; the object must still fire.
+  osk::AttachedModel att;
+  append_object(att, 1, identity(),
+                {sphere_prim(0.05, identity()), sphere_prim(0.1, translate(0.3, 0.0, 0.0))});
+  ASSERT_EQ(att.n_objects, 1U);
+  ASSERT_EQ(att.n_primitives, 2U);
+
+  osk::WorldModel w;
+  osk::Capsule obs;
+  obs.radius = 0.05;
+  obs.half_length = 0.0;
+  obs.origin = translate(0.35, 0.0, 0.0);  // 0.35 from origin; near primitive B only
+  w.capsules = {obs};
+
+  const auto hit = osk::check_attached_world_collision(m, att, s, w, 0.0);
+  EXPECT_TRUE(hit.hit) << "the second primitive of the object must be checked and reported";
+  EXPECT_EQ(hit.link_a, 0) << "evidence stays object-level (single object index 0)";
+  EXPECT_EQ(hit.link_b, 0);
+  // B centre at x=0.3 r=0.1; obstacle centre x=0.35 r=0.05 -> centreline 0.05, radii 0.15.
+  EXPECT_NEAR(hit.min_distance, -0.1, 1e-9);
+}
+
+TEST(AttachedMultiPrimitive, FirstPrimitiveCollisionIsReported) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  // Now the FIRST primitive is the colliding one; the object still fires and
+  // reports the (object-level) index with the minimum distance across prims.
+  osk::AttachedModel att;
+  append_object(att, 1, identity(),
+                {sphere_prim(0.1, identity()), sphere_prim(0.05, translate(1.0, 0.0, 0.0))});
+
+  osk::WorldModel w;
+  osk::Capsule obs;
+  obs.radius = 0.1;
+  obs.half_length = 0.2;
+  obs.origin = translate(0.15, 0.0, 0.0);  // overlaps primitive A at origin
+  w.capsules = {obs};
+
+  const auto hit = osk::check_attached_world_collision(m, att, s, w, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_NEAR(hit.min_distance, -0.05, 1e-9);
+}
+
+TEST(AttachedMultiPrimitive, MultipleObjectsWithMultiplePrimitives) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  // Object 0 attach link 1 at origin; object 1 attach link 3 at x=2.0.
+  s.link_world = {identity(), identity(), identity(), translate(2.0, 0.0, 0.0)};
+
+  osk::AttachedModel att;
+  // Object 0: two prims, both clear of the obstacle.
+  append_object(att, 1, identity(),
+                {sphere_prim(0.05, identity()), sphere_prim(0.05, translate(0.2, 0.0, 0.0))});
+  // Object 1: two prims; the SECOND (offset +x 0.3 → world x=2.3) hits.
+  append_object(att, 3, identity(),
+                {sphere_prim(0.05, identity()), sphere_prim(0.1, translate(0.3, 0.0, 0.0))});
+  ASSERT_EQ(att.n_objects, 2U);
+  ASSERT_EQ(att.n_primitives, 4U);
+
+  osk::WorldModel w;
+  osk::Capsule obs;
+  obs.radius = 0.05;
+  obs.half_length = 0.0;
+  obs.origin = translate(2.35, 0.0, 0.0);  // near object 1's second primitive only
+  w.capsules = {obs};
+
+  const auto hit = osk::check_attached_world_collision(m, att, s, w, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 1) << "object 1 (second object, second primitive) must be reported";
+  EXPECT_EQ(hit.link_b, 0);
+}
+
+TEST(AttachedMultiPrimitive, PoseInLinkComposesWithPoseInObject) {
+  // Quaternion composition: object pose_in_link is +90° about Z at the origin;
+  // the primitive is offset +x 0.2 in the object frame. The composed world
+  // centre is Rz(90)·(0.2,0,0) = (0, 0.2, 0), NOT (0.2, 0, 0).
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  const double q = std::sqrt(0.5);
+  const osk::Transform obj_pose =
+      osk::transform_from_translation_quat(0.0, 0.0, 0.0, 0.0, 0.0, q, q);  // +90° about Z
+
+  osk::AttachedModel att;
+  append_object(att, 1, obj_pose, {sphere_prim(0.05, translate(0.2, 0.0, 0.0))});
+
+  // Obstacle at the composed (rotated) location → hit.
+  osk::WorldModel hit_world;
+  osk::Capsule near_obs;
+  near_obs.radius = 0.05;
+  near_obs.half_length = 0.0;
+  near_obs.origin = translate(0.0, 0.2, 0.0);
+  hit_world.capsules = {near_obs};
+  const auto hit = osk::check_attached_world_collision(m, att, s, hit_world, 0.0);
+  EXPECT_TRUE(hit.hit) << "primitive must land at the composed (rotated) pose (0, 0.2, 0)";
+  EXPECT_LT(hit.min_distance, 0.0);
+
+  // Obstacle at the UN-rotated location (0.2, 0, 0) → clear (would only hit if
+  // the composition order were wrong).
+  osk::WorldModel clear_world;
+  osk::Capsule far_obs;
+  far_obs.radius = 0.05;
+  far_obs.half_length = 0.0;
+  far_obs.origin = translate(0.2, 0.0, 0.0);
+  clear_world.capsules = {far_obs};
+  const auto clear = osk::check_attached_world_collision(m, att, s, clear_world, 0.0);
+  EXPECT_FALSE(clear.hit) << "the pre-rotation position must be clear (composition order matters)";
+}
+
+// ── transform_from_translation_quat ────────────────────────────────────
+
+TEST(TransformFromQuat, IdentityQuaternionKeepsAxes) {
+  const osk::Transform t = osk::transform_from_translation_quat(1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0);
+  EXPECT_NEAR(t.r[0], 1.0, 1e-12);
+  EXPECT_NEAR(t.r[4], 1.0, 1e-12);
+  EXPECT_NEAR(t.r[8], 1.0, 1e-12);
+  EXPECT_NEAR(t.t.x, 1.0, 1e-12);
+  EXPECT_NEAR(t.t.y, 2.0, 1e-12);
+  EXPECT_NEAR(t.t.z, 3.0, 1e-12);
+}
+
+TEST(TransformFromQuat, NinetyAboutZMatchesRpy) {
+  // Quaternion for +90 deg about Z: (0,0,sin45,cos45).
+  const double s = std::sqrt(0.5);
+  const osk::Transform q = osk::transform_from_translation_quat(0.0, 0.0, 0.0, 0.0, 0.0, s, s);
+  const osk::Transform r = osk::transform_from_xyz_rpy(0.0, 0.0, 0.0, 0.0, 0.0, kPi / 2.0);
+  for (int i = 0; i < 9; ++i) {
+    EXPECT_NEAR(q.r[i], r.r[i], 1e-9) << "rotation element " << i;
+  }
+}
+
+TEST(TransformFromQuat, NonUnitQuaternionIsNormalised) {
+  // Same rotation as a unit +90-about-Z quaternion, scaled by 5.
+  const double s = std::sqrt(0.5) * 5.0;
+  const osk::Transform q = osk::transform_from_translation_quat(0.0, 0.0, 0.0, 0.0, 0.0, s, s);
+  EXPECT_NEAR(q.r[0], 0.0, 1e-9);
+  EXPECT_NEAR(q.r[1], -1.0, 1e-9);
+  EXPECT_NEAR(q.r[3], 1.0, 1e-9);
+}
+
+// ── ingest_attached_objects (fixed-capacity, fail-closed) ──────────────
+
+namespace {
+
+osk::AttachedModel presized_model(std::size_t max_objects, std::size_t max_prims,
+                                  std::size_t max_touch) {
+  osk::AttachedModel m;
+  m.objects.assign(max_objects, osk::AttachedObject{});
+  m.primitives.assign(max_prims, osk::AttachedPrimitive{});
+  m.touch_links.assign(max_touch, 0);
+  m.n_objects = 0;
+  m.n_primitives = 0;
+  return m;
+}
+
+osk::AttachedPrimitiveInput sphere_prim_input(double radius) {
+  osk::AttachedPrimitiveInput p;
+  p.kind = osk::AttachedShapeKind::kSphere;
+  p.radius = radius;
+  p.half_length = 0.0;
+  return p;
+}
+
+osk::AttachedObjectInput sphere_input(const std::string& attach,
+                                      const std::vector<std::string>& touch) {
+  osk::AttachedObjectInput in;
+  in.attach_link = attach;
+  in.touch_links = touch;
+  in.primitives = {sphere_prim_input(0.05)};
+  return in;
+}
+
+const std::vector<std::string> kLinkNames = {"base", "hand", "finger_left", "finger_right", "arm"};
+
+}  // namespace
+
+TEST(IngestAttached, ResolvesLinkAndTouchNames) {
+  auto model = presized_model(4, 4, 8);
+  const std::vector<osk::AttachedObjectInput> in = {
+      sphere_input("hand", {"finger_left", "finger_right"})};
+  const auto st = osk::ingest_attached_objects(in, kLinkNames, 4, 4, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kOk);
+  ASSERT_EQ(model.n_objects, 1U);
+  ASSERT_EQ(model.n_primitives, 1U);
+  EXPECT_EQ(model.objects[0].attach_link, 1);  // "hand"
+  ASSERT_EQ(model.objects[0].prim_count, 1);
+  EXPECT_EQ(model.objects[0].prim_first, 0);
+  ASSERT_EQ(model.objects[0].touch_count, 2);
+  EXPECT_EQ(model.touch_links[0], 2);  // finger_left
+  EXPECT_EQ(model.touch_links[1], 3);  // finger_right
+}
+
+TEST(IngestAttached, UnknownAttachLinkFailsClosed) {
+  auto model = presized_model(4, 4, 8);
+  const std::vector<osk::AttachedObjectInput> in = {sphere_input("gripper_typo", {"finger_left"})};
+  const auto st = osk::ingest_attached_objects(in, kLinkNames, 4, 4, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kUnknownLink);
+  EXPECT_EQ(model.n_objects, 0U) << "an unknown attach link must leave nothing checkable";
+}
+
+TEST(IngestAttached, UnknownTouchLinkFailsClosed) {
+  auto model = presized_model(4, 4, 8);
+  const std::vector<osk::AttachedObjectInput> in = {sphere_input("hand", {"third_finger"})};
+  const auto st = osk::ingest_attached_objects(in, kLinkNames, 4, 4, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kUnknownLink);
+  EXPECT_EQ(model.n_objects, 0U);
+}
+
+TEST(IngestAttached, ObjectOverflowFailsClosed) {
+  auto model = presized_model(1, 4, 8);
+  const std::vector<osk::AttachedObjectInput> in = {sphere_input("hand", {"finger_left"}),
+                                                    sphere_input("arm", {"finger_right"})};
+  const auto st = osk::ingest_attached_objects(in, kLinkNames, 1, 4, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kOverflow);
+  EXPECT_EQ(model.n_objects, 0U);
+}
+
+TEST(IngestAttached, PrimitiveOverflowFailsClosed) {
+  // One object carrying three primitives against a total-primitive cap of 2.
+  auto model = presized_model(4, 2, 8);
+  osk::AttachedObjectInput multi;
+  multi.attach_link = "hand";
+  multi.touch_links = {};
+  multi.primitives = {sphere_prim_input(0.05), sphere_prim_input(0.04), sphere_prim_input(0.03)};
+  const auto st = osk::ingest_attached_objects({multi}, kLinkNames, 4, 2, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kOverflow);
+  EXPECT_EQ(model.n_objects, 0U);
+  EXPECT_EQ(model.n_primitives, 0U);
+}
+
+TEST(IngestAttached, TotalPrimitiveOverflowAcrossObjectsFailsClosed) {
+  // Two objects with two primitives each (4 total) against a cap of 3.
+  auto model = presized_model(4, 3, 8);
+  osk::AttachedObjectInput a;
+  a.attach_link = "hand";
+  a.primitives = {sphere_prim_input(0.05), sphere_prim_input(0.04)};
+  osk::AttachedObjectInput b;
+  b.attach_link = "arm";
+  b.primitives = {sphere_prim_input(0.05), sphere_prim_input(0.04)};
+  const auto st = osk::ingest_attached_objects({a, b}, kLinkNames, 4, 3, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kOverflow);
+  EXPECT_EQ(model.n_objects, 0U);
+}
+
+TEST(IngestAttached, TouchLinkOverflowFailsClosed) {
+  auto model = presized_model(4, 4, 1);
+  const std::vector<osk::AttachedObjectInput> in = {
+      sphere_input("hand", {"finger_left", "finger_right"})};
+  const auto st = osk::ingest_attached_objects(in, kLinkNames, 4, 4, 1, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kOverflow);
+  EXPECT_EQ(model.n_objects, 0U);
+}
+
+TEST(IngestAttached, MalformedRadiusFailsClosed) {
+  auto model = presized_model(4, 4, 8);
+  osk::AttachedObjectInput bad = sphere_input("hand", {"finger_left"});
+  bad.primitives[0].radius = 0.0;  // non-positive radius
+  const auto st = osk::ingest_attached_objects({bad}, kLinkNames, 4, 4, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kMalformed);
+  EXPECT_EQ(model.n_objects, 0U);
+}
+
+TEST(IngestAttached, EmptyPrimitivesObjectFailsClosed) {
+  auto model = presized_model(4, 4, 8);
+  osk::AttachedObjectInput no_geom;
+  no_geom.attach_link = "hand";
+  no_geom.touch_links = {"finger_left"};
+  no_geom.primitives = {};  // an object with no geometry is not safe to ignore
+  const auto st = osk::ingest_attached_objects({no_geom}, kLinkNames, 4, 4, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kMalformed);
+  EXPECT_EQ(model.n_objects, 0U);
+}
+
+TEST(IngestAttached, MultiplePrimitivesPerObjectResolve) {
+  auto model = presized_model(4, 8, 8);
+  osk::AttachedObjectInput cap;
+  cap.attach_link = "hand";
+  cap.touch_links = {"finger_left"};
+  osk::AttachedPrimitiveInput c;
+  c.kind = osk::AttachedShapeKind::kCapsule;
+  c.radius = 0.03;
+  c.half_length = 0.06;
+  osk::AttachedPrimitiveInput box;
+  box.kind = osk::AttachedShapeKind::kBox;
+  box.half_extents = {0.02, 0.03, 0.04};
+  cap.primitives = {c, box};  // one object, two primitives
+
+  const auto st = osk::ingest_attached_objects({cap}, kLinkNames, 4, 8, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kOk);
+  ASSERT_EQ(model.n_objects, 1U);
+  ASSERT_EQ(model.n_primitives, 2U);
+  ASSERT_EQ(model.objects[0].prim_count, 2);
+  EXPECT_EQ(model.objects[0].prim_first, 0);
+  EXPECT_EQ(model.primitives[0].kind, osk::AttachedShapeKind::kCapsule);
+  EXPECT_NEAR(model.primitives[0].half_length, 0.06, 1e-12);
+  EXPECT_EQ(model.primitives[1].kind, osk::AttachedShapeKind::kBox);
+  EXPECT_NEAR(model.primitives[1].half_extents.z, 0.04, 1e-12);
+  EXPECT_EQ(model.objects[0].touch_count, 1);
+}
+
+TEST(IngestAttached, TwoObjectsFlattenPrimitiveSlicesInOrder) {
+  auto model = presized_model(4, 8, 8);
+  osk::AttachedObjectInput a;
+  a.attach_link = "hand";
+  a.primitives = {sphere_prim_input(0.05), sphere_prim_input(0.04)};
+  osk::AttachedObjectInput b;
+  b.attach_link = "arm";
+  b.primitives = {sphere_prim_input(0.03)};
+  const auto st = osk::ingest_attached_objects({a, b}, kLinkNames, 4, 8, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kOk);
+  ASSERT_EQ(model.n_objects, 2U);
+  ASSERT_EQ(model.n_primitives, 3U);
+  EXPECT_EQ(model.objects[0].prim_first, 0);
+  EXPECT_EQ(model.objects[0].prim_count, 2);
+  EXPECT_EQ(model.objects[1].prim_first, 2);
+  EXPECT_EQ(model.objects[1].prim_count, 1);
+  EXPECT_EQ(model.objects[1].attach_link, 4);  // "arm"
+}
+
+TEST(IngestAttached, EmptyInputIsOkAndEmpty) {
+  auto model = presized_model(4, 4, 8);
+  const auto st = osk::ingest_attached_objects({}, kLinkNames, 4, 4, 8, model);
+  EXPECT_EQ(st, osk::AttachIngestStatus::kOk);
+  EXPECT_EQ(model.n_objects, 0U);
+  EXPECT_EQ(model.n_primitives, 0U);
+}
+
+// ── Evidence coherence: reported pair and reported distance describe ONE hit ──
+//
+// `CollisionHit` is E-stop evidence: `link_a`/`link_b` name the geometry that
+// tripped the check; `min_distance` is the number the FailureTrigger and the
+// operator log quote. Contract: on a hit, evidence names the DEEPEST pair
+// that tripped the gate; the sweep-wide minimum over every pair checked
+// (including gate-exempted ones, e.g. an attached payload's attach-time
+// contact baseline) is carried separately in `sweep_min_distance`. Reporting
+// only — tests below also pin that the stop/no-stop decision is unaffected.
+
+namespace {
+
+// Base-frame transform of an occupied cell, recovered from the linear voxel
+// index the evidence reports (`idx = x + sx*(y + sy*z)`) — lets a test
+// recompute the distance of the cell the kernel named and compare it with the
+// distance the kernel reported.
+osk::Transform voxel_transform_at(const osk::VoxelGrid& grid, int linear_index) {
+  const int ix = linear_index % grid.sx;
+  const int iy = (linear_index / grid.sx) % grid.sy;
+  const int iz = linear_index / (grid.sx * grid.sy);
+  // Every grid in this file is identity-oriented (`pose.r` default), so the
+  // cell's base-frame centre is `pose.t` plus the lattice offset. A rotated
+  // grid would need `pose.r` applied to that offset — see
+  // `OrientedGrid.*` below, which builds its expectations that way.
+  osk::Transform t;
+  t.t = {grid.pose.t.x + (ix + 0.5) * grid.resolution, grid.pose.t.y + (iy + 0.5) * grid.resolution,
+         grid.pose.t.z + (iz + 0.5) * grid.resolution};
+  return t;
+}
+
+// One box primitive (posed in its object's frame). A box payload gives the
+// voxel check an exact SAT overlap depth, so a test can place a deep
+// "payload residue" cell and a shallow support cell with hand-computed
+// distances.
+osk::AttachedPrimitive box_prim(double hx, double hy, double hz,
+                                const osk::Transform& pose_in_object = osk::Transform{}) {
+  osk::AttachedPrimitive p;
+  p.kind = osk::AttachedShapeKind::kBox;
+  p.half_extents = {hx, hy, hz};
+  p.pose_in_object = pose_in_object;
+  return p;
+}
+
+const osk::Vec3 kVoxelHalf{0.05, 0.05, 0.05};  // make_grid()'s 0.1 m cells
+
+// ── Support-contact witness fixture (ADR-0092 D6) ───────────────────────────
+//
+// The 2026-08-13 baguette run, to the tenth of a millimetre. A 300x50x50 mm
+// payload rests on a counter with its bottom face at z = 0. The counter is
+// mapped at 25 mm resolution and the lattice phase puts the surface cell's
+// centre 3.2 mm ABOVE that face, so the cell cube's top face is 15.7 mm above
+// it: the check reads -15.70 mm of penetration for a contact MuJoCo measured
+// at -0.87..-1.37 mm. That inflation is pure discretisation, and the witness
+// exists to tolerate exactly it — and nothing else.
+
+constexpr int kSupportN = 24;
+constexpr double kSupportRes = 0.025;
+// Attested physical depth: the deepest of the six real MuJoCo counter-payload
+// contacts in that run.
+constexpr double kAttestedPenetration = 0.00137;
+
+int support_index(int x, int y, int z) { return x + kSupportN * (y + kSupportN * z); }
+
+osk::VoxelGrid support_grid(const std::vector<std::uint8_t>& occ) {
+  osk::VoxelGrid g;
+  // Phased so cell (12, 12, 12) is centred at (0, 0, +0.0032).
+  g.pose.t = {-0.3125, -0.3125, -0.3093};
+  g.resolution = kSupportRes;
+  g.sx = kSupportN;
+  g.sy = kSupportN;
+  g.sz = kSupportN;
+  g.occupancy = occ.data();
+  g.attached_contact_tolerance = 0.001;  // physical slack, not a quantisation fudge
+  return g;
+}
+
+// The carried baguette: one box spanning z in [0, 0.05], attached at link 1.
+void append_baguette(osk::AttachedModel& att, double patch_radius_m) {
+  append_object(att, 1, identity(), {box_prim(0.15, 0.025, 0.025, translate(0.0, 0.0, 0.025))});
+  osk::AttachedObject& o = att.objects.back();
+  o.has_support_witness = patch_radius_m > 0.0;
+  o.support_point = {0.0, 0.0, 0.0};   // the payload's own support face
+  o.support_normal = {0.0, 0.0, 1.0};  // counter -> payload
+  o.support_patch_radius = patch_radius_m;
+  o.support_max_penetration = kAttestedPenetration;
+}
+
+}  // namespace
+
+TEST(SupportContactWitness, QuantisationInflatedSupportContactDoesNotStopTheRobot) {
+  // The exact false stop this witness exists to remove.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  auto grid = support_grid(occ);
+
+  // First: what the kernel actually sees without any attestation — a 15.70 mm
+  // penetration, which is exactly what E-stopped the baguette run.
+  const auto unattested = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(unattested.hit) << "no witness is live yet, so this must still stop";
+  EXPECT_NEAR(unattested.min_distance, -0.0157, 1e-9);
+
+  // Now arm the witness. Same geometry, same cell, same -15.70 mm reading —
+  // but the depth that decides is measured against the attested support plane,
+  // where it is 3.2 mm, inside the 12.5 mm cube half-width the lattice can
+  // legitimately produce.
+  grid.support_witness_live = 0x1;
+  EXPECT_EQ(osk::update_support_contact_witnesses(att, s, grid, 0x1, 0.0), 0x1)
+      << "the payload is still on its attested support, so the witness stays live";
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+}
+
+TEST(SupportContactWitness, NoAttestationMeansNoExemption) {
+  // Fail-closed: a payload with no witness behaves exactly as it does today.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);  // patch 0 => has_support_witness == false
+  ASSERT_FALSE(att.objects[0].has_support_witness);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  auto grid = support_grid(occ);
+  // Even with the live bit wrongly set, an object that attests nothing is
+  // exempt from nothing, and the latch drops the bit on the next refresh.
+  grid.support_witness_live = 0x1;
+  EXPECT_TRUE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+  EXPECT_EQ(osk::update_support_contact_witnesses(att, s, grid, 0x1, 0.0), 0x0);
+}
+
+TEST(SupportContactWitness, DeepeningIntoTheSupportStillStops) {
+  // The payload drives 40 mm further into the counter. The cell's height above
+  // the attested support face rises millimetre for millimetre with the sink,
+  // and past the lattice envelope it stops the robot.
+  //
+  // 40 mm rather than the 20 mm this test used before ADR-0097's Second
+  // Amendment (hazard log Entry 012, "Calibration 2026-08-15"): the envelope
+  // gained one voxel, so it is now 12.5 + 1.37 + 1 + 25 = 39.87 mm and the sink
+  // has to put the cell past THAT to prove deepening still stops. At 40 mm of
+  // sink the cell sits 43.2 mm above the attested plane.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  auto grid = support_grid(occ);
+  grid.support_witness_live = 0x1;
+  ASSERT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  // 20 mm of sink is 23.2 mm above the plane — inside the widened envelope, and
+  // that is the calibration doing exactly what it was approved to do.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.02);
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.04);
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_b, support_index(12, 12, 12));
+  EXPECT_LT(hit.min_distance, 0.0);
+}
+
+TEST(SupportContactWitness, SeparationKillsTheExemptionAndRecontactIsANewViolation) {
+  // Hysteresis. Lift the payload clear, and the attestation dies with the
+  // contact it described; lowering back onto the same cell is a fresh contact
+  // that only a fresh attestation could ever exempt.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  auto grid = support_grid(occ);
+
+  std::uint8_t live = 0x1;
+  grid.support_witness_live = live;
+  ASSERT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  // Lift 10 cm: nothing the witness would exempt is in contact any more.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, 0.10);
+  live = osk::update_support_contact_witnesses(att, s, grid, live, 0.0);
+  EXPECT_EQ(live, 0x0);
+
+  // Come back down onto the very same cell. The latch never re-arms itself.
+  att.objects[0].pose_in_link = identity();
+  live = osk::update_support_contact_witnesses(att, s, grid, live, 0.0);
+  EXPECT_EQ(live, 0x0) << "only a fresh World State attestation may re-arm the witness";
+  grid.support_witness_live = live;
+  EXPECT_TRUE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+}
+
+TEST(SupportContactWitness, NewContactOutsideThePatchStillStopsMidCarry) {
+  // A live support witness must not license a contact against anything else.
+  // The wall cell sits 150 mm out — past the 100 mm attested patch plus the
+  // cube's circumradius — while the support cell underneath stays exempt.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  occ[static_cast<std::size_t>(support_index(18, 12, 12))] = 1;  // 150 mm along +x
+  auto grid = support_grid(occ);
+  grid.support_witness_live = 0x1;
+
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_b, support_index(18, 12, 12))
+      << "the stop must name the unattested cell, never the exempt support cell";
+}
+
+TEST(SupportContactWitness, ProtrusionInsideThePatchStillStops) {
+  // Inside the patch, but genuinely higher than the attested support face: an
+  // object standing on the counter under the payload. 50 mm of solid above the
+  // support plane is not discretisation, and it stops the robot.
+  //
+  // Two cells up rather than one, since ADR-0097's Second Amendment (hazard log
+  // Entry 012, "Calibration 2026-08-15"): the height envelope gained one voxel
+  // precisely so that ADJACENT CO-PLANAR structure one voxel up — a raised edge
+  // or a neighbouring stack on the same surface — stops reading as a protrusion.
+  // That one-voxel band is now exempt by decision (see
+  // `…TheRound8CoplanarCellIsInsideTheWidenedEnvelope`), so what proves the
+  // bound still bites is solid a further voxel above it.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  occ[static_cast<std::size_t>(support_index(12, 12, 14))] = 1;  // stacked two cells up
+  auto grid = support_grid(occ);
+  grid.support_witness_live = 0x1;
+
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_b, support_index(12, 12, 14));
+}
+
+// ── 2026-08-15 battery: height-envelope calibration ──────────────────────────
+// Source: spark:~/openral-runs/2026-08-15-baguette-battery ("Calibration
+// 2026-08-15"), hazard-log Entry 012 (HZ-0092-1), ADR-0097 Second Amendment.
+// Findings: run 4 moved the payload 10.2 mm during the stop while the
+// lateral patch gate (135.7 mm) stayed clear of the actual 84-86 mm offset —
+// ruling out "sliding" — and round-8 r2 measured +42.9 mm against a
+// ~15-19 mm envelope (excess +24.4 mm ≈ one 25 mm voxel): adjacent
+// co-planar structure sits ~1 voxel above the attested plane during genuine
+// support contact.
+//
+// Bound gains a 4th additive term, one full voxel, inside the existing
+// lateral patch (patch radius untouched — height, not reach):
+//   half_resolution·(|n.x|+|n.y|+|n.z|) + attested depth + slack + resolution
+//
+// Fixture: same 24³/25 mm lattice, re-phased so a cell layer sits at a chosen
+// height above the attested plane; attested depth = run's 5 mm. Envelope =
+// 12.5 + 5.0 + 1.0 + 25.0 = 43.5 mm; r2's +42.9 mm clears it by 0.6 mm.
+
+namespace {
+
+constexpr double kBatteryPenetration = 0.005;  // r2's attested physical depth
+constexpr double kBatteryPatchRadius = 0.114;  // the run's patch: 135.65 mm gate
+constexpr double kBatteryEnvelope = 0.0435;    // 12.5 + 5 + 1 + 25 mm
+constexpr double kR2CoplanarHeight = 0.0429;   // round-8 r2's measured excess
+constexpr double kR2LateralOffset = 0.085;     // inside the run's 84-86 mm band
+
+// The kernel node's own physical FK/pose slack — `attached_contact_tolerance_m`,
+// declared and defaulted to 1 mm in `src/lifecycle_kernel.cpp`. It is the third
+// term of the envelope, so it is named here rather than spelled `0.001` at each
+// call site.
+constexpr double kBatteryContactTolerance = 0.001;
+
+// The SAME round-8 r2 cell to the micrometre, as the final battery recorded it
+// (`spark:~/openral-runs/2026-08-15-final-battery/`): +42.893 mm above the
+// attested support plane, 85.7 mm out. `kR2CoplanarHeight` / `kR2LateralOffset`
+// above carry the same cell rounded to the tenth of a millimetre, and the
+// rounding went UP, so the rounded fixture is the STRICTER of the two probes —
+// 0.600 mm of headroom against the field cell's own 0.607 mm. Both are pinned
+// below; neither is allowed to drift.
+constexpr double kR2FieldHeight = 0.042893;
+constexpr double kR2FieldLateral = 0.0857;
+
+// The battery lattice, phased so cell layer `iz = 14` centres exactly
+// `top_height` above the attested plane (z = 0, the payload's own support face)
+// and column `ix = 15` centres exactly `kR2LateralOffset` out along +x. The
+// support cell the witness measures against is then layer 12, two voxels (50 mm)
+// below the probed layer, in column 12.
+osk::VoxelGrid battery_grid(const std::vector<std::uint8_t>& occ, double top_height) {
+  osk::VoxelGrid g;
+  g.pose.t = {kR2LateralOffset - 15.5 * kSupportRes, -0.3125, top_height - 14.5 * kSupportRes};
+  g.resolution = kSupportRes;
+  g.sx = kSupportN;
+  g.sy = kSupportN;
+  g.sz = kSupportN;
+  g.occupancy = occ.data();
+  g.attached_contact_tolerance = kBatteryContactTolerance;
+  return g;
+}
+
+void append_battery_baguette(osk::AttachedModel& att) {
+  append_baguette(att, kBatteryPatchRadius);
+  att.objects.back().support_max_penetration = kBatteryPenetration;
+}
+
+// Base-frame centre of cell (ix, iy, iz) on a battery lattice.
+osk::Vec3 battery_center(const osk::VoxelGrid& g, int ix, int iy, int iz) {
+  // Identity-oriented lattice (see `voxel_transform_at`).
+  return osk::Vec3{g.pose.t.x + (ix + 0.5) * g.resolution, g.pose.t.y + (iy + 0.5) * g.resolution,
+                   g.pose.t.z + (iz + 0.5) * g.resolution};
+}
+
+}  // namespace
+
+TEST(SupportContactWitness, TheRound8CoplanarCellIsInsideTheWidenedEnvelope) {
+  // Round-8 r2, to the tenth of a millimetre. The payload is in continuing
+  // support contact (the cell two layers down is occupied, exempt, and keeps the
+  // latch alive) and the co-planar cell 85 mm out sits +42.9 mm above the
+  // attested plane — one voxel over the pre-calibration envelope, 0.6 mm inside
+  // the calibrated one. Before the calibration this stopped the flagship run.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_battery_baguette(att);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;  // the support surface
+  occ[static_cast<std::size_t>(support_index(15, 12, 14))] = 1;  // the co-planar cell
+  auto grid = battery_grid(occ, kR2CoplanarHeight);
+  grid.support_witness_live = 0x1;
+
+  // The fixture is the arithmetic, so state it before leaning on it: the cell is
+  // where the run said it was, laterally and vertically.
+  const osk::Vec3 coplanar = battery_center(grid, 15, 12, 14);
+  ASSERT_NEAR(coplanar.z, kR2CoplanarHeight, 1e-12);
+  ASSERT_NEAR(coplanar.x, kR2LateralOffset, 1e-12);
+  ASSERT_LT(kR2CoplanarHeight, kBatteryEnvelope) << "0.6 mm of headroom, and not a millimetre more";
+  ASSERT_LT(kBatteryEnvelope - kR2CoplanarHeight, 0.001);
+
+  EXPECT_EQ(osk::update_support_contact_witnesses(att, s, grid, 0x1, 0.0), 0x1)
+      << "support contact persists; the witness is live throughout";
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit)
+      << "the co-planar cell one voxel up is inside the calibrated envelope";
+
+  // The bound itself, probed directly on either side of 43.5 mm — the fixture
+  // passes because the arithmetic says so, not because it was rounded into
+  // passing.
+  const osk::AttachedObject& obj = att.objects[0];
+  const double slack = grid.attached_contact_tolerance;
+  EXPECT_TRUE(osk::support_contact_exempts(
+      obj, identity(), osk::Vec3{kR2LateralOffset, 0.0, kBatteryEnvelope}, kSupportRes, slack));
+  EXPECT_FALSE(osk::support_contact_exempts(
+      obj, identity(), osk::Vec3{kR2LateralOffset, 0.0, kBatteryEnvelope + 1e-9}, kSupportRes,
+      slack));
+}
+
+TEST(SupportContactWitness, TheWidenedEnvelopeIsExactlyItsFourNamedTerms) {
+  // The envelope DERIVED rather than transcribed, at the exact geometry the
+  // field flew. `kBatteryEnvelope` above is a literal: it can't notice when
+  // one of its four summarised terms moves underneath it, silently probing a
+  // stale number. This rebuilds the figure from the constants the kernel
+  // actually reads (live resolution, attested depth, attached_contact_tolerance_m,
+  // calibration's one voxel) so both a changed constant and a changed formula
+  // fail here.
+  //
+  // Provenance: thinnest safety-relevant margin in the stack. Final battery
+  // (spark:~/openral-runs/2026-08-15-final-battery/, round 8 r2; hazard-log
+  // Entry 012, "Calibration 2026-08-15") put the real co-planar cell at
+  // +42.893 mm above the attested support plane, 85.7 mm out, against a
+  // 43.500 mm envelope: 0.607 mm headroom — the run's whole outcome turns on
+  // it. Half a millimetre off any of the four constants and the flagship run
+  // stops again, or a genuine protrusion stops being one.
+  osk::AttachedModel att;
+  append_battery_baguette(att);
+  const osk::AttachedObject& obj = att.objects[0];
+
+  // The four terms, in the order the bound adds them. The support normal is
+  // axis-aligned (+z, counter -> payload), so the first term is exactly half a
+  // voxel: 0.5 x 25 mm x (|0| + |0| + |1|).
+  const osk::Vec3& n = obj.support_normal;
+  ASSERT_NEAR(std::fabs(n.x) + std::fabs(n.y) + std::fabs(n.z), 1.0, 1e-15)
+      << "the run's support face is axis-aligned; the first term is half a voxel";
+  const double normal_half_width =
+      0.5 * kSupportRes * (std::fabs(n.x) + std::fabs(n.y) + std::fabs(n.z));
+  const double derived =
+      normal_half_width + kBatteryPenetration + kBatteryContactTolerance + kSupportRes;
+
+  EXPECT_DOUBLE_EQ(normal_half_width, 0.0125);
+  EXPECT_DOUBLE_EQ(kBatteryPenetration, 0.005) << "r2's attested physical contact depth";
+  EXPECT_DOUBLE_EQ(kBatteryContactTolerance, 0.001) << "the node's attached_contact_tolerance_m";
+  EXPECT_DOUBLE_EQ(kSupportRes, 0.025) << "the 2026-08-15 co-planar voxel, and the map's own cell";
+  EXPECT_DOUBLE_EQ(derived, 0.0435) << "12.5 + 5 + 1 + 25 mm = 43.500 mm, exactly";
+  EXPECT_DOUBLE_EQ(derived, kBatteryEnvelope) << "the literal above must be this derivation";
+
+  // 43.500 mm is the FLOOR of the envelope at this resolution and depth, not a
+  // midpoint: (|n.x| + |n.y| + |n.z|) >= 1 for every unit normal, with equality
+  // only when the support face is axis-aligned. No attitude of the support face
+  // can make the bound narrower than the number derived above — so an envelope
+  // reported BELOW 43.500 mm here is arithmetically unreachable, whichever way
+  // the counter is tilted.
+  constexpr double kInvSqrt3 = 0.5773502691896258;
+  for (const osk::Vec3& tilt : {osk::Vec3{0.0, 0.0, -1.0}, osk::Vec3{0.0, -1.0, 0.0},
+                                osk::Vec3{kInvSqrt3, kInvSqrt3, kInvSqrt3},
+                                osk::Vec3{0.6, 0.0, 0.8}, osk::Vec3{-0.28, 0.96, 0.0}}) {
+    const double tilted =
+        0.5 * kSupportRes * (std::fabs(tilt.x) + std::fabs(tilt.y) + std::fabs(tilt.z)) +
+        kBatteryPenetration + kBatteryContactTolerance + kSupportRes;
+    EXPECT_GE(tilted, derived) << "a tilted support face only ever widens the height envelope";
+  }
+
+  // The field cell, to the micrometre, against the derived bound — exempt, by
+  // 0.607 mm. The rounded fixture the other tests fly (+42.9 mm) is the
+  // stricter probe of the two at 0.600 mm; both are inside, and the gap between
+  // them is the rounding, not a tolerance.
+  EXPECT_TRUE(osk::support_contact_exempts(obj, identity(),
+                                           osk::Vec3{kR2FieldLateral, 0.0, kR2FieldHeight},
+                                           kSupportRes, kBatteryContactTolerance))
+      << "round-8 r2's co-planar cell is inside the calibrated envelope";
+  EXPECT_NEAR(derived - kR2FieldHeight, 0.000607, 1e-12) << "the field margin: 0.607 mm";
+  EXPECT_NEAR(derived - kR2CoplanarHeight, 0.000600, 1e-12) << "the rounded fixture's 0.600 mm";
+  EXPECT_LT(kR2FieldLateral, kBatteryPatchRadius + 0.5 * kSupportRes * 1.7320508075688772)
+      << "85.7 mm is well inside the run's 135.65 mm lateral gate; height is the only bound left";
+
+  // And the closed side of the bound, on the derived number rather than the
+  // literal: the last micrometre is exempt, the first one past it is not.
+  EXPECT_TRUE(osk::support_contact_exempts(obj, identity(),
+                                           osk::Vec3{kR2FieldLateral, 0.0, derived - 1e-6},
+                                           kSupportRes, kBatteryContactTolerance));
+  EXPECT_TRUE(osk::support_contact_exempts(obj, identity(),
+                                           osk::Vec3{kR2FieldLateral, 0.0, derived}, kSupportRes,
+                                           kBatteryContactTolerance))
+      << "the bound is closed: a cell exactly on the envelope is still support";
+  EXPECT_FALSE(osk::support_contact_exempts(obj, identity(),
+                                            osk::Vec3{kR2FieldLateral, 0.0, derived + 1e-6},
+                                            kSupportRes, kBatteryContactTolerance))
+      << "one micrometre past 43.500 mm is a protrusion, and it stops the robot";
+}
+
+TEST(SupportContactWitness, SolidAboveTheCoplanarBandStillStops) {
+  // The other side of the same calibration. +55 mm is 11.5 mm past the
+  // calibrated envelope — a genuine protrusion standing on the support surface,
+  // not the one-voxel co-planar band the battery measured — and it stops the
+  // robot with the witness live and support contact unbroken.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_battery_baguette(att);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  occ[static_cast<std::size_t>(support_index(15, 12, 14))] = 1;
+  auto grid = battery_grid(occ, 0.055);
+  grid.support_witness_live = 0x1;
+  ASSERT_NEAR(battery_center(grid, 15, 12, 14).z, 0.055, 1e-12);
+  ASSERT_GT(0.055, kBatteryEnvelope);
+
+  EXPECT_EQ(osk::update_support_contact_witnesses(att, s, grid, 0x1, 0.0), 0x1);
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit) << "the calibration widened the envelope; it did not remove it";
+  EXPECT_EQ(hit.link_b, support_index(15, 12, 14))
+      << "the stop must name the protrusion, never the exempt support cell";
+  EXPECT_FALSE(osk::support_contact_exempts(
+      att.objects[0], identity(), osk::Vec3{kR2LateralOffset, 0.0, 0.055}, kSupportRes, 0.001));
+}
+
+TEST(SupportContactWitness, TheWidenedEnvelopeIsHeightOnlyNotReach) {
+  // The half of the calibration that did NOT move. The extra voxel applies only
+  // within the already-bounded lateral patch: a cell at the same +42.9 mm but
+  // past the attested patch (padded by the cube circumradius) is a contact
+  // nobody attested and still stops, exactly as
+  // `NewContactOutsideThePatchStillStopsMidCarry` requires mid-carry.
+  osk::AttachedModel att;
+  append_battery_baguette(att);
+  const osk::AttachedObject& obj = att.objects[0];
+  const double reach = kBatteryPatchRadius + 0.5 * kSupportRes * 1.7320508075688772;
+  ASSERT_NEAR(reach, 0.13565, 1e-5) << "the run's own 135.7 mm lateral gate";
+
+  EXPECT_TRUE(osk::support_contact_exempts(
+      obj, identity(), osk::Vec3{reach - 0.001, 0.0, kR2CoplanarHeight}, kSupportRes, 0.001));
+  EXPECT_FALSE(osk::support_contact_exempts(
+      obj, identity(), osk::Vec3{reach + 0.001, 0.0, kR2CoplanarHeight}, kSupportRes, 0.001));
+}
+
+TEST(SupportContactWitness, ExemptCellsStayOutOfTheReportedDistance) {
+  // Evidence coherence, unchanged by the new exemption: the exempt support
+  // cell reaches sweep_min_distance only, never min_distance.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  occ[static_cast<std::size_t>(support_index(18, 12, 12))] = 1;
+  auto grid = support_grid(occ);
+  grid.support_witness_live = 0x1;
+
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_NEAR(hit.min_distance, -0.0125, 1e-9) << "the wall cell's own 12.5 mm overlap";
+  EXPECT_NEAR(hit.sweep_min_distance, -0.0157, 1e-9)
+      << "the exempt support cell's 15.7 mm stays available as a diagnostic only";
+}
+
+TEST(SupportContactWitness, LostOccupancyMapDropsEveryWitness) {
+  // Fail-closed: with no map there is no way to confirm the payload is still on
+  // its support, so no exemption may survive the refresh.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+  (void)m;
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  auto grid = support_grid(occ);
+  grid.occupancy = nullptr;
+  EXPECT_EQ(osk::update_support_contact_witnesses(att, s, grid, 0xFF, 0.0), 0x0);
+}
+
+// ── partition against the Layer-2 payload clearing ───────────────────────────
+// `openral_octomap_bridge` removes the payload's own cells from the published
+// grid; the witness above proves continued support by finding an occupied
+// cell it would exempt still touching the payload. A resting payload's
+// bottom cell layer IS the counter's top cell layer, so the two mechanisms
+// contend for the same cells. Division (stated here so a change to either
+// side must pass through it): payload silhouette ABOVE the attested plane →
+// clearing; cells inside the attested patch → witness.
+
+TEST(SupportContactWitness, ThePartitionedClearingLeavesTheWitnessItsEvidence) {
+  // What the bridge must publish for a resting payload: the payload's own cell
+  // one layer up is gone, the attested support cell underneath is not. The
+  // witness then still measures against a real cell, stays live, and exempts
+  // exactly it.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  // The pre-clearing map, for contrast: the payload's own uncleared silhouette
+  // at +53.2 mm above the attested plane is not support contact, and stops the
+  // robot — the 2026-08-14 acceptance-run failure this clearing exists to fix.
+  // Two layers up rather than one since the 2026-08-15 height calibration
+  // (hazard log Entry 012): the +28.2 mm layer is now inside the widened
+  // envelope, so it is the layer above it that still makes the contrast.
+  std::vector<std::uint8_t> before(kSupportN * kSupportN * kSupportN, 0);
+  before[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  before[static_cast<std::size_t>(support_index(12, 12, 14))] = 1;
+  auto pre = support_grid(before);
+  pre.support_witness_live = 0x1;
+  const auto pre_hit = osk::check_attached_voxel_collision(m, att, s, pre, 0.0);
+  ASSERT_TRUE(pre_hit.hit);
+  EXPECT_EQ(pre_hit.link_b, support_index(12, 12, 14));
+
+  // After the partitioned clearing: the silhouette cell cleared, the support
+  // cell withheld.
+  std::vector<std::uint8_t> after(kSupportN * kSupportN * kSupportN, 0);
+  after[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  auto post = support_grid(after);
+  post.support_witness_live = 0x1;
+  EXPECT_EQ(osk::update_support_contact_witnesses(att, s, post, 0x1, 0.0), 0x1)
+      << "the withheld support cell is what keeps the witness alive";
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, post, 0.0).hit);
+}
+
+TEST(SupportContactWitness, ClearingTheAttestedPatchKillsTheWitnessAndTheReturningCellStops) {
+  // The 2026-08-14 defect, from the kernel's side, and why the bridge must not
+  // clear the attested patch. Reproduced 2/2 on baguette+counter and
+  // cup+island: the clearing takes the counter with the payload, the witness
+  // loses the only evidence it is allowed to consult and declares separation
+  // (`support_witness_separated live=0x0 was=0x1`) while the payload has not
+  // moved a micrometre — and the moment a support cell falls back outside the
+  // clearing reach and returns to the map, the unchanged physical contact
+  // E-stops, unexempted.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  auto cleared = support_grid(occ);  // the support cell cleared away with the payload
+  cleared.support_witness_live = 0x1;
+  const std::uint8_t live = osk::update_support_contact_witnesses(att, s, cleared, 0x1, 0.0);
+  EXPECT_EQ(live, 0x0) << "no occupied cell left to attest to a contact that never ended";
+
+  // One frame later the same cell is in the map again. The latch never re-arms
+  // itself, so this is a fresh, unattested contact.
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  auto returned = support_grid(occ);
+  returned.support_witness_live = live;
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, returned, 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_b, support_index(12, 12, 12));
+  EXPECT_NEAR(hit.min_distance, -0.0157, 1e-9);
+  EXPECT_EQ(hit.sweep_min_distance, hit.min_distance)
+      << "sweep == min is the field signature of a stop with no exemption active";
+}
+
+TEST(SupportContactWitness, MalformedAttestationFailsTheWholeIngestClosed) {
+  const std::vector<std::string> links = {"base", "hand"};
+  osk::AttachedModel out;
+  out.objects.assign(2, osk::AttachedObject{});
+  out.primitives.assign(4, osk::AttachedPrimitive{});
+  out.touch_links.assign(4, 0);
+
+  osk::AttachedObjectInput in;
+  in.attach_link = "hand";
+  osk::AttachedPrimitiveInput prim;
+  prim.kind = osk::AttachedShapeKind::kSphere;
+  prim.radius = 0.05;
+  in.primitives = {prim};
+  in.has_support_witness = true;
+  in.support_point = {0.0, 0.0, 0.0};
+  in.support_normal = {0.0, 0.0, 0.0};  // degenerate
+  in.support_patch_radius = 0.1;
+  in.support_max_penetration = 0.001;
+  EXPECT_EQ(osk::ingest_attached_objects({in}, links, 2, 4, 4, out),
+            osk::AttachIngestStatus::kMalformed);
+  EXPECT_EQ(out.n_objects, 0U);
+
+  in.support_normal = {0.0, 0.0, 4.0};  // un-normalised is fine; it gets normalised
+  in.support_patch_radius = -1.0;       // but a non-positive patch is not
+  EXPECT_EQ(osk::ingest_attached_objects({in}, links, 2, 4, 4, out),
+            osk::AttachIngestStatus::kMalformed);
+
+  in.support_patch_radius = 0.1;
+  in.support_max_penetration = -0.001;  // nor is a negative depth
+  EXPECT_EQ(osk::ingest_attached_objects({in}, links, 2, 4, 4, out),
+            osk::AttachIngestStatus::kMalformed);
+
+  in.support_max_penetration = 0.001;
+  EXPECT_EQ(osk::ingest_attached_objects({in}, links, 2, 4, 4, out), osk::AttachIngestStatus::kOk);
+  ASSERT_EQ(out.n_objects, 1U);
+  EXPECT_TRUE(out.objects[0].has_support_witness);
+  EXPECT_NEAR(out.objects[0].support_normal.z, 1.0, 1e-12) << "the normal is normalised at ingest";
+  EXPECT_NEAR(out.objects[0].support_patch_radius, 0.1, 1e-12);
+}
+
+// ── Place-phase witness (ADR-0097) ──────────────────────────────────────────
+// `support_contact_exempts` is producer-blind — no branch on `evidence_kind`,
+// no knowledge of what a declaration is; the declaration gates the PRODUCER,
+// keeping the predicate evidence-based. A place witness is structurally the
+// same as a pick witness: an attestation on
+// `AttachedCollisionObject.support_contact`, exempting exactly its patch.
+//
+// Scenario: round-5 (spark:~/openral-runs/2026-08-14-round5/baguette/
+// seed1_run2) — payload inserted into a mapped container, resting on the
+// shelf. That run stopped at -1.78 mm because World State attested nothing
+// for the shelf contact (no place phase to attest for), so the shelf read as
+// an ordinary obstacle. In kernel terms declared/undeclared differ in one
+// bit, `has_support_witness`; both directions pinned below.
+
+namespace {
+
+// The cabinet's own occupancy, on the same 24^3 / 25 mm lattice: three shelf
+// cells directly under the inserted payload, and one back-panel cell 150 mm
+// along +x — inside the container, on the payload, and NOT on the attested
+// support plane.
+constexpr int kShelfCellsX[] = {11, 12, 13};
+constexpr int kCabinetBackX = 18;
+constexpr int kCabinetBackZ = 13;
+
+void fill_cabinet(std::vector<std::uint8_t>& occ, bool with_back_panel) {
+  for (const int ix : kShelfCellsX) {
+    occ[static_cast<std::size_t>(support_index(ix, 12, 12))] = 1;
+  }
+  if (with_back_panel) {
+    occ[static_cast<std::size_t>(support_index(kCabinetBackX, 12, kCabinetBackZ))] = 1;
+  }
+}
+
+}  // namespace
+
+TEST(SupportContactWitness, DeclaredPlaceContactRidesTheSameExemptionAsThePick) {
+  // The declared insertion. The payload is down on the cabinet's shelf, World
+  // State has attested that contact, and the kernel does not stop on it.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);  // the place attestation: same shape, same caps
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet(occ, /*with_back_panel=*/false);
+  auto grid = support_grid(occ);
+  grid.support_witness_live = 0x1;
+
+  EXPECT_EQ(osk::update_support_contact_witnesses(att, s, grid, 0x1, 0.0), 0x1)
+      << "the payload is resting on the surface it attested; the witness stays live";
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit)
+      << "the flagship counter->cabinet insertion completes";
+}
+
+TEST(SupportContactWitness, TheSameInsertionWithNoDeclarationStillStops) {
+  // Round-5 itself. Identical geometry, identical cells, identical payload
+  // pose — the ONLY difference is that nothing was attested, because no place
+  // phase was declared. The kernel sees an ordinary obstacle and stops on it,
+  // at the quantisation-inflated depth the run reported.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);  // no attestation => has_support_witness == false
+  ASSERT_FALSE(att.objects[0].has_support_witness);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet(occ, /*with_back_panel=*/false);
+  auto grid = support_grid(occ);
+  grid.support_witness_live = 0x1;  // even wrongly set, it exempts nothing
+
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit) << "an undeclared insertion must keep stopping the robot";
+  EXPECT_NEAR(hit.min_distance, -0.0157, 1e-9);
+  EXPECT_EQ(osk::update_support_contact_witnesses(att, s, grid, 0x1, 0.0), 0x0);
+}
+
+TEST(SupportContactWitness, TheDeclaredShelfIsExemptButTheCabinetAroundItIsNot) {
+  // The anti-scope, inside the declared target itself. The shelf the payload
+  // was attested against is exempt; the cabinet's back panel — same container,
+  // same goal, 150 mm out and therefore outside the attested patch — is not.
+  // A declaration buys the attested patch and nothing else.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet(occ, /*with_back_panel=*/true);
+  auto grid = support_grid(occ);
+  grid.support_witness_live = 0x1;
+
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_b, support_index(kCabinetBackX, 12, kCabinetBackZ))
+      << "the stop must name the back panel, never the attested shelf";
+}
+
+TEST(SupportContactWitness, DeepeningIntoTheDeclaredPlaceSurfaceStillStops) {
+  // Symmetric with DeepeningIntoTheSupportStillStops. A declaration does not
+  // license driving the payload THROUGH the shelf it declared.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet(occ, /*with_back_panel=*/false);
+  auto grid = support_grid(occ);
+  grid.support_witness_live = 0x1;
+  ASSERT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  // 40 mm of sink, for the same reason `DeepeningIntoTheSupportStillStops`
+  // moved from 20: the envelope gained one voxel on 2026-08-15 and the pick and
+  // place witnesses share the one predicate, so they share the new bound too.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.04);
+  EXPECT_TRUE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+}
+
+TEST(SupportContactWitness, PickAndPlaceShareOneSlotSequentially) {
+  // The concurrency question ADR-0097 left to implementation time, answered:
+  // one witness per payload, reused. The pick witness dies on separation from
+  // the counter; the place witness is a NEW attestation written into the same
+  // slot, and it exempts its own plane only.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;  // the counter
+  auto grid = support_grid(occ);
+
+  std::uint8_t live = 0x1;
+  grid.support_witness_live = live;
+  ASSERT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  // Carry away. The pick witness dies and the kernel never revives it.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, 0.30);
+  live = osk::update_support_contact_witnesses(att, s, grid, live, 0.0);
+  ASSERT_EQ(live, 0x0);
+
+  // The place attestation lands: the payload is now over the cabinet shelf,
+  // and World State has attested THAT contact. The kernel re-arms only because
+  // a new attestation arrived (the lifecycle node's (support_id, stamp_ns) key
+  // rule), and the exemption follows the new plane.
+  std::fill(occ.begin(), occ.end(), static_cast<std::uint8_t>(0));
+  fill_cabinet(occ, /*with_back_panel=*/true);
+  att.objects[0].pose_in_link = identity();
+  live = 0x1;  // stands in for the fresh-attestation re-arm
+  grid.support_witness_live = live;
+
+  EXPECT_EQ(osk::update_support_contact_witnesses(att, s, grid, live, 0.0), 0x1);
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_b, support_index(kCabinetBackX, 12, kCabinetBackZ))
+      << "the place witness exempts the shelf it describes and nothing else";
+}
+
+TEST(SupportContactWitness, AWrongDeclaredTargetChangesWhichContactNeverHowMuch) {
+  // HZ-0097-2 mitigation 3. Give the attestation BOTH kernel caps at once —
+  // the largest patch (0.5 m) and the deepest penetration (10 mm) a witness
+  // may claim — i.e. the most any declaration, right or wrong, could ever buy.
+  // The exemption is still bounded: the total a cell may sit above the attested
+  // plane is 12.5 mm of cube half-width + 10 mm of attested depth + 1 mm of
+  // pose-noise slack + 25 mm of co-planar headroom (ADR-0097's Second
+  // Amendment, hazard log Entry 012 "Calibration 2026-08-15") = 48.5 mm, and
+  // that arithmetic does not know or care what was declared.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.50);                     // the maximum patch
+  att.objects[0].support_max_penetration = 0.01;  // the maximum depth
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  occ[static_cast<std::size_t>(support_index(12, 12, 12))] = 1;
+  auto grid = support_grid(occ);
+  grid.support_witness_live = 0x1;
+
+  // The plane rides in the payload's own frame, so sinking the payload sinks
+  // it too. At 45 mm of sink the cell is 48.2 mm above the plane — inside the
+  // 48.5 mm bound, and still exempt.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.045);
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  // At 50 mm it is 53.2 mm above, and the caps do not stretch for it.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.05);
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  EXPECT_TRUE(hit.hit) << "the caps bound a wrong declaration; they do not stretch for it";
+  EXPECT_EQ(hit.link_b, support_index(12, 12, 12));
+}
+
+TEST(CollisionEvidence, AttachedVoxelReportsTheTriggeringCellNotTheExemptResidue) {
+  // The observed field failure, to five decimals: a box payload carried into
+  // an occupancy map that still holds the payload's own cell. That residue
+  // cell is 100.4 mm "inside" the payload and is exempt (it was already
+  // embedded at attach time); the cell that actually stops the robot is the
+  // support cell it newly touches by 0.4 mm.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, translate(-0.001, 0.0, 0.0), {box_prim(0.0504, 0.0504, 0.0504)});
+
+  std::vector<std::uint8_t> occ(125, 0);
+  const int residue = voxel_index(2, 2, 2);  // the payload's own occupancy residue
+  const int support = voxel_index(3, 2, 2);  // the real, newly touched support cell
+  occ[static_cast<std::size_t>(residue)] = 1;
+  occ[static_cast<std::size_t>(support)] = 1;
+  std::vector<std::uint8_t> contact_mask(125, 0);
+  std::vector<double> contact_distance(125, std::numeric_limits<double>::infinity());
+  auto grid = make_grid(occ);
+  grid.attached_contact_mask = contact_mask.data();
+  grid.attached_contact_distance = contact_distance.data();
+  grid.attached_contact_stride = occ.size();
+  grid.attached_contact_tolerance = 0.001;
+
+  // Attach-time snapshot: only the residue cell is in contact (the support
+  // cell is still 0.6 mm clear), so only the residue cell is exempt.
+  ASSERT_TRUE(osk::update_attached_voxel_contacts(att, s, grid, contact_mask.data(),
+                                                  contact_distance.data(), contact_mask.size(),
+                                                  contact_distance.size(), true));
+  ASSERT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  // 1 mm of approach: the payload now overlaps the support cell by 0.4 mm.
+  att.objects[0].pose_in_link = identity();
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_EQ(hit.link_b, support) << "the stop was caused by the support cell";
+  EXPECT_NEAR(hit.min_distance, -0.0004, 1e-9)
+      << "min_distance must describe the cell the evidence names, not the exempt residue";
+  EXPECT_NEAR(hit.sweep_min_distance, -0.1004, 1e-9)
+      << "the sweep-wide minimum (the exempt residue) stays available, separately";
+}
+
+TEST(CollisionEvidence, AttachedVoxelReportsTheDeepestTriggeringCell) {
+  // Three occupied cells trip at once. The evidence must name one of them and
+  // quote that one's distance; the deepest is the useful choice and the one
+  // pinned here.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, translate(0.02, 0.0, 0.0), {box_prim(0.09, 0.05, 0.05)});
+
+  std::vector<std::uint8_t> occ(125, 0);
+  occ[static_cast<std::size_t>(voxel_index(1, 2, 2))] = 1;  // scanned first, -0.02 m
+  occ[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;  // deepest, -0.10 m
+  occ[static_cast<std::size_t>(voxel_index(3, 2, 2))] = 1;  // -0.06 m
+  const auto grid = make_grid(occ);
+
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_b, voxel_index(2, 2, 2));
+  // Recompute the named cell's distance: evidence must be self-consistent.
+  const osk::Transform named = voxel_transform_at(grid, hit.link_b);
+  const double named_distance = osk::box_box_distance(
+      translate(0.02, 0.0, 0.0), osk::Vec3{0.09, 0.05, 0.05}, named, kVoxelHalf);
+  EXPECT_NEAR(hit.min_distance, named_distance, 1e-9);
+  EXPECT_NEAR(hit.sweep_min_distance, named_distance, 1e-9)
+      << "no cell is exempt here, so the sweep minimum is the triggering cell";
+}
+
+TEST(CollisionEvidence, WorldVoxelDistanceDescribesTheReportedCell) {
+  // Same coherence rule on the robot-link voxel path: the shallow cell is
+  // scanned first, the deep cell second, and the evidence must not mix them.
+  const auto m = one_capsule_model();  // capsule r=0.1, half-length 0.2 at the origin
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  std::vector<std::uint8_t> occ(125, 0);
+  occ[static_cast<std::size_t>(voxel_index(1, 2, 2))] = 1;  // -0.05 m, scanned first
+  occ[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;  // -0.10 m, deepest
+  const auto grid = make_grid(occ);
+
+  const auto hit = osk::check_voxel_collision(m, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_b, voxel_index(2, 2, 2));
+  const osk::Transform named = voxel_transform_at(grid, hit.link_b);
+  const double named_distance = osk::box_capsule_distance(named, kVoxelHalf, identity(), 0.1, 0.2);
+  EXPECT_NEAR(hit.min_distance, named_distance, 1e-9);
+  EXPECT_NEAR(hit.sweep_min_distance, named_distance, 1e-9);
+}
+
+TEST(CollisionEvidence, SelfCollisionDistanceDescribesTheReportedLinkPair) {
+  // Link 1 grazes link 2 by 1 mm (checked first) while it overlaps link 3 by
+  // 50 mm. The evidence must not quote the 50 mm against the (1,2) pair.
+  osk::CollisionModel m = hand_model();
+  add_capsule(m, 1, 0.05, 0.0, identity());
+  add_capsule(m, 2, 0.05, 0.0, identity());
+  add_capsule(m, 3, 0.05, 0.0, identity());
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), translate(0.099, 0.0, 0.0), translate(0.0, 0.05, 0.0)};
+
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 1);
+  EXPECT_EQ(hit.link_b, 3) << "the deepest tripping pair is (link 1, link 3)";
+  EXPECT_NEAR(hit.min_distance, -0.05, 1e-9);
+  EXPECT_NEAR(hit.sweep_min_distance, -0.05, 1e-9);
+}
+
+TEST(CollisionEvidence, AttachedWorldDistanceDescribesTheReportedObstacle) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {sphere_prim(0.1)});
+
+  osk::WorldModel w;
+  osk::Capsule grazing;
+  grazing.radius = 0.1;
+  grazing.half_length = 0.0;
+  grazing.origin = translate(0.199, 0.0, 0.0);  // -1 mm, checked first
+  osk::Capsule deep;
+  deep.radius = 0.1;
+  deep.half_length = 0.0;
+  deep.origin = translate(0.15, 0.0, 0.0);  // -50 mm
+  w.capsules = {grazing, deep};
+
+  const auto hit = osk::check_attached_world_collision(m, att, s, w, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_EQ(hit.link_b, 1) << "the deepest tripping obstacle is the second one";
+  EXPECT_NEAR(hit.min_distance, -0.05, 1e-9);
+}
+
+TEST(CollisionEvidence, SweepMinimumEqualsTheEvidenceDistanceWhenNothingTrips) {
+  // With no hit there is no pair to describe, so `min_distance` keeps its
+  // clearance meaning and both fields agree.
+  const auto m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  const auto clear = osk::check_world_collision(m, s, world_obstacle_at(1.0), 0.0);
+  EXPECT_FALSE(clear.hit);
+  EXPECT_NEAR(clear.min_distance, 0.8, 1e-9);
+  EXPECT_NEAR(clear.sweep_min_distance, clear.min_distance, 1e-12);
+
+  // An empty check reports no clearance at all (infinite), on both fields.
+  const osk::WorldModel empty;
+  const auto nothing = osk::check_world_collision(m, s, empty, 0.0);
+  EXPECT_FALSE(nothing.hit);
+  EXPECT_TRUE(std::isinf(nothing.min_distance));
+  EXPECT_TRUE(std::isinf(nothing.sweep_min_distance));
+}
+
+TEST(CollisionEvidence, GatingIsUnchangedAcrossTheAttachedContactLadder) {
+  // Reporting-only guard rail. The same inputs must produce the same
+  // stop/no-stop decision as before the evidence fix: the expectations below
+  // are the pre-fix kernel's answers, recorded here so any future change to
+  // the evidence path that moves a gate fails loudly.
+  //
+  // Fixture: a box payload attached at link 1, an occupancy residue cell it is
+  // embedded in at attach time, and a support cell 0.6 mm ahead of it.
+  const osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  struct Case {
+    double approach_m;  // payload offset along +x from the snapshot pose
+    bool expect_hit;
+  };
+  // 0.000: snapshot pose — residue exempt, support 0.6 mm clear.
+  // 0.001: support newly touched by 0.4 mm — a new cell, so it stops.
+  // 0.005: the new cell is 4.4 mm deep — stops.
+  //
+  // The `allow_new_shallow` column this ladder used to carry is gone with the
+  // mechanism: a blanket "any new cell shallower than the tolerance is fine"
+  // is not something the support-contact witness needs, and it exempted cells
+  // no one had attested. Its removal moves every one of those rows from
+  // no-stop to stop, i.e. strictly toward the conservative side.
+  const std::vector<Case> cases = {{0.000, false}, {0.001, true}, {0.005, true}};
+
+  for (const Case& c : cases) {
+    osk::AttachedModel att;
+    append_object(att, 1, translate(-0.001, 0.0, 0.0), {box_prim(0.0504, 0.0504, 0.0504)});
+    std::vector<std::uint8_t> occ(125, 0);
+    occ[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;
+    occ[static_cast<std::size_t>(voxel_index(3, 2, 2))] = 1;
+    std::vector<std::uint8_t> contact_mask(125, 0);
+    std::vector<double> contact_distance(125, std::numeric_limits<double>::infinity());
+    auto grid = make_grid(occ);
+    grid.attached_contact_mask = contact_mask.data();
+    grid.attached_contact_distance = contact_distance.data();
+    grid.attached_contact_stride = occ.size();
+    grid.attached_contact_tolerance = 0.001;
+    ASSERT_TRUE(osk::update_attached_voxel_contacts(att, s, grid, contact_mask.data(),
+                                                    contact_distance.data(), contact_mask.size(),
+                                                    contact_distance.size(), true));
+
+    att.objects[0].pose_in_link = translate(-0.001 + c.approach_m, 0.0, 0.0);
+    const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+    EXPECT_EQ(hit.hit, c.expect_hit) << "gating changed at approach=" << c.approach_m;
+    if (hit.hit) {
+      EXPECT_LE(hit.min_distance, 0.0) << "a reported stop is never a clearance";
+    }
+  }
+}
+
+// ── Declaration-scoped approach allowance (ADR-0097, 2026-08-14 amendment) ──
+// Closes round-6 (spark:~/openral-runs/2026-08-14-round6/baguette/
+// seed1_carry_*): with a correct place declaration and payload headed for the
+// declared cabinet, the kernel E-stopped at horizon_step 0 on
+// attached:sim:obj_main vs voxel_178099 (min_distance -4.9 mm) while the
+// payload was still 22-30 mm from real shelf contact. Declaration and
+// trajectory were fine — the place witness is earned by measured contact,
+// and the predictive check (unrelated to the witness) stopped the payload
+// before it could touch, because 25 mm cells inflate the cabinet's thin
+// opening by up to one voxel. A witness earned by touching can't arm if the
+// payload is stopped before it can touch.
+//
+// Fix: margin allowance of min(1.5 × voxel, 40 mm), applied only to the
+// declared payload, only to cells whose centre is inside the producer's
+// declared-target region, only while the declaration is live. Not an
+// exemption — reported distance is still the cell's true distance; the hard
+// stop behind the reduced margin is untouched.
+//
+// Cap was min(one voxel, 25 mm) until ADR-0097's Second Amendment
+// (2026-08-15, hazard log HZ-0097-4, "Calibration 2026-08-15"). The 5-run
+// battery's run 1 (spark:~/openral-runs/2026-08-15-baguette-battery/run1) —
+// the allowance's first in-vivo firing — read 26.48 mm of predictive-check
+// penetration at a ground-truth -2.43 mm contact, 1.48 mm short. Map-vs-truth
+// error at a placement pose is itself ~1 voxel, so a one-voxel allowance
+// absorbs exactly the discretization and leaves nothing for the contact
+// itself — structurally marginal, not occasionally short. At 25 mm cells the
+// cap is now 37.5 mm; at a real 50 mm grid it's 40 mm, not 75 mm — the
+// absolute ceiling still binds, only its value moved (2.5 cm → 4 cm).
+//
+// Fixture: same 24³/25 mm lattice as the witness tests; cabinet modelled as
+// a shelf below and a lip above, separated by the opening the payload must
+// pass through. Lattice phase: shelf cells' top face at z = -9.3 mm, lip
+// cells' bottom face at z = +40.7 mm — a quantised 50 mm opening for a
+// 50 mm-tall baguette, zero predicted clearance where the real cabinet has
+// centimetres.
+
+namespace {
+
+constexpr int kApproachShelfZ = 11;    // cube z in [-0.0343, -0.0093]
+constexpr int kApproachLipZ = 14;      // cube z in [ 0.0407,  0.0657]
+constexpr int kApproachOutsideX = 18;  // a shelf cell OUTSIDE the declared region
+constexpr int kApproachCabinetX[] = {11, 12, 13};
+
+void fill_cabinet_opening(std::vector<std::uint8_t>& occ, bool with_outside_obstacle) {
+  for (const int ix : kApproachCabinetX) {
+    occ[static_cast<std::size_t>(support_index(ix, 12, kApproachShelfZ))] = 1;
+    occ[static_cast<std::size_t>(support_index(ix, 12, kApproachLipZ))] = 1;
+  }
+  if (with_outside_obstacle) {
+    occ[static_cast<std::size_t>(support_index(kApproachOutsideX, 12, kApproachShelfZ))] = 1;
+  }
+}
+
+// The region the sim producer computes from the declared body's model subtree:
+// the cabinet's interior, 200 x 120 x 120 mm about the opening. It contains the
+// shelf and lip cell centres (z = -21.8 mm and +53.2 mm) and the three cabinet
+// columns, and NOT the ix=18 obstacle 150 mm away.
+osk::PlaceApproachRegion declared_cabinet_region(std::uint8_t mask = 0x1) {
+  osk::PlaceApproachRegion region;
+  EXPECT_EQ(osk::ingest_place_region(translate(0.0, 0.0, 0.0157), osk::Vec3{0.10, 0.06, 0.06}, mask,
+                                     region),
+            osk::PlaceRegionStatus::kOk);
+  return region;
+}
+
+// ── A coarse 50 mm lattice, for the absolute-cap tests ──────────────────────
+//
+// HZ-0095-2's episode in a new form: at real hardware's 5 cm resolution a purely
+// resolution-relative allowance would be 50 mm, double sim's. The cap makes that
+// impossible, and these helpers are what proves it.
+constexpr int kCoarseN = 13;
+constexpr double kCoarseRes = 0.05;
+
+int coarse_index(int x, int y, int z) { return x + kCoarseN * (y + kCoarseN * z); }
+
+osk::VoxelGrid coarse_grid(const std::vector<std::uint8_t>& occ) {
+  osk::VoxelGrid g;
+  // Phased so cell (6, 6, 6) is centred on the origin; its cube spans +/-25 mm.
+  g.pose.t = {-0.325, -0.325, -0.325};
+  g.resolution = kCoarseRes;
+  g.sx = kCoarseN;
+  g.sy = kCoarseN;
+  g.sz = kCoarseN;
+  g.occupancy = occ.data();
+  g.attached_contact_tolerance = 0.001;
+  return g;
+}
+
+}  // namespace
+
+TEST(PlaceApproachAllowance, TheRound6ApproachReachesTheDeclaredShelf) {
+  // The exact field stop, and its removal. The payload is inserted through the
+  // quantised opening: 4.9 mm into the shelf cells' inflated cube, 4.9 mm clear
+  // of the lip's. Undeclared that is round 6, to the tenth of a millimetre.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);  // no witness yet — it is EARNED at contact
+  ASSERT_FALSE(att.objects[0].has_support_witness);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet_opening(occ, /*with_outside_obstacle=*/false);
+  auto grid = support_grid(occ);
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.0142);
+
+  const auto round6 = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(round6.hit) << "with no declaration this is exactly what stopped the run";
+  EXPECT_NEAR(round6.min_distance, -0.0049, 1e-9);
+  EXPECT_FALSE(round6.place_allowance_active);
+
+  // The declaration's region goes live. Same geometry, same cell, same true
+  // -4.9 mm reading — the margin it is gated against is what moved.
+  grid.place_region = declared_cabinet_region();
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit)
+      << "the declared approach must be able to continue through the opening";
+
+  // And it continues all the way down to real shelf contact 19.1 mm lower, where
+  // the true distance is -24.0 mm — inside the 37.5 mm cap, with the 13.5 mm of
+  // headroom past the maximum inflation a 25 mm surface cell can produce that
+  // the Second Amendment bought. At that pose the place witness arms and its
+  // bounded, non-deepening exemption takes over.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.0333);
+  const auto at_contact = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  EXPECT_FALSE(at_contact.hit);
+  EXPECT_NEAR(at_contact.sweep_min_distance, -0.024, 1e-9)
+      << "the sweep still reports the true distance; only the gate moved";
+}
+
+TEST(PlaceApproachAllowance, TheRun1FieldPenetrationNowReachesContact) {
+  // ADR-0097's Second Amendment, on its own field evidence. Run 1 of the
+  // 2026-08-15 battery tripped at 26.48 mm of predictive-check penetration on a
+  // cell inside the declared region, 1.48 mm past the 25 mm allowance then in
+  // force, at a ground-truth contact of -2.43 mm. The calibrated cap is 37.5 mm
+  // at sim's 25 mm cells, so that reading is now 11.02 mm inside the allowance
+  // and the insertion continues to the contact the witness is earned by.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);  // no witness: the allowance is what is under test
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet_opening(occ, /*with_outside_obstacle=*/false);
+  auto grid = support_grid(occ);
+  grid.place_region = declared_cabinet_region();
+  EXPECT_NEAR(osk::place_approach_allowance(grid, 0, osk::Vec3{0.0, 0.0, -0.0218}), 0.0375, 1e-12)
+      << "min(1.5 x 25 mm voxel, 40 mm absolute) is 37.5 mm";
+
+  // The run-1 reading itself, reproduced to the hundredth of a millimetre.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.03578);
+  const auto run1 = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  EXPECT_NEAR(run1.sweep_min_distance, -0.02648, 1e-9) << "the field penetration, unchanged";
+  EXPECT_FALSE(run1.hit) << "1.48 mm short under the old cap; 11.02 mm inside the calibrated one";
+
+  // The cap still bites past that, at 38.2 mm and at 40 mm — but not against
+  // THIS payload: a 50 mm-tall baguette passing a 25 mm cell saturates at
+  // exactly 37.5 mm of overlap on every axis (25 mm of half-extent + 12.5 mm of
+  // cell half-width), so the calibrated cap is precisely the deepest reading the
+  // flagship geometry can produce. `…DeepeningPastTheAllowanceInsideTheRegion
+  // StillStops` carries the deeper payload that can, and pins both stops.
+
+  // Undeclared, run 1 is still a stop at the same true distance: the calibration
+  // moved a declaration-scoped margin, nothing else.
+  grid.place_region = osk::PlaceApproachRegion{};
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.03578);
+  const auto undeclared = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(undeclared.hit);
+  EXPECT_NEAR(undeclared.min_distance, -0.02648, 1e-9);
+  EXPECT_FALSE(undeclared.place_allowance_active);
+}
+
+TEST(PlaceApproachAllowance, TheSameApproachUndeclaredStopsExactlyAsRound6Did) {
+  // The regression that keeps the relaxation declaration-scoped. Byte-identical
+  // inputs, no live region: the pre-amendment kernel's answer, unchanged.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet_opening(occ, /*with_outside_obstacle=*/false);
+  auto grid = support_grid(occ);
+  ASSERT_FALSE(grid.place_region.valid) << "a default VoxelGrid carries no allowance";
+
+  for (const double dz : {-0.0142, -0.0333, -0.0500}) {
+    att.objects[0].pose_in_link = translate(0.0, 0.0, dz);
+    const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+    EXPECT_TRUE(hit.hit) << "undeclared insertion must keep stopping at dz=" << dz;
+    EXPECT_FALSE(hit.place_allowance_active);
+  }
+}
+
+TEST(PlaceApproachAllowance, TheAllowanceAppliesToThePredictedHorizonToo) {
+  // Round 6 stopped at horizon_step 0, not on the measured configuration. The
+  // predictive path is the same function called with an inflated margin, so the
+  // allowance has to hold there — otherwise the fix would not touch the failure
+  // it exists for.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet_opening(occ, /*with_outside_obstacle=*/false);
+  auto grid = support_grid(occ);
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.0142);
+
+  // collision_predict_margin_growth_m's default look-ahead inflation.
+  constexpr double kPredictiveMargin = 0.01;
+  ASSERT_TRUE(osk::check_attached_voxel_collision(m, att, s, grid, kPredictiveMargin).hit);
+  grid.place_region = declared_cabinet_region();
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, kPredictiveMargin).hit);
+}
+
+TEST(PlaceApproachAllowance, ACoarserGridNeverWidensTheAllowance) {
+  // HZ-0097-4 mitigation 1 as calibrated 2026-08-15, and the HZ-0095-2 lesson it
+  // descends from. At 50 mm resolution the voxel-relative half of the formula
+  // would be 1.5 x 50 = 75 mm — nearly twice sim's 37.5 mm, a permissiveness
+  // increase arriving as a side effect of map coarseness and reviewed by nobody.
+  // The absolute ceiling makes it 40 mm (the amendment's own worked example), so
+  // 45 mm of penetration inside the declared region still stops.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);
+
+  std::vector<std::uint8_t> occ(kCoarseN * kCoarseN * kCoarseN, 0);
+  occ[static_cast<std::size_t>(coarse_index(6, 6, 6))] = 1;
+  auto grid = coarse_grid(occ);
+  osk::PlaceApproachRegion region;
+  ASSERT_EQ(osk::ingest_place_region(identity(), osk::Vec3{0.20, 0.10, 0.10}, 0x1, region),
+            osk::PlaceRegionStatus::kOk);
+  grid.place_region = region;
+
+  EXPECT_NEAR(osk::place_approach_allowance(grid, 0, osk::Vec3{0.0, 0.0, 0.0}), 0.040, 1e-12)
+      << "min(1.5 x 50 mm voxel, 40 mm absolute) is 40 mm, never 75";
+
+  // 30 mm of penetration: inside the cap, forgiven.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.005);
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  // 45 mm: past the cap, and it stops — which a resolution-relative allowance
+  // would not have done.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.020);
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_NEAR(hit.min_distance, -0.045, 1e-9) << "the reported distance is the true one";
+  EXPECT_TRUE(hit.place_allowance_active) << "a stop at a reduced margin must say so";
+}
+
+// ── The advisory band (#176) ─────────────────────────────────────────────────
+//
+// A payload that has ARRIVED in its declared receptacle reads far deeper than
+// it is: the 2026-08-26 baguette place read −38.22 mm against a 37.5 mm
+// allowance while the ground truth measured −1.4 mm of physical contact, and
+// that 0.72 mm overshoot was a latched E-stop needing /openral/estop_reset.
+//
+// The band makes exactly that class refusable instead of latchable. It does not
+// widen what trips: every test below that expects `hit` expected `hit` before.
+// What it adds is `advisory`, and the whole safety argument is in how narrowly
+// that is set — so each of these pins one boundary of it.
+//
+// On the coarse 50 mm lattice these fixtures use: allowance = min(1.5 x 50, 40)
+// = 40 mm, advisory depth = min(0.2 x 50, 5) = 5 mm. So a declared payload is
+// clear above −40 mm, advisory in (−45, −40], and latched at or below −45 mm.
+// `d == dz − 25 mm` in this fixture's reachable range, whose floor is −50 mm
+// (the deepest a payload can read against a single 50 mm cell at all).
+
+namespace {
+
+// The jar-in-the-declared-region fixture, at a chosen payload offset.
+osk::CollisionHit advisory_case(double dz, bool declared) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);  // no witness: the band must stand on its own
+
+  static std::vector<std::uint8_t> occ;
+  occ.assign(static_cast<std::size_t>(kCoarseN) * kCoarseN * kCoarseN, 0);
+  occ[static_cast<std::size_t>(coarse_index(6, 6, 6))] = 1;
+  auto grid = coarse_grid(occ);
+  if (declared) {
+    grid.place_region = declared_cabinet_region();
+  }
+  att.objects[0].pose_in_link = translate(0.0, 0.0, dz);
+  return osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+}
+
+}  // namespace
+
+TEST(PlaceAdvisoryBand, AnArrivedPlaceIsRefusedRatherThanLatched) {
+  // −43 mm: 3 mm past the 40 mm allowance, inside the 5 mm band. This is the
+  // 2026-08-26 baguette case in miniature (it overshot by 0.72 mm) — it still
+  // refuses the action, it just no longer demands an operator reset for it.
+  const auto hit = advisory_case(-0.018, /*declared=*/true);
+  EXPECT_TRUE(hit.hit) << "an advisory hit is a refusal, not a pass";
+  EXPECT_TRUE(hit.advisory);
+  EXPECT_TRUE(hit.place_allowance_active);
+  EXPECT_NEAR(hit.min_distance, -0.043, 1e-9) << "the reported distance is still the true one";
+}
+
+TEST(PlaceAdvisoryBand, PastTheBandItIsTheLatchedStopItAlwaysWas) {
+  // −49 mm: 4 mm beyond allowance + band, and still reachable (the floor is
+  // −50 mm). The depth the band absorbs is bounded by the overshoot it exists
+  // for; past that, a stop is a stop.
+  const auto hit = advisory_case(-0.024, /*declared=*/true);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_FALSE(hit.advisory);
+}
+
+TEST(PlaceAdvisoryBand, TheBandEndsExactlyWhereItSaysItDoes) {
+  // The boundary itself, to the millimetre either side. −44 mm is the last
+  // advisory reading; −45 mm is the band's floor and latches.
+  const auto inside = advisory_case(-0.019, /*declared=*/true);   // d = −44 mm
+  const auto outside = advisory_case(-0.020, /*declared=*/true);  // d = −45 mm
+  ASSERT_TRUE(inside.hit);
+  ASSERT_TRUE(outside.hit);
+  EXPECT_TRUE(inside.advisory);
+  EXPECT_FALSE(outside.advisory) << "the band's floor latches, like every other trip boundary";
+}
+
+TEST(PlaceAdvisoryBand, AnUndeclaredPayloadIsNeverAdvisory) {
+  // The declaration is the whole licence. The identical geometry, with nobody
+  // having declared a place, is the latched stop it is today — and it trips at
+  // the plain margin rather than at the allowance, so it trips far sooner.
+  const auto hit = advisory_case(-0.018, /*declared=*/false);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_FALSE(hit.advisory);
+  EXPECT_FALSE(hit.place_allowance_active);
+}
+
+TEST(PlaceAdvisoryBand, TheBandStaysASmallFractionOfTheAllowance) {
+  // The band must never become the dominant term. It exists to absorb a
+  // measured 0.72 mm overshoot, not to widen the allowance by stealth, so it is
+  // pinned here at both lattices and against the allowance it sits on.
+  //
+  // Why a ratio and not "shallower than the deepest reachable contact": depth
+  // depends on the PAYLOAD's own primitive, not only the map. A 150x25x25 mm
+  // box saturates at -37.50 mm on the 25 mm grid (at/inside the 37.5 mm
+  // allowance — can never trip in a declared region), while the field
+  // baguette reached -38.22 mm. No universal "deepest reachable" to bound
+  // against; where depth saturates, the lifecycle node's consecutive-refusal
+  // cap is the operative bound, not this one.
+  for (const double res : {0.025, 0.05}) {
+    const double allowance = osk::place_approach_allowance_cap(res);
+    const double band = osk::place_advisory_depth(res);
+    EXPECT_GT(band, 0.0) << "resolution " << res;
+    EXPECT_LT(band, allowance / 4.0)
+        << "at resolution " << res << " the advisory band is no longer a small correction on the "
+        << "approach allowance";
+    EXPECT_LE(band, osk::kMaxPlaceAdvisoryDepthM);
+  }
+  // Sim and real end up at the same 5 mm band: the absolute ceiling binds on
+  // both, so a coarser map buys no extra permissiveness (the HZ-0097-4 lesson,
+  // applied to the new number as well).
+  EXPECT_NEAR(osk::place_advisory_depth(0.025), 0.005, 1e-12);
+  EXPECT_NEAR(osk::place_advisory_depth(0.05), 0.005, 1e-12);
+  EXPECT_NEAR(osk::place_advisory_depth(0.0), 0.0, 1e-12) << "an unusable map collapses the band";
+}
+
+TEST(PlaceAdvisoryBand, ARobotLinkIsNeverAdvisoryHoweverShallow) {
+  // The band lives in the attached-payload sweep and cannot reach a link. This
+  // is the property the whole change is scoped on: an arm touching the world is
+  // a stop, at any depth, declared place or not.
+  osk::CollisionModel m = one_capsule_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity()};
+  std::vector<std::uint8_t> occ(5 * 5 * 5, 0);
+  occ[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;
+  auto grid = make_grid(occ);
+  grid.place_region = declared_cabinet_region();  // declared, and irrelevant here
+
+  const auto hit = osk::check_voxel_collision(m, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_FALSE(hit.advisory);
+}
+
+TEST(PlaceAdvisoryBand, TheBandNeverMakesAClearPairTrip) {
+  // Strictly additive: the band re-labels tripping pairs, it never creates one.
+  // −35 mm is inside the allowance and clear, and stays clear.
+  const auto hit = advisory_case(-0.010, /*declared=*/true);
+  EXPECT_FALSE(hit.hit);
+  EXPECT_FALSE(hit.advisory);
+}
+
+TEST(PlaceAdvisoryBand, AShallowHardTripOutranksADeeperAdvisoryOne) {
+  // The failure mode `fold_pair`'s severity-first ranking exists for. Two
+  // payloads in one sweep: one deep inside its own declared region (advisory at
+  // −45 mm), one undeclared and only −5 mm into a cell — a real latching stop.
+  // Ranked by depth alone the advisory pair would win and the caller would not
+  // latch, silently losing the stop the second payload earned.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);  // object 0 — declared
+  append_baguette(att, 0.0);  // object 1 — not in the region mask
+
+  std::vector<std::uint8_t> occ(static_cast<std::size_t>(kCoarseN) * kCoarseN * kCoarseN, 0);
+  occ[static_cast<std::size_t>(coarse_index(6, 6, 6))] = 1;
+  auto grid = coarse_grid(occ);
+  grid.place_region = declared_cabinet_region(0x1);  // object 0 only
+
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.018);  // d = −43 mm, advisory
+  att.objects[1].pose_in_link = translate(0.0, 0.0, 0.020);   // d = −5 mm, hard
+
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_FALSE(hit.advisory) << "a hard trip must outrank a deeper advisory one";
+  EXPECT_EQ(hit.link_a, 1) << "and the reported pair must be the hard one";
+  EXPECT_NEAR(hit.min_distance, -0.005, 1e-9);
+}
+
+TEST(PlaceApproachAllowance, AnObjectAlreadyInTheRegionIsForgivenOnlyToTheCap) {
+  // HZ-0097-4's accepted cost, and its bound. A jar already sitting on the
+  // declared shelf when the declaration goes live receives the same allowance as
+  // the shelf, for the declared window, whether or not the payload ever touches
+  // it. That is a real reduction in the predictive check's conservatism —
+  // accepted, bounded, and pinned here: on this 50 mm lattice the forgiveness
+  // stops dead at the 40 mm absolute ceiling (ADR-0097's Second Amendment; the
+  // accepted cost is unchanged in shape and re-accepted at the same severity).
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);
+
+  std::vector<std::uint8_t> occ(kCoarseN * kCoarseN * kCoarseN, 0);
+  occ[static_cast<std::size_t>(coarse_index(6, 6, 6))] = 1;  // the jar
+  auto grid = coarse_grid(occ);
+  osk::PlaceApproachRegion region;
+  ASSERT_EQ(osk::ingest_place_region(identity(), osk::Vec3{0.20, 0.10, 0.10}, 0x1, region),
+            osk::PlaceRegionStatus::kOk);
+  grid.place_region = region;
+
+  struct Case {
+    double dz;
+    double distance;
+    bool expect_hit;
+  };
+  const std::vector<Case> cases = {{0.020, -0.005, false},
+                                   {0.005, -0.020, false},
+                                   {-0.005, -0.030, false},
+                                   {-0.015, -0.040, true},  // exactly the ceiling: it trips
+                                   {-0.020, -0.045, true}};
+  for (const Case& c : cases) {
+    att.objects[0].pose_in_link = translate(0.0, 0.0, c.dz);
+    const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+    EXPECT_EQ(hit.hit, c.expect_hit) << "jar penetration " << c.distance;
+    EXPECT_NEAR(hit.hit ? hit.min_distance : hit.sweep_min_distance, c.distance, 1e-9);
+  }
+}
+
+TEST(PlaceApproachAllowance, DeepeningPastTheAllowanceInsideTheRegionStillStops) {
+  // HZ-0097-4 mitigation 3, at sim's own resolution, on the cap as calibrated
+  // 2026-08-15. The allowance shrinks the predictive margin, not the hard
+  // stop behind it: a payload driven THROUGH the declared shelf still
+  // E-stops — 0.7 mm past the 37.5 mm cap is still a stop, and so is the
+  // 40 mm the amendment's own headroom arithmetic quotes.
+  //
+  // Payload here is a 300x100x100 mm tote, not the 50 mm-tall baguette,
+  // deliberately: against a 25 mm cell a 50 mm-tall box saturates at exactly
+  // 37.5 mm of SAT overlap (25 mm half-extent + 12.5 mm cell half-width) on
+  // every axis, so the flagship payload's own geometry can't reach past the
+  // calibrated cap at all — proving the hard stop needs a deeper payload.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_object(att, 1, identity(), {box_prim(0.15, 0.05, 0.05, translate(0.0, 0.0, 0.05))});
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet_opening(occ, /*with_outside_obstacle=*/false);
+  auto grid = support_grid(occ);
+  grid.place_region = declared_cabinet_region();
+
+  // At real shelf contact: -24.0 mm, inside the cap, allowed.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.0333);
+  ASSERT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  // 14.2 mm further, through the shelf: -38.2 mm, past the cap, stopped.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.0475);
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit) << "a declaration never licenses driving THROUGH the declared shelf";
+  EXPECT_EQ(hit.link_a, 0);
+  EXPECT_NEAR(hit.min_distance, -0.0382, 1e-9) << "the reported distance is the true one";
+  EXPECT_TRUE(hit.place_allowance_active) << "a stop at a reduced margin must say so";
+
+  // And 40 mm — the reading run 1 would have had to produce for the OLD cap to
+  // be the right one — stops too.
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.0493);
+  const auto forty = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(forty.hit);
+  EXPECT_NEAR(forty.min_distance, -0.0400, 1e-9);
+}
+
+TEST(PlaceApproachAllowance, OutsideTheDeclaredRegionTheMarginIsUnchanged) {
+  // The scope that makes this a place allowance rather than a global one. A shelf
+  // cell 150 mm out — same height, same map, same payload, outside the declared
+  // receptacle — stops the robot at the full margin, and it is the cell the
+  // evidence names.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet_opening(occ, /*with_outside_obstacle=*/true);
+  auto grid = support_grid(occ);
+  grid.place_region = declared_cabinet_region();
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.0142);
+
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_b, support_index(kApproachOutsideX, 12, kApproachShelfZ))
+      << "the stop must name the cell outside the declared region";
+  EXPECT_FALSE(hit.place_allowance_active)
+      << "that cell's margin was never reduced, and the evidence must not claim it was";
+}
+
+TEST(PlaceApproachAllowance, TheAllowanceFollowsTheDeclaredPayloadOnly) {
+  // The declaration names one payload. A second object the robot happens to be
+  // carrying is not in the mask and gets nothing, even inside the same region.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);  // object 0 — the declared payload
+  append_object(att, 1, translate(0.0, 0.0, -0.0142),
+                {box_prim(0.15, 0.025, 0.025, translate(0.0, 0.0, 0.025))});
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet_opening(occ, /*with_outside_obstacle=*/false);
+  auto grid = support_grid(occ);
+  grid.place_region = declared_cabinet_region(0x1);  // object 0 only
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.0142);
+
+  const auto hit = osk::check_attached_voxel_collision(m, att, s, grid, 0.0);
+  ASSERT_TRUE(hit.hit) << "the undeclared second payload still stops on the same cells";
+  EXPECT_EQ(hit.link_a, 1);
+  EXPECT_NEAR(osk::place_approach_allowance(grid, 1, osk::Vec3{0.0, 0.0, -0.0218}), 0.0, 1e-12);
+  EXPECT_NEAR(osk::place_approach_allowance(grid, 0, osk::Vec3{0.0, 0.0, -0.0218}), 0.0375, 1e-12);
+}
+
+TEST(PlaceApproachAllowance, ArmVsWorldIsUntouchedByALiveRegion) {
+  // The amendment's own words: "Arm-vs-world collision checks are unchanged."
+  // The robot's own links may not enter the declared receptacle any more freely
+  // than before, and the region is not an input to that check at all.
+  osk::CollisionModel m = hand_model();
+  add_capsule(m, 1, 0.02, 0.0, translate(0.0, 0.0, -0.0218));
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet_opening(occ, /*with_outside_obstacle=*/false);
+  auto grid = support_grid(occ);
+
+  const auto before = osk::check_voxel_collision(m, s, grid, 0.0);
+  ASSERT_TRUE(before.hit) << "the arm capsule is inside the shelf cells";
+  grid.place_region = declared_cabinet_region();
+  const auto after = osk::check_voxel_collision(m, s, grid, 0.0);
+  EXPECT_EQ(after.hit, before.hit);
+  EXPECT_EQ(after.link_b, before.link_b);
+  EXPECT_NEAR(after.min_distance, before.min_distance, 1e-15);
+  EXPECT_FALSE(after.place_allowance_active);
+}
+
+TEST(PlaceApproachAllowance, TheRegionIsAnOrientedBoxNotItsAxisAlignedHull) {
+  // The producer measures a receptacle, and a receptacle has an orientation. The
+  // axis-aligned hull of a rotated one is strictly larger, i.e. strictly more
+  // permissive, so the predicate tests the box itself.
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  auto grid = support_grid(occ);
+  osk::PlaceApproachRegion region;
+  ASSERT_EQ(
+      osk::ingest_place_region(osk::transform_from_xyz_rpy(0.0, 0.0, 0.0, 0.0, 0.0, kPi / 4.0),
+                               osk::Vec3{0.20, 0.02, 0.10}, 0x1, region),
+      osk::PlaceRegionStatus::kOk);
+  grid.place_region = region;
+
+  // On the rotated long axis: inside.
+  const double d = 0.15 / std::sqrt(2.0);
+  EXPECT_NEAR(osk::place_approach_allowance(grid, 0, osk::Vec3{d, d, 0.0}), 0.0375, 1e-12);
+  // The same distance along +x — inside the AABB of the rotated box, outside the
+  // box.
+  EXPECT_NEAR(osk::place_approach_allowance(grid, 0, osk::Vec3{0.15, 0.0, 0.0}), 0.0, 1e-12);
+}
+
+TEST(PlaceApproachAllowance, DegenerateAndOversizedRegionsGrantNothing) {
+  // Fail-closed means "no allowance", not "a dropped message": unlike a malformed
+  // support attestation, a bad region can only ever make the kernel more
+  // permissive, so refusing it restores exactly the pre-amendment margin.
+  osk::PlaceApproachRegion region;
+  const osk::Vec3 sane{0.10, 0.06, 0.06};
+  const double nan_value = std::numeric_limits<double>::quiet_NaN();
+
+  // Each refusal reports WHICH way the region failed, and they are not
+  // interchangeable: `kNoObject` is the ordinary pre-grasp state the node logs at
+  // INFO, the rest are producer errors it warns about. Round-8 labelled all of
+  // them `bounds`, which made the noisiest line in the run the one that described
+  // its cause least.
+  EXPECT_EQ(osk::ingest_place_region(identity(), sane, 0x0, region),
+            osk::PlaceRegionStatus::kNoObject)
+      << "a declaration whose payload is not carried arms nothing";
+  EXPECT_EQ(osk::ingest_place_region(identity(), osk::Vec3{0.0, 0.06, 0.06}, 0x1, region),
+            osk::PlaceRegionStatus::kDegenerate)
+      << "a region with no interior";
+  EXPECT_EQ(osk::ingest_place_region(identity(), osk::Vec3{-0.1, 0.06, 0.06}, 0x1, region),
+            osk::PlaceRegionStatus::kDegenerate);
+  EXPECT_EQ(osk::ingest_place_region(identity(), osk::Vec3{nan_value, 0.06, 0.06}, 0x1, region),
+            osk::PlaceRegionStatus::kBadExtents);
+  EXPECT_EQ(osk::ingest_place_region(identity(),
+                                     osk::Vec3{std::numeric_limits<double>::infinity(), 0.06, 0.06},
+                                     0x1, region),
+            osk::PlaceRegionStatus::kBadExtents);
+  EXPECT_EQ(osk::ingest_place_region(identity(), osk::Vec3{2.0, 0.06, 0.06}, 0x1, region),
+            osk::PlaceRegionStatus::kOversize)
+      << "a half-extent past 1.5 m is a producer error, not a receptacle";
+  EXPECT_EQ(osk::ingest_place_region(identity(), osk::Vec3{1.4, 1.4, 1.4}, 0x1, region),
+            osk::PlaceRegionStatus::kOversizeVolume)
+      << "22 m^3 is a room, and a declaration names ONE receptacle";
+  EXPECT_EQ(osk::ingest_place_region(translate(nan_value, 0.0, 0.0), sane, 0x1, region),
+            osk::PlaceRegionStatus::kBadPose);
+
+  // Every rejection leaves the struct inert, so a caller that ignores the return
+  // value still gets no allowance.
+  EXPECT_FALSE(region.valid);
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  auto grid = support_grid(occ);
+  grid.place_region = region;
+  EXPECT_NEAR(osk::place_approach_allowance(grid, 0, osk::Vec3{0.0, 0.0, 0.0}), 0.0, 1e-12);
+
+  // The largest region the caps do admit is still admitted.
+  EXPECT_EQ(osk::ingest_place_region(identity(), osk::Vec3{1.0, 1.0, 1.0}, 0x1, region),
+            osk::PlaceRegionStatus::kOk);
+  EXPECT_TRUE(region.valid);
+}
+
+TEST(PlaceApproachAllowance, EveryRefusalHasItsOwnReasonToken) {
+  // The tokens are the `reason=` key of the kernel's place-region log lines, so
+  // they are a contract with whoever reads a run: distinct per failure, stable,
+  // and never null. Round-8's single `bounds` label for all of them is what made
+  // the pre-grasp no-payload state indistinguishable from a malformed region.
+  EXPECT_STREQ(osk::place_region_status_reason(osk::PlaceRegionStatus::kOk), "ok");
+  EXPECT_STREQ(osk::place_region_status_reason(osk::PlaceRegionStatus::kNoObject), "no_object");
+  EXPECT_STREQ(osk::place_region_status_reason(osk::PlaceRegionStatus::kBadPose), "bad_pose");
+  EXPECT_STREQ(osk::place_region_status_reason(osk::PlaceRegionStatus::kBadExtents), "bad_extents");
+  EXPECT_STREQ(osk::place_region_status_reason(osk::PlaceRegionStatus::kDegenerate), "degenerate");
+  EXPECT_STREQ(osk::place_region_status_reason(osk::PlaceRegionStatus::kOversize), "oversize");
+  EXPECT_STREQ(osk::place_region_status_reason(osk::PlaceRegionStatus::kOversizeVolume),
+               "oversize_volume");
+  EXPECT_STREQ(osk::place_region_status_reason(osk::PlaceRegionStatus::kBadGeometry),
+               "bad_geometry");
+  EXPECT_STREQ(osk::place_region_status_reason(osk::PlaceRegionStatus::kGeometryOverflow),
+               "geometry_overflow");
+
+  const osk::PlaceRegionStatus all[] = {osk::PlaceRegionStatus::kOk,
+                                        osk::PlaceRegionStatus::kNoObject,
+                                        osk::PlaceRegionStatus::kBadPose,
+                                        osk::PlaceRegionStatus::kBadExtents,
+                                        osk::PlaceRegionStatus::kDegenerate,
+                                        osk::PlaceRegionStatus::kOversize,
+                                        osk::PlaceRegionStatus::kOversizeVolume,
+                                        osk::PlaceRegionStatus::kBadGeometry,
+                                        osk::PlaceRegionStatus::kGeometryOverflow};
+  std::set<std::string> tokens;
+  for (const auto status : all) {
+    const char* reason = osk::place_region_status_reason(status);
+    ASSERT_NE(reason, nullptr);
+    tokens.insert(reason);
+  }
+  EXPECT_EQ(tokens.size(), std::size(all)) << "two outcomes sharing one token is the round-8 bug";
+}
+
+TEST(PlaceApproachAllowance, AMapWithNoResolutionGrantsNothing) {
+  // Same fail-closed direction as update_support_contact_witnesses: no usable map
+  // means no allowance, not an unbounded one.
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  auto grid = support_grid(occ);
+  grid.place_region = declared_cabinet_region();
+  grid.resolution = 0.0;
+  EXPECT_NEAR(osk::place_approach_allowance(grid, 0, osk::Vec3{0.0, 0.0, 0.0}), 0.0, 1e-12);
+  grid.resolution = kSupportRes;
+  EXPECT_NEAR(osk::place_approach_allowance(grid, 8, osk::Vec3{0.0, 0.0, 0.0}), 0.0, 1e-12)
+      << "past the eight-object schema cap there is no mask bit to consult";
+}
+
+// ── declared target's own geometry (ADR-0098, survey Path B) ────────────────
+// The region box says WHERE the receptacle is, not WHAT it is, so it grants
+// the same blanket allowance to every cell inside it regardless of whether
+// the declared body put that cell there. This covers shipping the target's
+// own primitives so a payload is measured against the modelled shelf, not
+// the 50 mm cube it was quantised into.
+//
+// Coarse fixture: cell (6,6,6), a 50 mm cube centred on the origin, top face
+// at +25 mm; modelled shelf's top face at +5 mm (cube over-states by 20 mm).
+// Baguette bottom face at `dz`, margin 0:
+//   * undeclared            trips at dz <= +25 mm (cube's face)
+//   * declared, box only    trips at dz <= -15 mm (cube face - 40 mm blanket
+//                           allowance, 20 mm of it unjustified by the shelf)
+//   * declared + geometry   trips at dz <= +5 mm (the shelf itself)
+// Geometry sits strictly between the two: keeps the relief quantisation
+// created, gives back the 20 mm the blanket forgave on no evidence. Not an
+// invariant — at the deployed 30 mm standoff a deeper shelf can put geometry
+// on the permissive side (standoff doesn't apply to the dispatched body).
+// The real invariant is `NeverLetsThePayloadReachTheModelledSurface`: the
+// payload never reaches the modelled surface without stopping.
+
+namespace {
+
+// The declared cabinet region, plus the shelf the sim producer measured inside
+// it: a box whose top face is at `top_z`. `store` is the caller's buffer because
+// `PlaceApproachRegion::geometry` is a view into it and has to outlive the
+// checks that read it — the same ownership the node gives it.
+osk::PlaceApproachRegion declared_region_with_shelf(std::vector<osk::AttachedPrimitive>& store,
+                                                    double top_z) {
+  osk::PlaceApproachRegion region;
+  EXPECT_EQ(osk::ingest_place_region(identity(), osk::Vec3{0.20, 0.10, 0.10}, 0x1, region),
+            osk::PlaceRegionStatus::kOk);
+  std::vector<osk::AttachedPrimitiveInput> geometry(1);
+  geometry[0].kind = osk::AttachedShapeKind::kBox;
+  geometry[0].half_extents = {0.10, 0.10, 0.05};
+  geometry[0].pose_in_object = translate(0.0, 0.0, top_z - 0.05);
+  EXPECT_EQ(osk::ingest_place_target_geometry(geometry, store, region),
+            osk::PlaceRegionStatus::kOk);
+  return region;
+}
+
+// One baguette-over-the-cell check at payload offset `dz`, under one of the
+// three regimes above. `margin` is the payload's world standoff — 0 for the
+// regime-ordering tests, where it only shifts every threshold equally, and the
+// deployed 30 mm where the point IS that the standoff does not apply to the
+// declared body.
+osk::CollisionHit shelf_case(double dz, const osk::PlaceApproachRegion& region,
+                             double margin = 0.0) {
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.0);  // no witness: this must stand on geometry alone
+
+  static std::vector<std::uint8_t> occ;
+  occ.assign(static_cast<std::size_t>(kCoarseN) * kCoarseN * kCoarseN, 0);
+  occ[static_cast<std::size_t>(coarse_index(6, 6, 6))] = 1;
+  auto grid = coarse_grid(occ);
+  grid.place_region = region;
+  att.objects[0].pose_in_link = translate(0.0, 0.0, dz);
+  return osk::check_attached_voxel_collision(m, att, s, grid, margin);
+}
+
+}  // namespace
+
+TEST(PlaceTargetGeometry, AdjudicatesAgainstTheBodyNotTheCellThatQuantisedIt) {
+  std::vector<osk::AttachedPrimitive> store(osk::kMaxPlaceTargetPrimitives);
+  const osk::PlaceApproachRegion box_only = declared_cabinet_region();
+  const osk::PlaceApproachRegion with_geometry = declared_region_with_shelf(store, 0.005);
+
+  // 15 mm above the cube's face: quantisation, and nothing else, is what would
+  // stop an UNDECLARED payload here. Both declared regimes let it through, so
+  // the relief the region exists to give survives the refinement.
+  EXPECT_TRUE(shelf_case(0.015, osk::PlaceApproachRegion{}).hit)
+      << "undeclared, the cube's inflated face stops it";
+  EXPECT_FALSE(shelf_case(0.015, box_only).hit);
+  EXPECT_FALSE(shelf_case(0.015, with_geometry).hit);
+
+  // Flush with the cube's centre plane: the modelled shelf is genuinely touched
+  // 5 mm in, and the geometry says so. The blanket allowance does not, because it
+  // is forgiving 40 mm where the quantisation only ever created 20 — it cannot
+  // tell the difference, having never been told where the shelf is.
+  const auto adjudicated = shelf_case(0.0, with_geometry);
+  ASSERT_TRUE(adjudicated.hit) << "a real 5 mm penetration of the declared shelf";
+  EXPECT_TRUE(adjudicated.place_target_adjudicated);
+  EXPECT_TRUE(adjudicated.place_allowance_active);
+  EXPECT_NEAR(adjudicated.min_distance, -0.005, 1e-9)
+      << "the reported distance is to the SHELF, measured, not to the 50 mm cube";
+  EXPECT_FALSE(shelf_case(0.0, box_only).hit);
+
+  // Deep: both stop, and only the geometry quotes the true depth. The cube reads
+  // 20 mm deeper than the shelf it stands in for, which is the number an incident
+  // review would otherwise be handed.
+  const auto deep_geometry = shelf_case(-0.020, with_geometry);
+  const auto deep_box = shelf_case(-0.020, box_only);
+  ASSERT_TRUE(deep_geometry.hit);
+  ASSERT_TRUE(deep_box.hit);
+  EXPECT_NEAR(deep_geometry.min_distance, -0.025, 1e-9);
+  EXPECT_NEAR(deep_box.min_distance, -0.045, 1e-9);
+  EXPECT_FALSE(deep_box.place_target_adjudicated)
+      << "a region with no geometry can never claim to have adjudicated one";
+}
+
+TEST(PlaceTargetGeometry, NeverLetsThePayloadReachTheModelledSurface) {
+  // The bound that replaces "at least as conservative as the box", because that
+  // is not the claim this makes and pretending otherwise would be the dangerous
+  // kind of test. Against the CUBE the refinement is looser, by exactly the
+  // amount the cube over-stated the surface. Against the BODY it is absolute:
+  // the payload never reaches the modelled surface without the pair tripping.
+  //
+  // Swept at the deployed 30 mm standoff, over shelves both shallower and deeper
+  // than the cell they sit in, so the assertion covers the range where the
+  // blanket allowance is respectively over- and under-forgiving.
+  constexpr double kMargin = 0.03;
+  std::vector<osk::AttachedPrimitive> store(osk::kMaxPlaceTargetPrimitives);
+  int touching = 0;
+  int adjudicated = 0;
+  for (int shelf_mm = -10; shelf_mm <= 20; shelf_mm += 5) {
+    const double top_z = 0.001 * shelf_mm;
+    const osk::PlaceApproachRegion with_geometry = declared_region_with_shelf(store, top_z);
+    for (int dz_mm = -50; dz_mm <= 50; ++dz_mm) {
+      const double dz = 0.001 * dz_mm;
+      const auto hit = shelf_case(dz, with_geometry, kMargin);
+      adjudicated += hit.place_target_adjudicated ? 1 : 0;
+      if (dz > top_z) {
+        continue;  // clear of the modelled surface; the cube may still stop it
+      }
+      ++touching;
+      EXPECT_TRUE(hit.hit) << "shelf_top_mm=" << shelf_mm << " dz_mm=" << dz_mm
+                           << ": the payload is at or inside the modelled shelf and did not stop";
+      EXPECT_TRUE(hit.place_target_adjudicated)
+          << "shelf_top_mm=" << shelf_mm << " dz_mm=" << dz_mm
+          << ": a stop at the modelled surface must name the body, not the cell";
+      EXPECT_LE(hit.min_distance, 1e-9) << "shelf_top_mm=" << shelf_mm << " dz_mm=" << dz_mm;
+    }
+  }
+  // A sweep whose inner assertion never runs passes for the wrong reason — the
+  // #188 lesson, pinned rather than trusted.
+  EXPECT_GT(touching, 100) << "the payload never reached a modelled surface: nothing was asserted";
+  EXPECT_GT(adjudicated, 0) << "the geometry path was never taken: nothing was refined";
+}
+
+TEST(PlaceTargetGeometry, TheStandoffMarginDoesNotApplyToTheBodyItWasDispatchedToTouch) {
+  // Why the gate moves to the surface. The place witness is EARNED by contact,
+  // so a mechanism that keeps a 30 mm standoff against the declared receptacle
+  // can never let the payload earn it — the round-6 failure, in a new place.
+  // Against every other cell in the map the standoff is untouched.
+  constexpr double kMargin = 0.03;
+  constexpr double kShelfTopZ = 0.005;
+  std::vector<osk::AttachedPrimitive> store(osk::kMaxPlaceTargetPrimitives);
+  const osk::PlaceApproachRegion box_only = declared_cabinet_region();
+  const osk::PlaceApproachRegion with_geometry = declared_region_with_shelf(store, kShelfTopZ);
+
+  // 10 mm clear of the modelled shelf. Undeclared the 30 mm standoff stops it;
+  // the blanket allowance stops it too, because it is measuring the cube and the
+  // cube is 20 mm in front of the shelf. Only the geometry can tell that this is
+  // a centimetre of real clearance.
+  EXPECT_TRUE(shelf_case(0.015, osk::PlaceApproachRegion{}, kMargin).hit);
+  EXPECT_TRUE(shelf_case(0.015, box_only, kMargin).hit);
+  EXPECT_FALSE(shelf_case(0.015, with_geometry, kMargin).hit)
+      << "10 mm of measured clearance from the declared shelf is not a collision";
+
+  // Contact. It trips — this is not an exemption — but at the surface, which is
+  // where the support-contact witness is attested and where the advisory band
+  // takes over from the latch.
+  const auto contact = shelf_case(kShelfTopZ, with_geometry, kMargin);
+  ASSERT_TRUE(contact.hit);
+  EXPECT_TRUE(contact.place_target_adjudicated);
+  EXPECT_NEAR(contact.min_distance, 0.0, 1e-9);
+  EXPECT_TRUE(contact.advisory) << "an arrival at the declared surface refuses, it does not latch";
+
+  // Past the advisory band it is the latched stop it always was.
+  const auto deep = shelf_case(kShelfTopZ - 0.010, with_geometry, kMargin);
+  ASSERT_TRUE(deep.hit);
+  EXPECT_FALSE(deep.advisory) << "10 mm into the modelled shelf is a stop, not a refusal";
+  EXPECT_NEAR(deep.min_distance, -0.010, 1e-9);
+}
+
+TEST(PlaceTargetGeometry, GeometryClaimingMoreClearanceThanTheCapFallsBackToTheBox) {
+  // The hazard a declared-geometry mechanism has that a box does not: a producer
+  // whose model is too SMALL — a fitted primitive that missed half the shelf, a
+  // stale articulated door — would otherwise hand the kernel unbounded clearance
+  // in the place it is least able to check. The cap is what makes that
+  // impossible: relief past the blanket allowance is refused outright and the
+  // pair falls back, bit for bit, to the region-box behaviour it would have had.
+  std::vector<osk::AttachedPrimitive> store(osk::kMaxPlaceTargetPrimitives);
+  const osk::PlaceApproachRegion box_only = declared_cabinet_region();
+  // A shelf modelled 100 mm below its true face: 120 mm of claimed clearance
+  // where the cap permits 40.
+  const osk::PlaceApproachRegion understated = declared_region_with_shelf(store, -0.095);
+
+  for (const double margin : {0.0, 0.03}) {
+    for (int dz_mm = -50; dz_mm <= 50; ++dz_mm) {
+      const double dz = 0.001 * dz_mm;
+      const auto box = shelf_case(dz, box_only, margin);
+      const auto claimed = shelf_case(dz, understated, margin);
+      EXPECT_EQ(claimed.hit, box.hit) << "margin=" << margin << " dz_mm=" << dz_mm;
+      EXPECT_FALSE(claimed.place_target_adjudicated)
+          << "margin=" << margin << " dz_mm=" << dz_mm
+          << ": an over-claiming model must never be the reported geometry";
+      if (box.hit) {
+        EXPECT_NEAR(claimed.min_distance, box.min_distance, 1e-12)
+            << "margin=" << margin << " dz_mm=" << dz_mm;
+      }
+    }
+  }
+}
+
+TEST(PlaceTargetGeometry, TheIngestRefusesWhatItCannotMeasure) {
+  // Same fail-closed direction, and the same #142/#146 posture, as the box: a
+  // producer that names a target and then describes it with a shape the kernel
+  // cannot measure is not one whose box is trusted either. Every refusal here
+  // leaves the region carrying NO geometry, so a caller that ignores the return
+  // value still gets the pre-ADR-0098 behaviour rather than a half-model.
+  std::vector<osk::AttachedPrimitive> store(osk::kMaxPlaceTargetPrimitives);
+  osk::PlaceApproachRegion region;
+  ASSERT_EQ(osk::ingest_place_region(identity(), osk::Vec3{0.20, 0.10, 0.10}, 0x1, region),
+            osk::PlaceRegionStatus::kOk);
+  const double nan_value = std::numeric_limits<double>::quiet_NaN();
+
+  const auto box_with = [](osk::Vec3 half, osk::Transform pose) {
+    osk::AttachedPrimitiveInput in;
+    in.kind = osk::AttachedShapeKind::kBox;
+    in.half_extents = half;
+    in.pose_in_object = pose;
+    return std::vector<osk::AttachedPrimitiveInput>{in};
+  };
+
+  const std::vector<osk::AttachedPrimitiveInput> none;
+  EXPECT_EQ(osk::ingest_place_target_geometry(none, store, region), osk::PlaceRegionStatus::kOk)
+      << "no geometry is the ordinary case, not a failure";
+  EXPECT_EQ(region.n_geometry, 0U);
+
+  EXPECT_EQ(osk::ingest_place_target_geometry(box_with({0.0, 0.1, 0.1}, identity()), store, region),
+            osk::PlaceRegionStatus::kBadGeometry)
+      << "a box with no interior is a shape the narrow phase cannot measure";
+  EXPECT_EQ(
+      osk::ingest_place_target_geometry(box_with({nan_value, 0.1, 0.1}, identity()), store, region),
+      osk::PlaceRegionStatus::kBadGeometry);
+  EXPECT_EQ(osk::ingest_place_target_geometry(
+                box_with({0.1, 0.1, 0.1}, translate(nan_value, 0.0, 0.0)), store, region),
+            osk::PlaceRegionStatus::kBadGeometry)
+      << "a non-finite pose puts the modelled body nowhere";
+
+  osk::AttachedPrimitiveInput sphere;
+  sphere.kind = osk::AttachedShapeKind::kSphere;
+  sphere.radius = -0.01;
+  const std::vector<osk::AttachedPrimitiveInput> bad_sphere{sphere};
+  EXPECT_EQ(osk::ingest_place_target_geometry(bad_sphere, store, region),
+            osk::PlaceRegionStatus::kBadGeometry);
+
+  osk::AttachedPrimitiveInput good;
+  good.kind = osk::AttachedShapeKind::kBox;
+  good.half_extents = {0.1, 0.1, 0.05};
+  const std::vector<osk::AttachedPrimitiveInput> over_cap(osk::kMaxPlaceTargetPrimitives + 1, good);
+  EXPECT_EQ(osk::ingest_place_target_geometry(over_cap, store, region),
+            osk::PlaceRegionStatus::kGeometryOverflow)
+      << "past the cap the model is truncated, and half a receptacle is worse than none";
+  const std::vector<osk::AttachedPrimitiveInput> at_cap(osk::kMaxPlaceTargetPrimitives, good);
+  EXPECT_EQ(osk::ingest_place_target_geometry(at_cap, store, region), osk::PlaceRegionStatus::kOk)
+      << "the largest list the cap admits is still admitted";
+  EXPECT_EQ(region.n_geometry, osk::kMaxPlaceTargetPrimitives);
+
+  // Every refusal above left the view inert, so nothing was ever adjudicated
+  // against a shape the ingest rejected.
+  ASSERT_EQ(osk::ingest_place_target_geometry(box_with({0.0, 0.1, 0.1}, identity()), store, region),
+            osk::PlaceRegionStatus::kBadGeometry);
+  EXPECT_EQ(region.geometry, nullptr);
+  EXPECT_EQ(region.n_geometry, 0U);
+}
+
+TEST(PlaceTargetGeometry, NoDeclarationAndNoGeometryBothMeasureInfinity) {
+  // What makes "no geometry" collapse to the pre-ADR-0098 path at every call
+  // site without a branch: the distance is +infinity, so the substitution's
+  // `d_target <= d_cell + allowance` guard can never be satisfied.
+  osk::AttachedPrimitive payload;
+  payload.kind = osk::AttachedShapeKind::kBox;
+  payload.half_extents = {0.15, 0.025, 0.025};
+
+  EXPECT_TRUE(
+      std::isinf(osk::place_target_distance(osk::PlaceApproachRegion{}, payload, identity())))
+      << "no declaration at all";
+  EXPECT_TRUE(
+      std::isinf(osk::place_target_distance(declared_cabinet_region(), payload, identity())))
+      << "a declaration whose producer measured a box but no geometry";
+
+  std::vector<osk::AttachedPrimitive> store(osk::kMaxPlaceTargetPrimitives);
+  const osk::PlaceApproachRegion with_geometry = declared_region_with_shelf(store, 0.005);
+  // The payload box spans z in [-0.025, +0.025] at the identity; the shelf's top
+  // face is at +0.005, so they overlap by 30 mm.
+  EXPECT_NEAR(osk::place_target_distance(with_geometry, payload, identity()), -0.030, 1e-9);
+}
+
+TEST(PlaceApproachAllowance, TheWitnessTakesOverWhereTheAllowanceStops) {
+  // The two mechanisms in sequence, which is the whole point of the amendment:
+  // the allowance buys the approach, the witness buys the contact. With the
+  // witness armed at the shelf the payload is exempt on that plane whether or not
+  // the region is live, and the latch is still measured against the map.
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+  osk::AttachedModel att;
+  append_baguette(att, 0.10);  // the place attestation, earned at contact
+  att.objects[0].support_point = {0.0, 0.0, 0.0};
+
+  std::vector<std::uint8_t> occ(kSupportN * kSupportN * kSupportN, 0);
+  fill_cabinet_opening(occ, /*with_outside_obstacle=*/false);
+  auto grid = support_grid(occ);
+  grid.support_witness_live = 0x1;
+  att.objects[0].pose_in_link = translate(0.0, 0.0, -0.0333);
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+
+  grid.place_region = declared_cabinet_region();
+  EXPECT_FALSE(osk::check_attached_voxel_collision(m, att, s, grid, 0.0).hit);
+  EXPECT_EQ(osk::update_support_contact_witnesses(att, s, grid, 0x1, 0.0), 0x1)
+      << "the witness latch is measured against the map, not against the allowance";
+}
+
+// ── issue #102: nominal PandaMobile pose vs a real fixture ──────────────────
+// Issue #102, acceptance bullet 3: "regression for the nominal valid pose and
+// a nearby genuinely colliding fixture pose." Report: a `deploy sim` run of
+// scenes/deploy/robocasa_baguette.yaml, seed 1, where the world-voxel gate
+// refused the arm's reset configuration before any motion, naming
+// panda_link4 vs voxel_39263 (centre [0.175, 0.075, 0.725] in base_link,
+// min_distance_m ~= -0.0526); moving the base ~16 cm away cleared the check
+// at the cost of taking the policy out of distribution.
+//
+// Kernel half of that acceptance, from in-tree or run-quoted geometry:
+//   * chain + collision boxes: robots/panda_mobile/robot.yaml verbatim
+//     (joint origins/rpy, per-link OBB half-extents+origins), base_link as
+//     FK root (post-ADR-0095: base_link IS the arm mount, no second 0.7 m
+//     RoboCasa pedestal inside the kernel);
+//   * configuration: robosuite's PandaOmron.init_qpos (what RoboCasa builds
+//     for robots: ["PandaMobile"]) — the reset pose the run was refused at;
+//   * lattice: deploy-sim's 25 mm cells (_octomap_resolution("sim")) at
+//     world_voxel_margin_m = 0.0 (_world_voxel_margin_m("sim")), phased so
+//     the run's logged cell centre is exactly a cell centre;
+//   * "nearby colliding fixture": same cabinet face moved 150 mm toward the
+//     robot — same order as the ~16 cm base shift, opposite direction.
+//
+// Joint state at the logged -52.6 mm is not in the repo (run logs live on
+// the validation host); this pins the recorded CELL against the recorded
+// LINK at the recorded pose instead of re-deriving that number.
+namespace {
+
+constexpr double kIssue102Res = 0.025;
+// Phased so the run's logged cell centre (0.175, 0.075, 0.725) is a cell centre.
+constexpr double kIssue102OriginX = -0.0125;
+constexpr double kIssue102OriginY = -0.3125;
+constexpr double kIssue102OriginZ = 0.0875;
+constexpr int kIssue102Sx = 26;
+constexpr int kIssue102Sy = 26;
+constexpr int kIssue102Sz = 30;
+
+// robots/panda_mobile/robot.yaml — `joints` (origin_xyz + origin_rpy, axis
+// defaulting to local +Z) and `collision_geometry` (box half-extents +
+// origin_xyz_rpy), links 1..7. The gripper is absent there and so here: it is
+// the intended-contact part, deliberately left out of the world check.
+osk::CollisionModel panda_mobile_arm_model() {
+  osk::CollisionModel m;
+  m.n_links = 7;
+  m.parent = {-1, 0, 1, 2, 3, 4, 5};
+  m.joint_kind = {osk::JointKind::kRevolute, osk::JointKind::kRevolute, osk::JointKind::kRevolute,
+                  osk::JointKind::kRevolute, osk::JointKind::kRevolute, osk::JointKind::kRevolute,
+                  osk::JointKind::kRevolute};
+  m.dof_index = {0, 1, 2, 3, 4, 5, 6};
+  m.origin = {
+      osk::transform_from_xyz_rpy(0.0, 0.0, 0.333, 0.0, 0.0, 0.0),
+      osk::transform_from_xyz_rpy(0.0, 0.0, 0.0, -1.5708, 0.0, 0.0),
+      osk::transform_from_xyz_rpy(0.0, -0.316, 0.0, 1.5708, 0.0, 0.0),
+      osk::transform_from_xyz_rpy(0.0825, 0.0, 0.0, 1.5708, 0.0, 0.0),
+      osk::transform_from_xyz_rpy(-0.0825, 0.384, 0.0, -1.5708, 0.0, 0.0),
+      osk::transform_from_xyz_rpy(0.0, 0.0, 0.0, 1.5708, 0.0, 0.0),
+      osk::transform_from_xyz_rpy(0.088, 0.0, 0.0, 1.5708, 0.0, 0.0),
+  };
+  m.axis = {{0, 0, 1}, {0, 0, 1}, {0, 0, 1}, {0, 0, 1}, {0, 0, 1}, {0, 0, 1}, {0, 0, 1}};
+  m.box_link = {0, 1, 2, 3, 4, 5, 6};
+  m.boxes = {
+      osk::Obb{{0.0552, 0.0724, 0.1410},
+               osk::transform_from_xyz_rpy(0.0, -0.0267, -0.0731, 0.3834, 0.0001, -0.0004)},
+      osk::Obb{{0.0552, 0.0719, 0.1407},
+               osk::transform_from_xyz_rpy(-0.0001, -0.0751, 0.0298, 1.9168, 0.0, -0.0002)},
+      osk::Obb{{0.0655, 0.0673, 0.1264},
+               osk::transform_from_xyz_rpy(0.0401, 0.0213, -0.0444, 0.6264, -0.6489, 2.7888)},
+      osk::Obb{{0.0658, 0.0684, 0.1272},
+               osk::transform_from_xyz_rpy(-0.0423, 0.0457, 0.0210, 1.1575, 0.3623, 0.6286)},
+      osk::Obb{{0.0552, 0.0672, 0.1705},
+               osk::transform_from_xyz_rpy(0.0003, 0.0416, -0.1090, -0.2720, 0.0021, 0.0011)},
+      osk::Obb{{0.0467, 0.0706, 0.0921},
+               osk::transform_from_xyz_rpy(0.0424, 0.0082, 0.0083, -3.0616, -1.4278, 0.0485)},
+      osk::Obb{{0.0295, 0.0440, 0.0711},
+               osk::transform_from_xyz_rpy(0.0123, 0.0123, 0.0800, 3.1380, -1.5171, -2.3520)},
+  };
+  return m;
+}
+
+// robosuite `PandaOmron.init_qpos` (robosuite @ 5ce6643, the pin in
+// pyproject.toml) — what `robots: ["PandaMobile"]` resets the arm to, and so the
+// "nominal valid pose" the issue's stop was reported at.
+std::vector<double> panda_omron_reset_qpos() {
+  return {0.0, kPi / 16.0 - 0.2, 0.0, -kPi / 2.0 - kPi / 3.0, 0.0, kPi - 0.4, kPi / 4.0};
+}
+
+std::size_t issue_102_cell(int ix, int iy, int iz) {
+  return static_cast<std::size_t>(ix + kIssue102Sx * (iy + kIssue102Sy * iz));
+}
+
+// The cell the run named: centre (0.175, 0.075, 0.725) in `base_link`.
+void mark_reported_voxel(std::vector<std::uint8_t>& occ) { occ[issue_102_cell(7, 15, 25)] = 1; }
+
+// A cabinet face: every cell from `first_ix` outward, full height and width.
+void mark_cabinet_face(std::vector<std::uint8_t>& occ, int first_ix) {
+  for (int iz = 0; iz < kIssue102Sz; ++iz) {
+    for (int iy = 0; iy < kIssue102Sy; ++iy) {
+      for (int ix = first_ix; ix < kIssue102Sx; ++ix) {
+        occ[issue_102_cell(ix, iy, iz)] = 1;
+      }
+    }
+  }
+}
+
+osk::VoxelGrid issue_102_grid(const std::vector<std::uint8_t>& occ) {
+  osk::VoxelGrid g;
+  g.pose.t = {kIssue102OriginX, kIssue102OriginY, kIssue102OriginZ};
+  g.resolution = kIssue102Res;
+  g.sx = kIssue102Sx;
+  g.sy = kIssue102Sy;
+  g.sz = kIssue102Sz;
+  g.occupancy = occ.data();
+  return g;
+}
+
+std::vector<std::uint8_t> issue_102_empty_occupancy() {
+  return std::vector<std::uint8_t>(
+      static_cast<std::size_t>(kIssue102Sx) * kIssue102Sy * kIssue102Sz, 0);
+}
+
+}  // namespace
+
+TEST(Issue102NominalPose, ReportedVoxelDoesNotRejectTheResetConfiguration) {
+  // The acceptance bullet's first half. At the manifest's chain and the reset
+  // configuration, a cell at the position the run logged is clear of every arm
+  // link — `panda_link4`, the link the stop named, included — so the kernel
+  // accepts. Not a near miss either: it still accepts at the 20 mm margin the
+  // REAL boundary uses (`_world_voxel_margin_m("real")`), which is what
+  // separates "the geometry is right" from "the margin happens to hide it".
+  const auto model = panda_mobile_arm_model();
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(model.n_links);
+  const auto qpos = panda_omron_reset_qpos();
+  osk::forward_kinematics(model, qpos.data(), qpos.size(), scratch);
+
+  auto occ = issue_102_empty_occupancy();
+  mark_reported_voxel(occ);
+  const auto grid = issue_102_grid(occ);
+
+  const auto sim = osk::check_voxel_collision(model, scratch, grid, 0.0);
+  EXPECT_FALSE(sim.hit) << "the nominal reset pose is rejected by the reported cell";
+  EXPECT_GT(sim.min_distance, 0.02) << "clearance, not a near miss";
+
+  const auto real = osk::check_voxel_collision(model, scratch, grid, 0.02);
+  EXPECT_FALSE(real.hit) << "still clear at the real boundary's 20 mm margin";
+}
+
+TEST(Issue102NominalPose, ParkedAtTheCabinetTheResetConfigurationIsAccepted) {
+  // The same pose against a real fixture rather than a single cell: a cabinet
+  // face at base-frame x = 0.5375, where a parked mobile base puts it. The arm's
+  // forward extent at this configuration is x = 0.4994 (its wrist), so the check
+  // has 38 mm of real clearance and no reason to stop.
+  const auto model = panda_mobile_arm_model();
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(model.n_links);
+  const auto qpos = panda_omron_reset_qpos();
+  osk::forward_kinematics(model, qpos.data(), qpos.size(), scratch);
+
+  auto occ = issue_102_empty_occupancy();
+  mark_reported_voxel(occ);
+  mark_cabinet_face(occ, 22);  // cell min x = 0.5375
+  const auto grid = issue_102_grid(occ);
+
+  const auto hit = osk::check_voxel_collision(model, scratch, grid, 0.0);
+  EXPECT_FALSE(hit.hit) << "a valid parked pose must not be refused";
+  EXPECT_GT(hit.min_distance, 0.02);
+}
+
+TEST(Issue102NominalPose, TheSameFixture150mmCloserStillStops) {
+  // The acceptance bullet's second half, and the reason the first half is not
+  // "the margin was relaxed": move that cabinet face 150 mm toward the robot —
+  // the same order as the ~16 cm base shift the issue reports as clearing the
+  // check — and the identical configuration is refused, with the evidence naming
+  // a real penetration on one of the forward links.
+  const auto model = panda_mobile_arm_model();
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(model.n_links);
+  const auto qpos = panda_omron_reset_qpos();
+  osk::forward_kinematics(model, qpos.data(), qpos.size(), scratch);
+
+  auto occ = issue_102_empty_occupancy();
+  mark_cabinet_face(occ, 16);  // cell min x = 0.3875, i.e. 150 mm closer
+  const auto grid = issue_102_grid(occ);
+
+  const auto hit = osk::check_voxel_collision(model, scratch, grid, 0.0);
+  ASSERT_TRUE(hit.hit) << "a genuinely colliding fixture pose must stop";
+  EXPECT_LT(hit.min_distance, 0.0) << "the reported pair really interpenetrates";
+  EXPECT_GE(hit.link_a, 4) << "the forward links are what reach the face";
+  EXPECT_GE(hit.link_b, 0) << "the evidence must name the cell it stopped on";
+}
+
+// ── field round 2026-08-22-harness-2 / baguette: attached-payload SELF stop ──
+// Kernel E-stopped on attached:sim:obj_main vs panda_link2 at min_distance
+// -4.63106 mm (sweep equal, horizon_step 0, mode 5 = CARTESIAN_DELTA). The
+// ground-truth probe in the same snapshot put the nearest payload MESH
+// 75.857 mm from robot0_link2 — looks like a wrong-link misattribution (the
+// class `fold_pair` exists to prevent), but is not. Arithmetic at the
+// MEASURED configuration the probe snapshotted:
+//   * panda_link2 is genuinely nearest by the kernel's payload-OBB<->link-OBB
+//     math, at +21.707 mm; panda_link1 runner-up, 25.5 mm further — no
+//     ranking ambiguity.
+//   * the logged -4.63 mm is a *predicted* step-0 config (one damped
+//     least-squares Jacobian look-ahead past the measured one; the probe
+//     measures the measured one — `horizon_step` says which). Not
+//     reproducible here: offending chunk was tick 117, ground-truth snapshot
+//     only retains tick-116 candidates, none mode 5. What's pinned below is
+//     the measured configuration both sides agree on.
+//   * the remaining 54.15 mm between +21.707 mm (OBB<->OBB) and +75.857 mm
+//     (mesh<->mesh) is representation, not error: panda_link2's own corner
+//     slop is 48.22 mm (collision_model_mesh_slop vs panda_mj_description
+//     under mujoco 3.8.0); the payload's published primitives (MuJoCo mesh
+//     geoms lowered to local AABB by extract_body_primitives) carry the
+//     rest — reported by adjudication_budget.self_collision.
+//
+// Geometry is field data verbatim: arm chain + OBBs from
+// robots/panda_mobile/robot.yaml (panda_mobile_arm_model above), joint
+// positions from run_gt_snapshot.json, payload's 16 box primitives +
+// pose_in_link from run_snapshots/collision_25.npz.
+namespace {
+
+osk::AttachedPrimitive field_box_prim(const osk::Vec3& half, const osk::Transform& pose) {
+  osk::AttachedPrimitive p;
+  p.kind = osk::AttachedShapeKind::kBox;
+  p.half_extents = half;
+  p.pose_in_object = pose;
+  return p;
+}
+
+// `obj_main`'s pose in `panda_link7`, its attach link (collision_25.npz).
+osk::Transform baguette_pose_in_link() {
+  return osk::transform_from_translation_quat(
+      -0.015373307407892995, 0.0099248604017905043, 0.21371086504358913, 0.93007658543616334,
+      0.36530955689910072, 0.0094951866102542144, 0.03763395133155914);
+}
+
+// The 16 box primitives World State published for `sim:obj_main`.
+std::vector<osk::AttachedPrimitive> baguette_primitives() {
+  return {
+      field_box_prim({0.0021944784960431251, 0.0011257817776130694, 0.0013770105126306431},
+                     osk::transform_from_translation_quat(0.027972432713558686,
+                                                          0.021545365254524607,
+                                                          -0.026648798487959889, 0, 0, 0, 1)),
+      field_box_prim({0.021919994350845056, 0.031714040010949587, 0.052465094886657695},
+                     osk::transform_from_translation_quat(
+                         -0.0048482222251336185, 0.027929188767952647, 0.012688233503858155,
+                         0.18059993879382152, 0.49374329084058216, 0.76065392612349636,
+                         0.38079762280047275)),
+      field_box_prim({0.018265302458733087, 0.024228997268541958, 0.029085167087921006},
+                     osk::transform_from_translation_quat(
+                         -0.0094978477023400423, 0.059685439382957971, 0.0037803362017842413,
+                         0.54331519240459458, -0.17282809181127035, -0.035349860079674077,
+                         0.8207858671880145)),
+      field_box_prim({0.022063799717089667, 0.021054374788510782, 0.032662974238288532},
+                     osk::transform_from_translation_quat(
+                         0.0022606363368854743, 0.073427011459713643, 0.016628542592376495,
+                         0.42100958851517306, -0.093330364242762184, -0.33405678729172378,
+                         0.83812077432368304)),
+      field_box_prim({0.011616132661283959, 0.032051379292673876, 0.053275991605340522},
+                     osk::transform_from_translation_quat(
+                         0.0013311552263077838, 0.00064165683169179356, 0.010244752334121254,
+                         0.17150219795423749, 0.45382792381313225, 0.74707993331306166,
+                         0.45442137373288094)),
+      field_box_prim({0.0095261805539839303, 0.030592621148165588, 0.033432510870647109},
+                     osk::transform_from_translation_quat(
+                         0.023206835593277887, -0.016445419412603478, 0.016929847153129004,
+                         -0.14124744209942697, -0.098370370621440245, 0.86819166041757312,
+                         0.46541988683934282)),
+      field_box_prim({0.0096440873979364364, 0.028991659988381834, 0.030891758457630956},
+                     osk::transform_from_translation_quat(
+                         -0.0076429449839323753, -0.0389871253200317, -0.0078676786425067018,
+                         0.41356582998975883, 0.82384095540237168, 0.29450289898020476,
+                         0.2520266393833096)),
+      field_box_prim({0.02641717913747536, 0.028332312517563102, 0.030863830670606253},
+                     osk::transform_from_translation_quat(
+                         -0.0019898141677784334, -0.07170768929675235, -0.0067996421285204806,
+                         -0.18779225881740699, -0.3109057821475868, 0.5294421359123932,
+                         0.76665682471101537)),
+      field_box_prim({0.017123035047319716, 0.025815171579397087, 0.031247145823329436},
+                     osk::transform_from_translation_quat(
+                         0.037063536981591608, -0.067642966337284782, 0.018269733581355925,
+                         -0.17071257078426857, -0.09931636195863984, 0.85830553349233984,
+                         0.47360858269245565)),
+      field_box_prim({0.0064465983783234459, 0.010840547729609398, 0.014809863667786111},
+                     osk::transform_from_translation_quat(
+                         -0.0074719003325031553, 0.093067547956081548, 0.012477444522082892,
+                         0.31203754993969346, 0.43392470568409447, 0.78443559040943034,
+                         0.31464697952405962)),
+      field_box_prim({0.0093259872466583925, 0.0097219127068609527, 0.017627378881697044},
+                     osk::transform_from_translation_quat(
+                         -8.4036881329098358e-05, 0.1005330375204859, -0.00027260097523389214,
+                         0.46632576142475268, 0.2617598010472082, 0.84321626792139048,
+                         -0.054849031897312203)),
+      field_box_prim({0.016281558664445858, 0.032784231669578126, 0.032839751536116617},
+                     osk::transform_from_translation_quat(
+                         0.027460134028921723, -0.039575604521251972, 0.016118270490434575,
+                         -0.1345517819604875, -0.051018237309738736, 0.88959474850167974,
+                         0.43349064680947619)),
+      field_box_prim({0.0051965623962684053, 0.014221816709332893, 0.029436791234186185},
+                     osk::transform_from_translation_quat(
+                         0.0066558036450046123, -0.05443148231260226, 0.0032491418597347822,
+                         -0.0057849801688535218, -0.27408060776929805, 0.25740329880276136,
+                         0.92660126063734383)),
+      field_box_prim({0.0031831396911569114, 0.011521921153894929, 0.027966366614740005},
+                     osk::transform_from_translation_quat(
+                         0.01752611165590235, -0.075195473039578145, 0.0049550846699575896,
+                         -0.027392159283649218, -0.27694733570222796, 0.27456243698273392,
+                         0.92041583594336251)),
+      field_box_prim({0.0044187683580256759, 0.029367606521699948, 0.03271031230381518},
+                     osk::transform_from_translation_quat(
+                         0.020400298458530197, -0.0033744314697265266, 0.017508800585312685,
+                         -0.14285252630285528, -0.1028292570483671, 0.86186096476884544,
+                         0.47562062300901953)),
+      field_box_prim({0.0044127332844738224, 0.026702117686299671, 0.030034158974274926},
+                     osk::transform_from_translation_quat(
+                         -0.010103197732818285, -0.025368664459904697, -0.0063071302933151371,
+                         -0.233603683579135, -0.26652139262795843, 0.8258329986246804,
+                         0.43862914252530194)),
+  };
+}
+
+// robot_joint_state.position for panda_joint1..7 at the stop (sim t = 17.95 s).
+std::vector<double> baguette_qpos() {
+  return {-0.16164400000000001,
+          -1.1826099999999999,
+          -0.084798999999999999,
+          -2.814155,
+          -0.304174,
+          1.61849,
+          1.7912570000000001};
+}
+
+// The payload attached to link index 6 (`panda_link7`). Its only touch link,
+// `panda_finger_pair`, carries no collision box and so has no model index --
+// the gripper is deliberately absent from `collision_geometry`.
+osk::AttachedModel baguette_attached_model() {
+  osk::AttachedModel att;
+  osk::AttachedObject o;
+  o.pose_in_link = baguette_pose_in_link();
+  o.attach_link = 6;
+  o.prim_first = 0;
+  o.touch_first = 0;
+  o.touch_count = 0;
+  for (const auto& p : baguette_primitives()) {
+    att.primitives.push_back(p);
+  }
+  o.prim_count = static_cast<int>(att.primitives.size());
+  att.objects.push_back(o);
+  att.n_objects = att.objects.size();
+  att.n_primitives = att.primitives.size();
+  return att;
+}
+
+// The payload's distance to ONE link, through the public entry point: keep the
+// whole chain (FK needs it) but leave only that link's OBB checkable. Nothing
+// trips at margin 0, so `finish_sweep` leaves `min_distance` as the sweep
+// minimum -- that link's own clearance.
+double baguette_distance_to_link(int link) {
+  const auto full = panda_mobile_arm_model();
+  osk::CollisionModel model = full;
+  model.box_link.clear();
+  model.boxes.clear();
+  for (std::size_t b = 0; b < full.boxes.size(); ++b) {
+    if (full.box_link[b] == link) {
+      model.box_link.push_back(full.box_link[b]);
+      model.boxes.push_back(full.boxes[b]);
+    }
+  }
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(model.n_links);
+  const auto qpos = baguette_qpos();
+  osk::forward_kinematics(model, qpos.data(), qpos.size(), scratch);
+  return osk::check_attached_self_collision(model, baguette_attached_model(), scratch, 0.0)
+      .sweep_min_distance;
+}
+
+}  // namespace
+
+TEST(BaguettePayloadSelfStop, TheNamedLinkIsGenuinelyTheNearestOne) {
+  // panda_link2 is model index 1. Rank every checked link (the attach link,
+  // index 6, is always allowed and never ranked).
+  int nearest = -1;
+  double nearest_d = 1e18;
+  double runner_up_d = 1e18;
+  for (int link = 0; link < 6; ++link) {
+    const double d = baguette_distance_to_link(link);
+    if (d < nearest_d) {
+      runner_up_d = nearest_d;
+      nearest_d = d;
+      nearest = link;
+    } else if (d < runner_up_d) {
+      runner_up_d = d;
+    }
+  }
+
+  EXPECT_EQ(nearest, 1) << "panda_link2 -- the link the field evidence named";
+  EXPECT_NEAR(nearest_d, 0.02170726, 1e-7);
+  EXPECT_NEAR(runner_up_d, 0.04724177, 1e-7) << "panda_link1";
+  // The margin that rules out a misattributed ranking: the runner-up is 25.5 mm
+  // further out, far beyond any plausible tie.
+  EXPECT_GT(runner_up_d - nearest_d, 0.02) << "the nearest link is unambiguous";
+}
+
+TEST(BaguettePayloadSelfStop, TheObbOrderingLegitimatelyInvertsTheMeshOrdering) {
+  // Why this pose fooled two separate analyses, pinned.
+  //
+  // In MESH space the two candidate links are nearly tied, panda_link1
+  // closer: probe measured nearest payload mesh at 73.855 mm from
+  // robot0_link1, 75.857 mm from robot0_link2. In OBB space (what the kernel
+  // actually checks) the order REVERSES and the gap opens: 47.242 mm for
+  // link1, 21.707 mm for link2.
+  //
+  // Not a defect: panda_link2's box is simply more inflated at this
+  // configuration (corner slop 48.22 mm), so it legitimately wins the
+  // kernel's argmin over its own geometry. Ranking by the probe and
+  // expecting the kernel to agree concludes the evidence named the wrong
+  // body — which happened, twice.
+  constexpr double kMeshLink1 = 0.073855;  // run_gt_snapshot nearest_payload_robot_pairs
+  constexpr double kMeshLink2 = 0.075857;
+
+  const double obb_link1 = baguette_distance_to_link(0);
+  const double obb_link2 = baguette_distance_to_link(1);
+
+  EXPECT_LT(kMeshLink1, kMeshLink2) << "by MESH, link1 is the nearer of the two";
+  EXPECT_LT(obb_link2, obb_link1) << "by OBB, link2 is -- the ordering inverts";
+  // Both OBB distances sit inside the 28.3-88.2 mm panda corner-slop band
+  // below their mesh counterparts, so neither is unexplained conservatism.
+  EXPECT_NEAR(kMeshLink2 - obb_link2, 0.05415, 1e-4) << "link2: 54.15 mm proud";
+  EXPECT_NEAR(kMeshLink1 - obb_link1, 0.02661, 1e-4) << "link1: 26.61 mm proud";
+  EXPECT_LT(kMeshLink2 - obb_link2, 0.0882) << "within panda's worst corner slop";
+}
+
+TEST(BaguettePayloadSelfStop, TheMeasuredConfigurationIsClearAndSaysSo) {
+  // At the MEASURED configuration the payload is 21.7 mm clear, so the check
+  // does not fire -- and `finish_sweep` lets `min_distance` keep its clearance
+  // meaning, naming no pair, because there is no tripping pair to name. The
+  // stop the field logged is one predicted look-ahead step past this.
+  const auto model = panda_mobile_arm_model();
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(model.n_links);
+  const auto qpos = baguette_qpos();
+  osk::forward_kinematics(model, qpos.data(), qpos.size(), scratch);
+
+  const auto hit =
+      osk::check_attached_self_collision(model, baguette_attached_model(), scratch, 0.0);
+  EXPECT_FALSE(hit.hit);
+  EXPECT_EQ(hit.link_a, -1);
+  EXPECT_EQ(hit.link_b, -1);
+  EXPECT_NEAR(hit.min_distance, 0.02170726, 1e-7);
+  EXPECT_NEAR(hit.sweep_min_distance, 0.02170726, 1e-7);
+}
+
+TEST(BaguettePayloadSelfStop, WhenItTripsTheEvidenceNamesThatSamePair) {
+  // Raise the margin past the measured clearance so the same geometry trips.
+  // The evidence must then name the pair the ranking identified, carrying that
+  // pair's OWN distance -- not another link's, and not the sweep's.
+  const auto model = panda_mobile_arm_model();
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(model.n_links);
+  const auto qpos = baguette_qpos();
+  osk::forward_kinematics(model, qpos.data(), qpos.size(), scratch);
+
+  const auto hit =
+      osk::check_attached_self_collision(model, baguette_attached_model(), scratch, 0.025);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_EQ(hit.link_a, 0) << "attached object 0 -- sim:obj_main";
+  EXPECT_EQ(hit.link_b, 1) << "panda_link2 -- the link the field evidence named";
+  EXPECT_NEAR(hit.min_distance, 0.02170726, 1e-7) << "the reported pair's OWN distance";
+  EXPECT_NEAR(hit.sweep_min_distance, 0.02170726, 1e-7);
+}
+
+// ── staged tight narrow phase: 26-DOP → exact convex hull ────────────────────
+// Safety case for replacing `box_box_distance` on the arm-vs-world-voxel path:
+// containment chain mesh ⊆ hull ⊆ 26-DOP ⊆ shipped OBB, so every value the
+// staged path returns is a LOWER bound on the true link-to-cell distance.
+// These tests prove the two halves the kernel owns; `mesh ⊆ hull` is offline
+// data proved against the real robosuite mesh by
+// tests/unit/test_collision_tight_geometry.py.
+//
+// "At least as conservative" here means: never over-reports clearance against
+// TRUE geometry (the safety property, checked here). Against the SHIPPED OBB
+// it deliberately reports MORE clearance — the box was proud of the real link
+// by up to 53 mm; removing that excess conservatism is the change, keeping
+// the kernel sound is the constraint.
+
+namespace {
+
+// Exact surface distance between two axis-aligned boxes.
+double aabb_aabb_distance(const osk::Vec3& ca, const osk::Vec3& ha, const osk::Vec3& cb,
+                          double hb) {
+  const double d[3] = {std::fabs(cb.x - ca.x) - ha.x - hb, std::fabs(cb.y - ca.y) - ha.y - hb,
+                       std::fabs(cb.z - ca.z) - ha.z - hb};
+  double acc = 0.0;
+  bool outside = false;
+  for (const double v : d) {
+    if (v > 0.0) {
+      acc += v * v;
+      outside = true;
+    }
+  }
+  if (outside) {
+    return std::sqrt(acc);
+  }
+  return std::max(std::max(d[0], d[1]), d[2]);  // overlapping: negative
+}
+
+// An UPPER bound on the hull-to-cell surface distance that needs no solver:
+// the closest single hull vertex. Any reported value above this is an
+// over-report, which is the failure this whole change must never introduce.
+double nearest_hull_vertex_to_cell(const osk::TightPose& pose, const osk::Vec3& center,
+                                   double half_side) {
+  double best = std::numeric_limits<double>::infinity();
+  for (int i = 0; i < pose.n_vertices; ++i) {
+    const osk::Vec3& p = pose.vertices[i];
+    const osk::Transform& x = pose.box;
+    const osk::Vec3 w{x.t.x + x.r[0] * p.x + x.r[1] * p.y + x.r[2] * p.z,
+                      x.t.y + x.r[3] * p.x + x.r[4] * p.y + x.r[5] * p.z,
+                      x.t.z + x.r[6] * p.x + x.r[7] * p.y + x.r[8] * p.z};
+    const double d[3] = {std::fabs(w.x - center.x) - half_side,
+                         std::fabs(w.y - center.y) - half_side,
+                         std::fabs(w.z - center.z) - half_side};
+    double acc = 0.0;
+    for (const double v : d) {
+      if (v > 0.0) {
+        acc += v * v;
+      }
+    }
+    best = std::min(best, std::sqrt(acc));
+  }
+  return best;
+}
+
+// The manifest's measured 26-DOP for `panda_link1` (13 tangent slabs in the
+// shipped box's own frame), lifted verbatim from robots/panda_mobile/robot.yaml.
+// `panda_link1` is the link whose exact hull is 1588 vertices -- over the
+// kernel's cost budget -- so it ships stage 1 only, and that is what this
+// fixture represents.
+osk::LinkHull panda_link1_dop() {
+  osk::LinkHull h;
+  h.vertex_first = 0;
+  h.vertex_count = 0;
+  const double lo[osk::kDopAxes] = {
+      -0.05502134419046353, -0.07224518140471763, -0.14082987685126935, -0.11711047489386382,
+      -0.11540894963827596, -0.11012989554980393, -0.1154433118227032,  -0.06860961055688732,
+      -0.07804751818779684, -0.12656989534730556, -0.11398132392419272, -0.12049854502882983,
+      -0.12788258044376566};
+  const double hi[osk::kDopAxes] = {0.055003115686142794, 0.07221304721515846, 0.1409169158859604,
+                                    0.11537882207055665,  0.11016639495826967, 0.11543191892827934,
+                                    0.11707534820255158,  0.07801075972929553, 0.06864027684344456,
+                                    0.11400731331074267,  0.12652316121368015, 0.12812835105624665,
+                                    0.12170808814947336};
+  for (int i = 0; i < osk::kDopAxes; ++i) {
+    h.dop_lo[i] = lo[i];
+    h.dop_hi[i] = hi[i];
+  }
+  return h;
+}
+
+// A deterministic spread of poses and cell offsets; no RNG, so a failure is
+// reproducible from the test name alone.
+osk::Transform rotated_pose(int i) {
+  const double a = 0.31 * i;
+  const double b = 0.17 * i;
+  const double c = 0.07 * i;
+  osk::Transform t = osk::transform_from_xyz_rpy(0.013 * ((i % 7) - 3), 0.011 * ((i % 5) - 2),
+                                                 0.009 * ((i % 11) - 5), a, b, c);
+  return t;
+}
+
+}  // namespace
+
+TEST(TightGeometryValidation, AcceptsTheShippedPandaLink1Dop) {
+  osk::CollisionModel m = one_box_model();
+  m.boxes[0].half_extents = osk::Vec3{0.0552, 0.0724, 0.1410};
+  m.box_hull = {0};
+  m.hulls = {panda_link1_dop()};
+  std::size_t offending = 99;
+  EXPECT_EQ(osk::validate_tight_geometry(m, offending), osk::TightGeometryStatus::kOk);
+  EXPECT_EQ(offending, 0u);
+  // The margin is real and measured, not a tolerance: the DOP sits inside the
+  // shipped box by 0.083 mm on its tightest axis. The shipped box carries no
+  // more headroom than that, which is why nothing here is allowed to grow.
+  double worst = std::numeric_limits<double>::infinity();
+  const double he[3] = {0.0552, 0.0724, 0.1410};
+  for (int k = 0; k < 3; ++k) {
+    worst = std::min(worst, std::min(he[k] - m.hulls[0].dop_hi[k], he[k] + m.hulls[0].dop_lo[k]));
+  }
+  EXPECT_GT(worst, 0.0) << "the DOP must be strictly inside the box the broad phase is sized from";
+  EXPECT_NEAR(worst, 8.31e-5, 1e-7);
+}
+
+TEST(TightGeometryValidation, RefusesADopSlabThatReachesOutsideItsBox) {
+  osk::CollisionModel m = one_box_model();
+  m.box_hull = {0};
+  m.hulls = {panda_link1_dop()};  // sized for a 0.141 m half-extent link
+  // one_box_model()'s box is a 0.05 m cube, so the same slabs now escape it.
+  std::size_t offending = 99;
+  EXPECT_EQ(osk::validate_tight_geometry(m, offending), osk::TightGeometryStatus::kEscapesBox);
+  EXPECT_EQ(offending, 0u);
+}
+
+TEST(TightGeometryValidation, RefusesAHullVertexOutsideItsOwnDop) {
+  osk::CollisionModel m = one_box_model();
+  std::vector<osk::Vec3> verts;
+  osk::LinkHull hull = axis_aligned_box_hull(osk::Vec3{0.04, 0.04, 0.04}, verts);
+  m.hull_vertices = verts;
+  // Shrink one slab so a corner that used to be tangent now pokes out.
+  hull.dop_hi[0] -= 1e-6;
+  m.hulls = {hull};
+  m.box_hull = {0};
+  std::size_t offending = 99;
+  EXPECT_EQ(osk::validate_tight_geometry(m, offending), osk::TightGeometryStatus::kHullEscapesDop);
+}
+
+TEST(TightGeometryValidation, RefusesAHullOverTheVertexBudget) {
+  osk::CollisionModel m = one_box_model();
+  std::vector<osk::Vec3> verts;
+  osk::LinkHull hull = axis_aligned_box_hull(osk::Vec3{0.04, 0.04, 0.04}, verts);
+  hull.vertex_count = osk::kMaxTightHullVertices + 1;
+  m.hull_vertices = verts;
+  m.hulls = {hull};
+  m.box_hull = {0};
+  std::size_t offending = 99;
+  EXPECT_EQ(osk::validate_tight_geometry(m, offending), osk::TightGeometryStatus::kTooManyVertices)
+      << "the vertex ceiling is a cost bound the kernel enforces, not advice";
+}
+
+TEST(TightGeometryValidation, RefusesAnInvertedSlab) {
+  osk::CollisionModel m = one_box_model();
+  osk::LinkHull hull = panda_link1_dop();
+  hull.dop_lo[4] = hull.dop_hi[4] + 1.0;
+  m.hulls = {hull};
+  m.box_hull = {0};
+  std::size_t offending = 99;
+  EXPECT_EQ(osk::validate_tight_geometry(m, offending), osk::TightGeometryStatus::kDegenerate);
+}
+
+TEST(TightGeometryValidation, AnEmptyBoxHullLeavesTheShippedPathAlone) {
+  const osk::CollisionModel m = one_box_model();
+  std::size_t offending = 99;
+  EXPECT_EQ(osk::validate_tight_geometry(m, offending), osk::TightGeometryStatus::kOk);
+}
+
+TEST(TightNarrowPhase, GjkReproducesTheClosedFormDistanceForAnAxisAlignedHull) {
+  // Ground truth without a solver: an axis-aligned box hull against an
+  // axis-aligned cell has a closed-form surface distance. If GJK's converged
+  // answer is not that number, "exact" is not a claim this change may make.
+  std::vector<osk::Vec3> verts;
+  const osk::Vec3 h{0.04, 0.03, 0.05};
+  const osk::LinkHull hull = axis_aligned_box_hull(h, verts);
+  osk::Transform box;  // identity: the hull IS axis-aligned in the base frame
+  const double half_side = 0.0125;
+  osk::TightPose pose;
+  osk::tight_pose_init(hull, verts.data(), box, half_side, pose);
+
+  int checked = 0;
+  for (int ix = -6; ix <= 6; ++ix) {
+    for (int iy = -6; iy <= 6; ++iy) {
+      for (int iz = -6; iz <= 6; ++iz) {
+        const osk::Vec3 center{0.025 * ix, 0.025 * iy, 0.025 * iz};
+        const double truth = aabb_aabb_distance(osk::Vec3{0, 0, 0}, h, center, half_side);
+        osk::Vec3 seed;
+        const double stage1 = osk::dop_cell_lower_bound(pose, center, half_side, &seed);
+        ASSERT_LE(stage1, truth + 1e-12)
+            << "stage 1 must never over-report at cell " << ix << "," << iy << "," << iz;
+        if (truth <= 0.0) {
+          continue;  // overlapping: GJK yields to stage 1 by design
+        }
+        osk::GjkWitness witness;
+        const double got =
+            osk::hull_cell_distance(pose, center, half_side, seed, 1e9, stage1, witness);
+        EXPECT_NEAR(got, truth, 1e-9) << "cell " << ix << "," << iy << "," << iz;
+        ++checked;
+      }
+    }
+  }
+  EXPECT_GT(checked, 1000);
+}
+
+TEST(TightNarrowPhase, NeverReportsMoreClearanceThanTheNearestHullVertex) {
+  // The soundness property, checked without trusting the solver: no reported
+  // value may exceed the distance from the cell to the closest single hull
+  // vertex, because that vertex is IN the hull. Swept over rotated poses, both
+  // stages, and both the converged and the early-exit path.
+  std::vector<osk::Vec3> verts;
+  const osk::LinkHull hull = axis_aligned_box_hull(osk::Vec3{0.055, 0.072, 0.141}, verts);
+  const double half_side = 0.0125;
+  int checked = 0;
+  for (int p = 0; p < 40; ++p) {
+    osk::TightPose pose;
+    osk::tight_pose_init(hull, verts.data(), rotated_pose(p), half_side, pose);
+    osk::GjkWitness witness;
+    for (int ix = -5; ix <= 5; ++ix) {
+      for (int iy = -5; iy <= 5; ++iy) {
+        for (int iz = -5; iz <= 5; ++iz) {
+          const osk::Vec3 center{0.05 * ix, 0.05 * iy, 0.05 * iz};
+          const double upper = nearest_hull_vertex_to_cell(pose, center, half_side);
+          osk::Vec3 seed;
+          const double stage1 = osk::dop_cell_lower_bound(pose, center, half_side, &seed);
+          ASSERT_LE(stage1, upper + 1e-9) << "stage 1 over-reported at pose " << p;
+          const double staged =
+              osk::hull_cell_distance(pose, center, half_side, seed, 0.0, stage1, witness);
+          ASSERT_LE(staged, upper + 1e-9) << "staged over-reported at pose " << p;
+          ASSERT_GE(staged, stage1) << "the staged answer may only ever tighten stage 1";
+          ++checked;
+        }
+      }
+    }
+  }
+  EXPECT_GT(checked, 50000);
+}
+
+TEST(TightNarrowPhase, ATruncatedGjkIsMoreConservativeNotLess) {
+  // Every early exit returns a lower bound, so capping the loop can only lose
+  // tightness. Driving the same query with a deliberately misleading warm
+  // witness must therefore never produce a LARGER answer than the cold,
+  // converged one.
+  std::vector<osk::Vec3> verts;
+  const osk::LinkHull hull = axis_aligned_box_hull(osk::Vec3{0.04, 0.03, 0.05}, verts);
+  const double half_side = 0.0125;
+  osk::TightPose pose;
+  osk::tight_pose_init(hull, verts.data(), rotated_pose(3), half_side, pose);
+  for (int ix = -4; ix <= 4; ++ix) {
+    for (int iy = -4; iy <= 4; ++iy) {
+      const osk::Vec3 center{0.05 * ix, 0.05 * iy, 0.06};
+      osk::Vec3 seed;
+      const double stage1 = osk::dop_cell_lower_bound(pose, center, half_side, &seed);
+      osk::GjkWitness cold;
+      const double converged =
+          osk::hull_cell_distance(pose, center, half_side, seed, 1e9, stage1, cold);
+      // The same cell, but told to stop as soon as the bound clears a margin of
+      // zero -- the kernel's real early exit.
+      osk::GjkWitness early;
+      const double truncated =
+          osk::hull_cell_distance(pose, center, half_side, seed, 0.0, stage1, early);
+      EXPECT_LE(truncated, converged + 1e-12);
+    }
+  }
+}
+
+TEST(TightNarrowPhase, TheDopAloneIsSometimesTheMoreConservativeOfTheTwo) {
+  // Recording a fact that is easy to assume away, and that the kernel's
+  // composition exists to handle: the 26-DOP's 16 separating axes are NOT a
+  // superset of `box_box_distance`'s 15. The box SAT's edge-cross axes can beat
+  // every DOP axis at some cells, so on a raw comparison the DOP is sometimes
+  // the tighter-reporting side and sometimes the looser one -- even though it is
+  // a strictly smaller solid. "Smaller solid" does not by itself imply "larger
+  // bound", which is why `check_voxel_collision` folds the shipped bound back in
+  // for every cell it refines instead of trusting the DOP outright.
+  const osk::Vec3 he{0.0552, 0.0724, 0.1410};
+  const osk::LinkHull dop = panda_link1_dop();
+  const double half_side = 0.0125;
+  const osk::Vec3 voxel_half{half_side, half_side, half_side};
+  int dop_tighter = 0;
+  int box_tighter = 0;
+  int checked = 0;
+  for (int p = 0; p < 12; ++p) {
+    const osk::Transform box = rotated_pose(p);
+    osk::TightPose pose;
+    osk::tight_pose_init(dop, nullptr, box, half_side, pose);
+    for (int ix = -5; ix <= 5; ++ix) {
+      for (int iy = -5; iy <= 5; ++iy) {
+        for (int iz = -5; iz <= 5; ++iz) {
+          const osk::Vec3 center{box.t.x + 0.04 * ix, box.t.y + 0.04 * iy, box.t.z + 0.04 * iz};
+          osk::Transform voxel;
+          voxel.t = center;
+          const double shipped = osk::box_box_distance(box, he, voxel, voxel_half);
+          const double tight = osk::dop_cell_lower_bound(pose, center, half_side, nullptr);
+          if (tight > shipped + 1e-6) {
+            ++dop_tighter;
+          } else if (shipped > tight + 1e-6) {
+            ++box_tighter;
+          }
+          ++checked;
+        }
+      }
+    }
+  }
+  EXPECT_GT(checked, 15000);
+  EXPECT_GT(dop_tighter, checked / 10)
+      << "a tightening that never actually tightens is not worth a hazard entry";
+  EXPECT_GT(box_tighter, 0)
+      << "if this ever reaches zero, the fold in check_voxel_collision starts looking "
+         "redundant; it is not -- see the axis-set argument above";
+}
+
+TEST(VoxelCollisionTightGeometry, NeverStopsWhereTheShippedPathWouldNotHave) {
+  // The behavioural guarantee the safety case rests on, checked through the
+  // shipped entry point over a sweep of single-cell grids: attaching tight
+  // geometry can only ever REMOVE stops the box was causing. It must never add
+  // one -- a new stop is a regression even though it is a safe one, and the
+  // entire justification for touching this code is that the box over-reports
+  // proximity.
+  osk::CollisionModel shipped = panda_mobile_arm_model();
+  osk::CollisionModel tight = shipped;
+  tight.hulls = {panda_link1_dop()};
+  tight.box_hull = {0, -1, -1, -1, -1, -1, -1};
+  std::size_t offending = 0;
+  ASSERT_EQ(osk::validate_tight_geometry(tight, offending), osk::TightGeometryStatus::kOk);
+
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(shipped.n_links);
+  const auto qpos = panda_omron_reset_qpos();
+  osk::forward_kinematics(shipped, qpos.data(), qpos.size(), scratch);
+
+  osk::VoxelGrid grid;
+  grid.pose.t = {-0.4, -0.4, 0.0};
+  grid.resolution = 0.025;
+  grid.sx = 40;
+  grid.sy = 40;
+  grid.sz = 40;
+  std::vector<std::uint8_t> occ(static_cast<std::size_t>(grid.sx) * grid.sy * grid.sz, 0);
+  grid.occupancy = occ.data();
+
+  int recovered = 0;
+  int examined = 0;
+  for (int iz = 6; iz < 34; ++iz) {
+    for (int iy = 6; iy < 34; ++iy) {
+      for (int ix = 6; ix < 34; ++ix) {
+        const std::size_t idx = static_cast<std::size_t>(ix + grid.sx * (iy + grid.sy * iz));
+        occ[idx] = 1;
+        const auto a = osk::check_voxel_collision(shipped, scratch, grid, 0.0);
+        const auto b = osk::check_voxel_collision(tight, scratch, grid, 0.0);
+        occ[idx] = 0;
+        ++examined;
+        if (b.hit) {
+          ASSERT_TRUE(a.hit) << "tight geometry invented a stop at cell " << ix << "," << iy << ","
+                             << iz;
+          ASSERT_GE(b.min_distance, a.min_distance - 1e-12)
+              << "the reported depth may only ever shrink";
+        } else if (a.hit) {
+          ++recovered;
+        }
+      }
+    }
+  }
+  EXPECT_GT(examined, 1000);
+  EXPECT_GT(recovered, 0) << "at this pose the shipped box should be stopping on cells the "
+                             "26-DOP clears -- if not, the fixture stopped exercising anything";
+}
+
+TEST(VoxelCollisionTightGeometry, StagedAndShippedAgreeOnWhatStopsTheRobot) {
+  // End to end through the shipped entry point, on the real seven-link Panda:
+  // attaching tight geometry must not change the SET of cells that stop the
+  // robot for cells that are unambiguously inside or unambiguously outside --
+  // it changes only the reported distance, and only in the tighter direction.
+  osk::CollisionModel shipped = panda_mobile_arm_model();
+  osk::CollisionModel tight = shipped;
+  tight.hulls = {panda_link1_dop()};
+  tight.box_hull = {0, -1, -1, -1, -1, -1, -1};
+  std::size_t offending = 0;
+  ASSERT_EQ(osk::validate_tight_geometry(tight, offending), osk::TightGeometryStatus::kOk);
+
+  osk::CollisionScratch scratch;
+  scratch.link_world.resize(shipped.n_links);
+  const auto qpos = panda_omron_reset_qpos();
+  osk::forward_kinematics(shipped, qpos.data(), qpos.size(), scratch);
+
+  std::vector<std::uint8_t> occ(kIssue102Sx * kIssue102Sy * kIssue102Sz, 0);
+  osk::VoxelGrid grid;
+  grid.pose.t = {0.0, -0.5, 0.0};
+  grid.resolution = 0.025;
+  grid.sx = kIssue102Sx;
+  grid.sy = kIssue102Sy;
+  grid.sz = kIssue102Sz;
+  grid.occupancy = occ.data();
+  mark_reported_voxel(occ);
+
+  const auto a = osk::check_voxel_collision(shipped, scratch, grid, 0.0);
+  const auto b = osk::check_voxel_collision(tight, scratch, grid, 0.0);
+  EXPECT_EQ(a.hit, b.hit) << "issue #102's reported cell is deep inside the link; no amount of "
+                             "tightening should reach it";
+  if (a.hit && b.hit) {
+    EXPECT_GE(b.min_distance, a.min_distance - 1e-12);
+  }
+  // `sweep_min_distance` is deliberately NOT asserted against the shipped
+  // figure. It is the sweep-wide diagnostic, and for a cell the 26-DOP clears
+  // outright the kernel never pays for `box_box_distance`, so the diagnostic can
+  // read marginally lower than today. That is an under-report of clearance --
+  // the safe direction -- and it never reaches a stop decision.
+}
+
+TEST(VoxelCollisionTightGeometry, ExhaustingTheStage2BudgetOnlyEverAddsConservatism) {
+  // The refinement budget is a real-time bound, so what matters is what happens
+  // when it runs out. Flooding a link's whole window with occupied cells drives
+  // far more than `kMaxStage2PerCheck` cells into stage 2; the check must still
+  // return, must still stop, and must not report MORE clearance than the same
+  // grid produces with the budget effectively unlimited (which it cannot,
+  // because the fallback is stage 1 + `box_box_distance`).
+  osk::CollisionModel tight = one_box_model();
+  tight.boxes[0].half_extents = osk::Vec3{0.0552, 0.0724, 0.1410};
+  std::vector<osk::Vec3> verts;
+  tight.hulls = {axis_aligned_box_hull(osk::Vec3{0.050, 0.068, 0.135}, verts)};
+  tight.hull_vertices = verts;
+  tight.box_hull = {0};
+  std::size_t offending = 0;
+  ASSERT_EQ(osk::validate_tight_geometry(tight, offending), osk::TightGeometryStatus::kOk);
+
+  osk::CollisionModel shipped = tight;
+  shipped.box_hull.clear();
+  shipped.hulls.clear();
+  shipped.hull_vertices.clear();
+
+  osk::CollisionScratch scratch;
+  scratch.link_world = {identity()};
+
+  osk::VoxelGrid grid;
+  grid.pose.t = {-0.5, -0.5, -0.5};
+  grid.resolution = 0.025;
+  grid.sx = 40;
+  grid.sy = 40;
+  grid.sz = 40;
+  // Every cell occupied: far past the budget, and the adverse case for cost.
+  std::vector<std::uint8_t> occ(static_cast<std::size_t>(grid.sx) * grid.sy * grid.sz, 1);
+  grid.occupancy = occ.data();
+
+  const auto a = osk::check_voxel_collision(shipped, scratch, grid, 0.02);
+  const auto b = osk::check_voxel_collision(tight, scratch, grid, 0.02);
+  ASSERT_TRUE(a.hit);
+  ASSERT_TRUE(b.hit);
+  EXPECT_GE(b.min_distance, a.min_distance - 1e-12)
+      << "budget exhaustion must fall back to the shipped bound, never below it";
+}
+
+// ── grid lattice is the map's, not the base frame's ──────────────────────────
+// `VoxelGrid::pose` carries the rotation from the grid's axes into base_frame,
+// so the perception bridge can publish on the source map's own lattice (one
+// cell per map voxel) instead of re-expressing it base-aligned — sound only
+// if every cell a map voxel's volume enters is marked, which dilated the
+// obstacle set by 29-35 mm (40 mm worst) on 25 mm cells (issue #173: held
+// 48% of live start-state E-stops). In exchange the kernel must apply the
+// rotation everywhere.
+
+namespace {
+
+// A rigid rotation with no zero entries, so a dropped or transposed term shows
+// up rather than cancelling.
+osk::Transform oblique_rotation() {
+  osk::Transform r;
+  const double a = 0.31;
+  const double b = -0.72;
+  const double c = 1.13;
+  const double ca = std::cos(a);
+  const double sa = std::sin(a);
+  const double cb = std::cos(b);
+  const double sb = std::sin(b);
+  const double cc = std::cos(c);
+  const double sc = std::sin(c);
+  r.r[0] = cc * cb;
+  r.r[1] = cc * sb * sa - sc * ca;
+  r.r[2] = cc * sb * ca + sc * sa;
+  r.r[3] = sc * cb;
+  r.r[4] = sc * sb * sa + cc * ca;
+  r.r[5] = sc * sb * ca - cc * sa;
+  r.r[6] = -sb;
+  r.r[7] = cb * sa;
+  r.r[8] = cb * ca;
+  return r;
+}
+
+osk::Transform mul(const osk::Transform& a, const osk::Transform& b) {
+  osk::Transform o;
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      double s = 0.0;
+      for (int k = 0; k < 3; ++k) {
+        s += a.r[i * 3 + k] * b.r[k * 3 + j];
+      }
+      o.r[i * 3 + j] = s;
+    }
+  }
+  o.t = osk::Vec3{a.t.x + a.r[0] * b.t.x + a.r[1] * b.t.y + a.r[2] * b.t.z,
+                  a.t.y + a.r[3] * b.t.x + a.r[4] * b.t.y + a.r[5] * b.t.z,
+                  a.t.z + a.r[6] * b.t.x + a.r[7] * b.t.y + a.r[8] * b.t.z};
+  return o;
+}
+
+// Cell (ix, iy, iz)'s base-frame centre on an ORIENTED lattice.
+osk::Vec3 oriented_cell_center(const osk::VoxelGrid& g, int ix, int iy, int iz) {
+  const double lx = (ix + 0.5) * g.resolution;
+  const double ly = (iy + 0.5) * g.resolution;
+  const double lz = (iz + 0.5) * g.resolution;
+  return osk::Vec3{g.pose.t.x + g.pose.r[0] * lx + g.pose.r[1] * ly + g.pose.r[2] * lz,
+                   g.pose.t.y + g.pose.r[3] * lx + g.pose.r[4] * ly + g.pose.r[5] * lz,
+                   g.pose.t.z + g.pose.r[6] * lx + g.pose.r[7] * ly + g.pose.r[8] * lz};
+}
+
+}  // namespace
+
+TEST(OrientedGrid, RotatingTheWholeProblemChangesNoDistance) {
+  // The invariance that makes an oriented grid safe to introduce at all:
+  // distance is a rigid-motion invariant, so rotating the robot AND the grid
+  // together must reproduce the unrotated answer — same verdict, same evidence
+  // cell, same distance to floating point.
+  //
+  // This is the property that fails first, and loudly, if the rotation reaches
+  // the cell centres but not the index window, or the window but not the
+  // staged tight path's cells.
+  const osk::CollisionModel m = one_capsule_model();
+  osk::CollisionScratch s;
+
+  std::vector<std::uint8_t> occ(5 * 5 * 5, 0);
+  for (std::size_t i = 0; i < occ.size(); i += 7) {
+    occ[i] = 1;
+  }
+
+  const osk::Transform R = oblique_rotation();
+  for (int step = 0; step < 12; ++step) {
+    const double t = 0.02 * step;
+    osk::Transform link;
+    link.t = {0.10 + t, -0.04 + 0.5 * t, 0.06 - 0.3 * t};
+    s.link_world = {link};
+
+    osk::VoxelGrid plain = make_grid(occ);
+    osk::VoxelGrid rotated = plain;
+    rotated.pose = mul(R, plain.pose);
+
+    osk::CollisionScratch rs;
+    rs.link_world = {mul(R, link)};
+
+    const auto a = osk::check_voxel_collision(m, s, plain, 0.01);
+    const auto b = osk::check_voxel_collision(m, rs, rotated, 0.01);
+
+    EXPECT_EQ(a.hit, b.hit) << "step " << step;
+    EXPECT_EQ(a.link_b, b.link_b) << "step " << step << ": a different cell is the evidence";
+    EXPECT_NEAR(a.min_distance, b.min_distance, 1e-12) << "step " << step;
+    EXPECT_NEAR(a.sweep_min_distance, b.sweep_min_distance, 1e-12) << "step " << step;
+  }
+}
+
+TEST(OrientedGrid, TheRotationIsLoadBearingAndNotDecorative) {
+  // The invariance above would also hold if the rotation were ignored on BOTH
+  // sides, so this pins that it is applied: a capsule sitting on an occupied
+  // cell of the ROTATED lattice stops, and the very same bytes read as though
+  // the lattice were base-aligned put that cell somewhere else, where the same
+  // capsule is clear. If the second half ever starts stopping too, this fixture
+  // has stopped proving anything.
+  const osk::CollisionModel m = one_capsule_model();
+  osk::CollisionScratch s;
+
+  std::vector<std::uint8_t> occ(5 * 5 * 5, 0);
+  occ[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;
+
+  osk::VoxelGrid rotated = make_grid(occ);
+  rotated.pose = mul(oblique_rotation(), rotated.pose);
+
+  s.link_world = {identity()};
+  osk::Transform link;
+  link.t = oriented_cell_center(rotated, 2, 2, 2);
+  s.link_world = {link};
+
+  const auto found = osk::check_voxel_collision(m, s, rotated, 0.0);
+  EXPECT_TRUE(found.hit) << "the capsule is inside the occupied cell and must stop";
+
+  osk::VoxelGrid as_if_aligned = rotated;
+  as_if_aligned.pose.r[0] = 1.0;
+  as_if_aligned.pose.r[1] = 0.0;
+  as_if_aligned.pose.r[2] = 0.0;
+  as_if_aligned.pose.r[3] = 0.0;
+  as_if_aligned.pose.r[4] = 1.0;
+  as_if_aligned.pose.r[5] = 0.0;
+  as_if_aligned.pose.r[6] = 0.0;
+  as_if_aligned.pose.r[7] = 0.0;
+  as_if_aligned.pose.r[8] = 1.0;
+  const auto misread = osk::check_voxel_collision(m, s, as_if_aligned, 0.0);
+  EXPECT_NE(found.link_b, misread.link_b)
+      << "reading the same grid without its rotation must not name the same cell";
+}
+
+// ── issue #191: self-collision at exact-hull fidelity ────────────────────────
+// OBB can't separate a pair of interleaving links. Shipped panda_mobile:
+// panda_link5<->panda_link7 boxes overlap on 86.38% of the pair's
+// (joint6, joint7) grid while real geometry interpenetrates on only 6.60%,
+// with no margin separating the populations (deepest real collision: box gap
+// -8.37 mm; shallowest false one: -36.64 mm) — why the pair shipped
+// ACM-exempted "under protest" from PR #169 until `check_self_collision`
+// learned to re-ask the hulls.
+//
+// Fixtures reproduce that RELATIONSHIP, not the geometry: two thin plates
+// each inside a fat box, offset so the boxes overlap and the plates don't.
+// The 152/102-vertex Panda hulls are verified against source meshes in
+// tests/unit/test_collision_tight_geometry.py; the pair's live verdict via
+// the real kernel node in tests/sim/safety/test_kernel_panda_link5_link7.py.
+namespace {
+
+// Two links, each carrying a 0.20 x 0.08 x 0.08 m box refined by a 10 mm-thick
+// plate hull. The plates lie against opposite faces of their boxes in y (link 0
+// at y = +0.035, link 1 at y = -0.035), so the boxes can interpenetrate while
+// the plates pass 60 mm clear of each other -- the OBB's corner slop standing
+// in for the Panda's wrist. `link1_origin` places the second link.
+osk::CollisionModel interleaving_plates_model(const osk::Transform& link1_origin, bool with_hulls,
+                                              std::vector<osk::Vec3>& verts) {
+  osk::CollisionModel m;
+  m.n_links = 2;
+  m.parent = {-1, 0};
+  m.joint_kind = {osk::JointKind::kFixed, osk::JointKind::kFixed};
+  m.dof_index = {-1, -1};
+  m.origin = {identity(), link1_origin};
+  m.axis = {{0, 0, 1}, {0, 0, 1}};
+  const osk::Vec3 box_half{0.10, 0.04, 0.04};
+  const osk::Vec3 plate_half{0.10, 0.005, 0.04};
+  m.box_link = {0, 1};
+  m.boxes = {osk::Obb{box_half, identity()}, osk::Obb{box_half, identity()}};
+  if (!with_hulls) {
+    return m;  // no tight geometry: `refine_self_pair` must leave the box alone
+  }
+  for (const double offset : {0.035, -0.035}) {
+    osk::LinkHull hull = axis_aligned_box_hull(plate_half, verts);
+    for (int i = 0; i < hull.vertex_count; ++i) {
+      verts[static_cast<std::size_t>(hull.vertex_first + i)].y += offset;
+    }
+    // Re-state the slabs around the shifted plate; the DOP must still contain it.
+    for (int i = 0; i < osk::kDopAxes; ++i) {
+      const double shift = osk::kDopAxis[i][1] * offset;
+      hull.dop_lo[i] += shift;
+      hull.dop_hi[i] += shift;
+    }
+    m.hulls.push_back(hull);
+  }
+  m.hull_vertices = verts;
+  m.box_hull = {0, 1};
+  return m;
+}
+
+// A hull vertex in the base frame.
+osk::Vec3 place(const osk::Transform& xf, const osk::Vec3& p) {
+  return osk::Vec3{xf.t.x + xf.r[0] * p.x + xf.r[1] * p.y + xf.r[2] * p.z,
+                   xf.t.y + xf.r[3] * p.x + xf.r[4] * p.y + xf.r[5] * p.z,
+                   xf.t.z + xf.r[6] * p.x + xf.r[7] * p.y + xf.r[8] * p.z};
+}
+
+}  // namespace
+
+TEST(SelfCollisionHull, TheHullVerdictReplacesTheBoxVerdictWhenTheyDisagree) {
+  // Frames 0.19 m apart along x: the two boxes interpenetrate by 10 mm, while
+  // the plates inside them pass 60 mm clear in y. This is the whole of #191 in
+  // two assertions -- the box says stop, the geometry says go, and the kernel
+  // must believe the geometry.
+  const osk::Transform link1 = translate(0.19, 0.0, 0.0);
+  std::vector<osk::Vec3> verts;
+  const osk::CollisionModel boxes_only = interleaving_plates_model(link1, false, verts);
+  osk::CollisionScratch s;
+  s.link_world.resize(2);
+  osk::forward_kinematics(boxes_only, nullptr, 0, s);
+
+  const auto by_box = osk::check_self_collision(boxes_only, s, 0.0);
+  EXPECT_TRUE(by_box.hit) << "the boxes overlap; without hulls this pair stops";
+  EXPECT_NEAR(by_box.min_distance, -0.01, 1e-9);
+
+  std::vector<osk::Vec3> hull_verts;
+  const osk::CollisionModel with_hulls = interleaving_plates_model(link1, true, hull_verts);
+  const auto by_hull = osk::check_self_collision(with_hulls, s, 0.0);
+  EXPECT_FALSE(by_hull.hit) << "the exact geometry is 60 mm apart; the refined check must clear";
+  EXPECT_NEAR(by_hull.sweep_min_distance, 0.06, 1e-6)
+      << "and it must report the true hull gap, not the box's bound";
+}
+
+TEST(SelfCollisionHull, ARealOverlapStillStopsWithHullsDeclared) {
+  // The direction that matters for safety: refining must not turn a genuine
+  // interpenetration into a clear. Lifting link 1 by 70 mm in y slides its plate
+  // onto link 0's, so the two plates now occupy the same slab.
+  std::vector<osk::Vec3> verts;
+  const osk::CollisionModel m = interleaving_plates_model(translate(0.19, 0.07, 0.0), true, verts);
+  osk::CollisionScratch s;
+  s.link_world.resize(2);
+  osk::forward_kinematics(m, nullptr, 0, s);
+
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  EXPECT_TRUE(hit.hit) << "overlapping hulls must stop";
+  // On overlap the GJK returns the caller's `box_box_distance`, which is the
+  // more conservative of the two numbers -- never less negative than the truth.
+  EXPECT_LE(hit.min_distance, 0.0);
+}
+
+TEST(SelfCollisionHull, RefinementIsSkippedEntirelyWhenTheBoxesAlreadyClear) {
+  // The cheap bound stays the gate: a pair the boxes separate never reaches the
+  // hulls, so its reported distance is the box's, unchanged from before #191.
+  const osk::Transform link1 = translate(0.30, 0.0, 0.0);
+  std::vector<osk::Vec3> boxed_verts;
+  std::vector<osk::Vec3> hull_verts;
+  const osk::CollisionModel boxes_only = interleaving_plates_model(link1, false, boxed_verts);
+  const osk::CollisionModel with_hulls = interleaving_plates_model(link1, true, hull_verts);
+  osk::CollisionScratch s;
+  s.link_world.resize(2);
+  osk::forward_kinematics(boxes_only, nullptr, 0, s);
+
+  const auto by_box = osk::check_self_collision(boxes_only, s, 0.0);
+  const auto by_hull = osk::check_self_collision(with_hulls, s, 0.0);
+  EXPECT_FALSE(by_box.hit);
+  EXPECT_FALSE(by_hull.hit);
+  EXPECT_EQ(by_box.sweep_min_distance, by_hull.sweep_min_distance)
+      << "declaring tight geometry must not move a verdict the boxes already settled";
+}
+
+TEST(SelfCollisionHull, AStageOneOnlyLinkKeepsTheBoxBound) {
+  // `panda_link1` ships a 26-DOP with no stage-2 hull (1588 vertices, over
+  // `kMaxTightHullVertices`). A pair with such a link has nothing to refine
+  // against, and must come back with the box's answer rather than a silently
+  // weaker one.
+  std::vector<osk::Vec3> verts;
+  osk::CollisionModel m = interleaving_plates_model(translate(0.19, 0.0, 0.0), true, verts);
+  m.hulls[1].vertex_count = 0;  // link 1 becomes stage 1 only
+  osk::CollisionScratch s;
+  s.link_world.resize(2);
+  osk::forward_kinematics(m, nullptr, 0, s);
+
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  EXPECT_TRUE(hit.hit) << "with nothing to refine against, the box verdict stands";
+  EXPECT_NEAR(hit.min_distance, -0.01, 1e-9);
+}
+
+TEST(SelfCollisionHull, HullHullDistanceIsSandwichedBetweenItsOwnBounds) {
+  // Soundness property the refinement rests on, swept not spot-checked.
+  // box_box_distance is NOT ground truth — it's a 15-axis SAT *lower* bound,
+  // and beating it is the point — so the answer is bracketed by two
+  // solver-free quantities:
+  //
+  //   box_box_distance  <=  true distance  <=  min over vertex pairs |v_a - v_b|
+  //
+  // Left inequality is the shipped conservatism (below it = needless E-stop);
+  // right is the safety-relevant one, since any point pair inside the two
+  // hulls upper-bounds the true distance — reporting above it would report
+  // clearance that doesn't exist.
+  std::vector<osk::Vec3> verts;
+  const osk::Vec3 plate{0.01, 0.04, 0.04};
+  const osk::LinkHull a = axis_aligned_box_hull(plate, verts);
+  const osk::LinkHull b = axis_aligned_box_hull(plate, verts);
+
+  int separated = 0;
+  int overlapping = 0;
+  int strictly_tighter = 0;
+  for (int i = 0; i < 200; ++i) {
+    const osk::Transform xf_a = identity();
+    osk::Transform xf_b = rotated_pose(i);
+    xf_b.t.x += 0.02 + 0.0006 * i;  // sweep from deep overlap out to well clear
+    osk::TightPose pose_a;
+    osk::TightPose pose_b;
+    osk::tight_pose_init(a, verts.data(), xf_a, 0.0, pose_a);
+    osk::tight_pose_init(b, verts.data(), xf_b, 0.0, pose_b);
+    const double sat = osk::box_box_distance(xf_a, plate, xf_b, plate);
+    const double got = osk::hull_hull_distance(pose_a, pose_b, 0.0, sat);
+
+    double vertex_min = std::numeric_limits<double>::infinity();
+    for (int ia = 0; ia < a.vertex_count; ++ia) {
+      const osk::Vec3 pa = place(xf_a, verts[static_cast<std::size_t>(a.vertex_first + ia)]);
+      for (int ib = 0; ib < b.vertex_count; ++ib) {
+        const osk::Vec3 pb = place(xf_b, verts[static_cast<std::size_t>(b.vertex_first + ib)]);
+        vertex_min = std::min(vertex_min, std::sqrt((pa.x - pb.x) * (pa.x - pb.x) +
+                                                    (pa.y - pb.y) * (pa.y - pb.y) +
+                                                    (pa.z - pb.z) * (pa.z - pb.z)));
+      }
+    }
+
+    EXPECT_GE(got, sat - 1e-12) << "pose " << i << ": below the shipped SAT bound";
+    EXPECT_LE(got, vertex_min + 1e-9) << "pose " << i << ": reported clearance that cannot exist";
+    if (sat > 0.0) {
+      ++separated;
+      if (got > sat + 1e-9) {
+        ++strictly_tighter;
+      }
+    } else {
+      EXPECT_EQ(got, sat) << "pose " << i << ": overlap must return the caller's bound";
+      ++overlapping;
+    }
+  }
+  EXPECT_GT(separated, 20) << "the sweep must actually reach separated poses";
+  EXPECT_GT(overlapping, 0) << "and overlapping ones";
+  EXPECT_GT(strictly_tighter, 0)
+      << "if GJK never beat the SAT bound the refinement would buy nothing";
+}
+
+// ── ADR-0100: the declaration-scoped contact-force gate (survey Path C) ───────
+//
+// At the instant of a place the true clearance IS zero, so no geometric margin
+// separates "set the object down" from "crush it" (survey §9 point 4). These
+// pin the second observable, and — more importantly — pin that it can only ever
+// ADD a refusal.
+
+namespace {
+
+/// One carried payload with a contact-force witness on the declared target.
+osk::AttachedModel force_gate_model(double threshold_n, double magnitude_n, bool calibrated,
+                                    bool target_matches = true, bool has_witness = true) {
+  osk::AttachedModel attached;
+  attached.objects.assign(2, osk::AttachedObject{});
+  attached.n_objects = 1;
+  osk::AttachedObject& obj = attached.objects[0];
+  obj.has_contact_force_witness = has_witness;
+  obj.contact_force_calibrated = has_witness && calibrated;
+  obj.contact_force_target_matches = has_witness && target_matches;
+  obj.contact_force_magnitude = has_witness ? magnitude_n : 0.0;
+  if (threshold_n > 0.0) {
+    attached.force_gate.valid = true;
+    attached.force_gate.object_mask = 0b1;
+    attached.force_gate.threshold_n = threshold_n;
+  }
+  return attached;
+}
+
+}  // namespace
+
+TEST(ContactForceGate, ASubThresholdTouchPassesAndAnOverThresholdPressRefuses) {
+  // The two directions the gate exists to separate, at the same geometry. Both
+  // configurations are ones every geometric check already accepted — the gate is
+  // evaluated last — so this is the whole of what it adds.
+  EXPECT_FALSE(osk::check_contact_force_gate(force_gate_model(30.0, 12.5, true)).tripped)
+      << "a 12.5 N touch inside a 30 N declaration is the place the declaration authorised";
+
+  const auto pressed = osk::check_contact_force_gate(force_gate_model(30.0, 41.0, true));
+  ASSERT_TRUE(pressed.tripped);
+  EXPECT_EQ(pressed.object_index, 0);
+  EXPECT_DOUBLE_EQ(pressed.magnitude_n, 41.0);
+  EXPECT_DOUBLE_EQ(pressed.threshold_n, 30.0);
+
+  // The bound is inclusive: a declaration saying "up to 30 N" permits 30 N.
+  EXPECT_FALSE(osk::check_contact_force_gate(force_gate_model(30.0, 30.0, true)).tripped);
+  EXPECT_TRUE(osk::check_contact_force_gate(force_gate_model(30.0, 30.0 + 1e-9, true)).tripped);
+}
+
+TEST(ContactForceGate, WithNoLiveDeclarationTheGateIsInert) {
+  // The fail-closed scoping this feature lives or dies on, and the #142 posture:
+  // a force far past ANY plausible threshold, armed witness and all, changes
+  // nothing without a declaration to scope it. Geometry decides alone.
+  auto undeclared = force_gate_model(0.0, 5000.0, true);
+  ASSERT_FALSE(undeclared.force_gate.valid);
+  EXPECT_FALSE(osk::check_contact_force_gate(undeclared).tripped);
+
+  // A live declaration that names a DIFFERENT payload is equally inert: the
+  // gate follows the declared object, never a second one the robot carries.
+  auto other_payload = force_gate_model(30.0, 5000.0, true);
+  other_payload.force_gate.object_mask = 0b10;
+  EXPECT_FALSE(osk::check_contact_force_gate(other_payload).tripped);
+}
+
+TEST(ContactForceGate, AnUncalibratedMagnitudeIsNeverReadAsNewtons) {
+  // Survey §21.7: no published work validates MuJoCo contact-force MAGNITUDES
+  // against real force-torque measurements, so an uncalibrated producer number
+  // is not a physical claim and must not be judged as one (CLAUDE.md §1.2).
+  // This is the test that keeps a stock sim from arming an enforcement surface
+  // nobody calibrated.
+  EXPECT_FALSE(osk::check_contact_force_gate(force_gate_model(30.0, 4000.0, false)).tripped)
+      << "an uncalibrated 4000 is a producer quantity, not 4000 newtons";
+  EXPECT_TRUE(osk::check_contact_force_gate(force_gate_model(30.0, 4000.0, true)).tripped)
+      << "the same number under a named calibration is judged";
+}
+
+TEST(ContactForceGate, AContactOnAnythingButTheDeclaredTargetAttestsNothing) {
+  // Scoping, the same rule the support witness's support_id is under: force
+  // bounds the one surface the declaration named, and grants nothing anywhere
+  // else. A payload pressing hard on a wall mid-place is a geometry problem.
+  EXPECT_FALSE(
+      osk::check_contact_force_gate(force_gate_model(30.0, 900.0, true, /*target_matches=*/false))
+          .tripped);
+  // And an absent witness is not evidence of absent contact — it only ever
+  // means the gate does not arm.
+  EXPECT_FALSE(osk::check_contact_force_gate(
+                   force_gate_model(30.0, 900.0, true, true, /*has_witness=*/false))
+                   .tripped);
+}
+
+TEST(ContactForceGate, AnOutOfRangeOrNonFiniteBoundArmsNothing) {
+  // Fail-closed toward the SHIPPED behaviour rather than toward a clamped bound
+  // nobody chose. The ceiling mirrors the schema's, so a declaration the wire
+  // accepts can never overflow the kernel.
+  auto over = force_gate_model(osk::kMaxContactForceThresholdN + 1.0, 5000.0, true);
+  EXPECT_FALSE(osk::check_contact_force_gate(over).tripped);
+
+  auto nan_threshold = force_gate_model(30.0, 5000.0, true);
+  nan_threshold.force_gate.threshold_n = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(osk::check_contact_force_gate(nan_threshold).tripped);
+
+  auto nan_magnitude = force_gate_model(30.0, 0.0, true);
+  nan_magnitude.objects[0].contact_force_magnitude = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(osk::check_contact_force_gate(nan_magnitude).tripped);
+
+  // At the ceiling exactly, the gate is live — the bound is a ceiling on the
+  // declaration, not an exclusion of it.
+  auto at_ceiling = force_gate_model(osk::kMaxContactForceThresholdN, 5000.0, true);
+  EXPECT_TRUE(osk::check_contact_force_gate(at_ceiling).tripped);
+}
+
+TEST(ContactForceGate, TheDeepestOverrunIsTheOneReported) {
+  // Single-pair coherence: the evidence names the worst overrun, not the first
+  // object scanned, so an incident review is handed the binding number.
+  osk::AttachedModel attached = force_gate_model(10.0, 15.0, true);
+  attached.n_objects = 2;
+  attached.force_gate.object_mask = 0b11;
+  osk::AttachedObject& second = attached.objects[1];
+  second.has_contact_force_witness = true;
+  second.contact_force_calibrated = true;
+  second.contact_force_target_matches = true;
+  second.contact_force_magnitude = 88.0;
+
+  const auto tripped = osk::check_contact_force_gate(attached);
+  ASSERT_TRUE(tripped.tripped);
+  EXPECT_EQ(tripped.object_index, 1);
+  EXPECT_DOUBLE_EQ(tripped.magnitude_n, 88.0);
+}
+
+// ── The hull check says when it did not measure the depth ─────────────────────
+//
+// GJK proves an overlap but does not size it; penetration depth needs an
+// expanding-polytope step this kernel does not run. So on the overlapping
+// branch `hull_hull_distance` falls back to `box_box_distance` — sound, since
+// the hull is contained in its box and the box can only report MORE
+// penetration, but far looser than the truth. Publishing that under the
+// identity of a check that exists *because* the box cannot be trusted for the
+// pair is what `depth_is_box_bound` closes. Disclosure, never a gate.
+
+TEST(SelfCollisionHull, AnOverlappingPairSaysItsDepthIsTheBoxBound) {
+  std::vector<osk::Vec3> verts;
+  const osk::Vec3 plate{0.01, 0.04, 0.04};
+  const osk::LinkHull a = axis_aligned_box_hull(plate, verts);
+  const osk::LinkHull b = axis_aligned_box_hull(plate, verts);
+
+  int overlapping = 0;
+  int separated = 0;
+  for (int i = 0; i < 200; ++i) {
+    const osk::Transform xf_a = identity();
+    osk::Transform xf_b = rotated_pose(i);
+    xf_b.t.x += 0.02 + 0.0006 * i;  // deep overlap out to well clear
+    osk::TightPose pose_a;
+    osk::TightPose pose_b;
+    osk::tight_pose_init(a, verts.data(), xf_a, 0.0, pose_a);
+    osk::tight_pose_init(b, verts.data(), xf_b, 0.0, pose_b);
+    const double sat = osk::box_box_distance(xf_a, plate, xf_b, plate);
+
+    bool depth_is_box_bound = true;  // seeded wrong on purpose: the call must set it
+    const double got = osk::hull_hull_distance(pose_a, pose_b, 0.0, sat, &depth_is_box_bound);
+
+    if (depth_is_box_bound) {
+      ++overlapping;
+      // The flag means exactly one thing: this number came from the box, not
+      // from the hulls. Anything else would make it a second, weaker gate.
+      EXPECT_DOUBLE_EQ(got, sat) << "pose " << i << ": flagged, so it must BE the bound";
+      EXPECT_LE(got, 0.0) << "pose " << i << ": the branch is reached only on overlap";
+    } else {
+      ++separated;
+      // Not flagged: the hulls were separated and the answer is the measurement
+      // the refinement exists to produce — at or above the box's bound.
+      EXPECT_GE(got, sat - 1e-12) << "pose " << i;
+    }
+  }
+  EXPECT_GT(overlapping, 0) << "the sweep must exercise the overlapping branch";
+  EXPECT_GT(separated, 0) << "and the separated one";
+}
+
+TEST(SelfCollisionHull, TheFlagIsClearedWhenNoHullRefinementHappened) {
+  // A pair that never reaches the GJK — one side stage-1 only — must not
+  // inherit a stale `true`, or a plain box verdict would advertise itself as a
+  // hull measurement that fell back. Fail-toward-honest: unset means "this is
+  // the ordinary box path", which is what it is.
+  std::vector<osk::Vec3> verts;
+  const osk::Vec3 plate{0.01, 0.04, 0.04};
+  const osk::LinkHull a = axis_aligned_box_hull(plate, verts);
+  osk::LinkHull stage_one_only = a;
+  stage_one_only.vertex_count = 0;  // DOP only: no stage-2 hull
+
+  osk::Transform xf_b = identity();
+  xf_b.t.x += 0.005;  // boxes overlap
+  osk::TightPose pose_a;
+  osk::TightPose pose_b;
+  osk::tight_pose_init(a, verts.data(), identity(), 0.0, pose_a);
+  osk::tight_pose_init(stage_one_only, verts.data(), xf_b, 0.0, pose_b);
+  const double sat = osk::box_box_distance(identity(), plate, xf_b, plate);
+
+  bool depth_is_box_bound = true;  // seeded wrong on purpose
+  const double got = osk::hull_hull_distance(pose_a, pose_b, 0.0, sat, &depth_is_box_bound);
+  EXPECT_FALSE(depth_is_box_bound);
+  EXPECT_DOUBLE_EQ(got, sat);
+}
+
+TEST(SelfCollisionHull, TheReportedHitCarriesTheDisclosure) {
+  // End to end through `check_self_collision`, because the flag is only worth
+  // anything if it survives onto the CollisionHit an operator actually reads.
+  //
+  // `interleaving_plates_model` puts its two plates in disjoint y bands on
+  // purpose — that is the case where the hulls clear a pair the boxes cannot.
+  // Here the opposite is wanted, so link 1 is given link 0's plate: same band,
+  // 5 mm apart along x, half-extent 0.10, i.e. hulls that genuinely overlap.
+  std::vector<osk::Vec3> verts;
+  osk::CollisionModel m = interleaving_plates_model(translate(0.005, 0.0, 0.0), true, verts);
+  m.hulls[1] = m.hulls[0];
+
+  osk::CollisionScratch s;
+  s.link_world.resize(2);
+  osk::forward_kinematics(m, nullptr, 0, s);
+
+  const auto hit = osk::check_self_collision(m, s, 0.0);
+  ASSERT_TRUE(hit.hit);
+  EXPECT_TRUE(hit.depth_is_box_bound)
+      << "the hulls overlap, so the published depth is the box's bound and must say so";
+  EXPECT_LE(hit.min_distance, 0.0);
+
+  // And the ordinary interleaving case — hulls that genuinely clear — must not
+  // set it, or the flag would just mean "this pair has hulls".
+  std::vector<osk::Vec3> clear_verts;
+  const osk::CollisionModel clear =
+      interleaving_plates_model(translate(0.19, 0.0, 0.0), true, clear_verts);
+  osk::CollisionScratch cs;
+  cs.link_world.resize(2);
+  osk::forward_kinematics(clear, nullptr, 0, cs);
+  const auto clear_hit = osk::check_self_collision(clear, cs, 0.0);
+  EXPECT_FALSE(clear_hit.depth_is_box_bound);
+}
+
+// --- Attached-payload stage-2 geometry (#266) --------------------------------
+//
+// Robot links got the staged 26-DOP -> exact-hull narrow phase in #166.
+// Attached payloads never did: `extract_body_primitives` lowers a carried MESH
+// geom to its local AABB, and across the 2026-09-10 resolution A/B (424
+// samples, 4 scenes) those corners stood a median 50.78 mm proud of the mesh --
+// 2.3-3.9x the whole world-voxel quantisation term, while 97% of the 15 mm
+// arm's stops were payload-vs-world and roughly half fired with the payload a
+// centimetre or more clear of anything.
+//
+// Fixture: an octahedron with vertices at +-`r` on each axis, lowered exactly
+// as the producer lowers it -- box half-extents `r` (its AABB), refined by the
+// mesh's own 26-DOP and its 6-vertex exact hull. The AABB corner (r,r,r) is
+// `r*sqrt(2)` from the nearest surface point, which is the entire defect,
+// reproduced at a size a single test grid can resolve.
+namespace {
+
+// The octahedron's own DOP slabs: tangent halfspaces u.x <= max over its
+// vertices of u.x, exactly as `_tight_geometry_from_points` builds them.
+osk::LinkHull octahedron_hull(double r, int vertex_first, bool with_stage2) {
+  osk::LinkHull h;
+  h.vertex_first = vertex_first;
+  h.vertex_count = with_stage2 ? 6 : 0;
+  const double verts[6][3] = {{r, 0, 0}, {-r, 0, 0}, {0, r, 0}, {0, -r, 0}, {0, 0, r}, {0, 0, -r}};
+  for (int i = 0; i < osk::kDopAxes; ++i) {
+    double lo = std::numeric_limits<double>::infinity();
+    double hi = -std::numeric_limits<double>::infinity();
+    for (const auto& v : verts) {
+      const double s =
+          osk::kDopAxis[i][0] * v[0] + osk::kDopAxis[i][1] * v[1] + osk::kDopAxis[i][2] * v[2];
+      lo = std::min(lo, s);
+      hi = std::max(hi, s);
+    }
+    h.dop_lo[i] = lo;
+    h.dop_hi[i] = hi;
+  }
+  return h;
+}
+
+std::vector<osk::Vec3> octahedron_vertices(double r) {
+  return {osk::Vec3{r, 0, 0},  osk::Vec3{-r, 0, 0}, osk::Vec3{0, r, 0},
+          osk::Vec3{0, -r, 0}, osk::Vec3{0, 0, r},  osk::Vec3{0, 0, -r}};
+}
+
+osk::AttachedPrimitive octahedron_box_prim(double r, const osk::Transform& pose_in_object,
+                                           int hull_index) {
+  osk::AttachedPrimitive p;
+  p.kind = osk::AttachedShapeKind::kBox;
+  p.half_extents = osk::Vec3{r, r, r};
+  p.pose_in_object = pose_in_object;
+  p.hull_index = hull_index;
+  return p;
+}
+
+}  // namespace
+
+TEST(AttachedVoxelTightGeometry, RefiningAPayloadOnlyEverRemovesStops) {
+  // The behavioural guarantee the safety case rests on, through the shipped
+  // entry point over a sweep of single-cell grids. A payload refinement may
+  // only ever recover clearance the box was hiding; inventing a stop would be
+  // a regression even though it is a safe one, since the whole reason to touch
+  // this path is that the box over-reports proximity.
+  const double r = 0.1;
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  osk::AttachedModel box_only;
+  append_object(box_only, 1, identity(), {octahedron_box_prim(r, identity(), -1)});
+
+  osk::AttachedModel refined;
+  append_object(refined, 1, identity(), {octahedron_box_prim(r, identity(), 0)});
+  refined.hulls = {octahedron_hull(r, 0, true)};
+  refined.hull_vertices = octahedron_vertices(r);
+  ASSERT_EQ(osk::validate_tight_hull(refined.hulls[0], refined.primitives[0].half_extents,
+                                     refined.hull_vertices),
+            osk::TightGeometryStatus::kOk);
+
+  std::vector<std::uint8_t> occ(125, 0);
+  int recovered = 0;
+  for (int iz = 0; iz < 5; ++iz) {
+    for (int iy = 0; iy < 5; ++iy) {
+      for (int ix = 0; ix < 5; ++ix) {
+        const std::size_t idx = static_cast<std::size_t>(voxel_index(ix, iy, iz));
+        occ[idx] = 1;
+        const auto a = osk::check_attached_voxel_collision(m, box_only, s, make_grid(occ), 0.0);
+        const auto b = osk::check_attached_voxel_collision(m, refined, s, make_grid(occ), 0.0);
+        occ[idx] = 0;
+        if (b.hit) {
+          ASSERT_TRUE(a.hit) << "the refinement invented a stop at cell " << ix << "," << iy << ","
+                             << iz;
+          ASSERT_GE(b.min_distance, a.min_distance - 1e-12)
+              << "the reported depth may only ever shrink";
+        } else if (a.hit) {
+          ++recovered;
+        }
+      }
+    }
+  }
+  EXPECT_GT(recovered, 0) << "the AABB should be stopping on cells the octahedron clears -- if "
+                             "not, the fixture stopped exercising anything";
+}
+
+TEST(AttachedVoxelTightGeometry, TheCornerCellIsExactlyWhatTheBoxWasInventing) {
+  // Names the defect rather than sampling it. The (+x,+y,+z) corner cell is
+  // diagonally clear of the octahedron and flush against its AABB, so the box
+  // stops and the refined payload does not -- the 50.78 mm class, at 100 mm.
+  const double r = 0.1;
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  std::vector<std::uint8_t> occ(125, 0);
+  occ[static_cast<std::size_t>(voxel_index(3, 3, 3))] = 1;  // centre (0.1, 0.1, 0.1)
+
+  osk::AttachedModel box_only;
+  append_object(box_only, 1, identity(), {octahedron_box_prim(r, identity(), -1)});
+  const auto boxed = osk::check_attached_voxel_collision(m, box_only, s, make_grid(occ), 0.0);
+  EXPECT_TRUE(boxed.hit) << "the AABB corner touches this cell -- that is the false stop";
+
+  // Stage 1 alone (the 26-DOP, no hull) already clears it: the octahedron's
+  // corner slab is tangent to the (1,1,1)/sqrt(3) face, well inside the box.
+  osk::AttachedModel dop_only;
+  append_object(dop_only, 1, identity(), {octahedron_box_prim(r, identity(), 0)});
+  dop_only.hulls = {octahedron_hull(r, 0, false)};
+  const auto staged1 = osk::check_attached_voxel_collision(m, dop_only, s, make_grid(occ), 0.0);
+  EXPECT_FALSE(staged1.hit) << "stage 1 alone must already recover the corner";
+
+  osk::AttachedModel refined;
+  append_object(refined, 1, identity(), {octahedron_box_prim(r, identity(), 0)});
+  refined.hulls = {octahedron_hull(r, 0, true)};
+  refined.hull_vertices = octahedron_vertices(r);
+  const auto staged2 = osk::check_attached_voxel_collision(m, refined, s, make_grid(occ), 0.0);
+  EXPECT_FALSE(staged2.hit);
+  // True octahedron-to-cell-corner clearance: the cell's near corner is
+  // (0.05, 0.05, 0.05) and the face plane x+y+z = r puts it 0.05*sqrt(3) - ...
+  // beyond it. The kernel reports a LOWER bound; it must be positive and it
+  // must not exceed the truth.
+  EXPECT_GT(staged2.min_distance, 0.0);
+  EXPECT_LT(staged2.min_distance, 0.05 * std::sqrt(3.0));
+}
+
+TEST(AttachedVoxelTightGeometry, ARealContactStillStops) {
+  // The check must stay (#266): the >=2 mm bucket of the A/B contains real
+  // interpenetration. A cell the octahedron genuinely occupies trips whether or
+  // not the payload is refined.
+  const double r = 0.1;
+  osk::CollisionModel m = hand_model();
+  osk::CollisionScratch s;
+  s.link_world = {identity(), identity(), identity(), identity()};
+
+  std::vector<std::uint8_t> occ(125, 0);
+  occ[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;  // the payload's own centre cell
+
+  osk::AttachedModel refined;
+  append_object(refined, 1, identity(), {octahedron_box_prim(r, identity(), 0)});
+  refined.hulls = {octahedron_hull(r, 0, true)};
+  refined.hull_vertices = octahedron_vertices(r);
+  const auto hit = osk::check_attached_voxel_collision(m, refined, s, make_grid(occ), 0.0);
+  EXPECT_TRUE(hit.hit);
+  EXPECT_LT(hit.min_distance, 0.0);
+}
+
+TEST(AttachedIngestTightGeometry, AnUnprovableRefinementIsDroppedNotObeyed) {
+  // Fail-DOWN, and why. A payload's refinement arrives on every world-state
+  // message from a live producer, so refusing the attachment outright would
+  // drop the payload's geometry -- the unsafe direction. Dropping only the
+  // refinement leaves the primitive checked as the plain box, i.e. exactly the
+  // pre-#266 behaviour.
+  osk::AttachedModel out;
+  out.objects.assign(2, osk::AttachedObject{});
+  out.primitives.assign(4, osk::AttachedPrimitive{});
+  out.touch_links.assign(4, 0);
+  out.hulls.assign(4, osk::LinkHull{});
+  out.hull_vertices.assign(4 * static_cast<std::size_t>(osk::kMaxTightHullVertices), osk::Vec3{});
+
+  const double r = 0.1;
+  osk::AttachedObjectInput in;
+  in.attach_link = "hand";
+  osk::AttachedPrimitiveInput honest;
+  honest.kind = osk::AttachedShapeKind::kBox;
+  honest.half_extents = osk::Vec3{r, r, r};
+  honest.has_tight = true;
+  const osk::LinkHull good = octahedron_hull(r, 0, true);
+  for (int i = 0; i < osk::kDopAxes; ++i) {
+    honest.dop_lo[i] = good.dop_lo[i];
+    honest.dop_hi[i] = good.dop_hi[i];
+  }
+  honest.hull_vertices = octahedron_vertices(r);
+
+  // Same primitive, but with a slab reaching outside the box it refines. That
+  // is the one failure that could make the broad-phase window skip a cell.
+  osk::AttachedPrimitiveInput escaping = honest;
+  escaping.dop_hi[0] = r * 2.0;
+
+  // ... and one whose hull vertex sits outside its own slabs: the containment
+  // chain hull <= DOP <= box broken at the other link.
+  osk::AttachedPrimitiveInput escaping_hull = honest;
+  escaping_hull.hull_vertices[0] = osk::Vec3{r * 0.99, r * 0.99, 0.0};
+
+  in.primitives = {honest, escaping};
+  ASSERT_EQ(osk::ingest_attached_objects({in}, {"base", "hand"}, 2, 4, 4, out),
+            osk::AttachIngestStatus::kOk);
+  EXPECT_EQ(out.primitives[0].hull_index, 0) << "a proved refinement is loaded";
+  EXPECT_EQ(out.primitives[1].hull_index, -1) << "an escaping slab is dropped, not obeyed";
+
+  in.primitives = {escaping_hull};
+  ASSERT_EQ(osk::ingest_attached_objects({in}, {"base", "hand"}, 2, 4, 4, out),
+            osk::AttachIngestStatus::kOk);
+  EXPECT_EQ(out.primitives[0].hull_index, -1) << "a hull outside its own DOP is dropped";
+
+  // An over-budget hull keeps its SLABS and drops its vertices -- stage 1,
+  // the same representation the producer emits for the same condition. It is
+  // never TRUNCATED to the first kMaxTightHullVertices: a truncated hull no
+  // longer contains its mesh.
+  osk::AttachedPrimitiveInput over_budget = honest;
+  over_budget.hull_vertices.assign(static_cast<std::size_t>(osk::kMaxTightHullVertices) + 1,
+                                   osk::Vec3{0.0, 0.0, 0.0});
+  in.primitives = {over_budget};
+  ASSERT_EQ(osk::ingest_attached_objects({in}, {"base", "hand"}, 2, 4, 4, out),
+            osk::AttachIngestStatus::kOk);
+  ASSERT_EQ(out.primitives[0].hull_index, 0) << "the slabs still bound the payload";
+  EXPECT_EQ(out.hulls[0].vertex_count, 0) << "stage 1 only, not a truncated hull";
+
+  // 13 zero slabs pass finite, not-inverted and inside-any-box, and collapse
+  // the payload to a POINT -- after which every cell reads as clear. Reachable
+  // from a producer that resized the arrays and forgot to fill them, so it
+  // must fail DOWN to the box rather than be obeyed.
+  osk::AttachedPrimitiveInput degenerate = honest;
+  for (int i = 0; i < osk::kDopAxes; ++i) {
+    degenerate.dop_lo[i] = 0.0;
+    degenerate.dop_hi[i] = 0.0;
+  }
+  degenerate.hull_vertices.clear();
+  in.primitives = {degenerate};
+  ASSERT_EQ(osk::ingest_attached_objects({in}, {"base", "hand"}, 2, 4, 4, out),
+            osk::AttachIngestStatus::kOk);
+  EXPECT_EQ(out.primitives[0].hull_index, -1) << "a payload with no extent is not a payload";
+
+  // The same, through the shipped entry point: a degenerate refinement must
+  // not make an occupied cell the payload sits on read as clear.
+  {
+    osk::CollisionModel m = hand_model();
+    osk::CollisionScratch sc;
+    sc.link_world = {identity(), identity(), identity(), identity()};
+    osk::AttachedModel att;
+    append_object(att, 1, identity(), {octahedron_box_prim(0.1, identity(), 0)});
+    att.hulls = {osk::LinkHull{}};  // all-zero slabs, no vertices
+    std::vector<std::uint8_t> occ(125, 0);
+    occ[static_cast<std::size_t>(voxel_index(2, 2, 2))] = 1;
+    const auto hit = osk::check_attached_voxel_collision(m, att, sc, make_grid(occ), 0.0);
+    EXPECT_TRUE(hit.hit) << "a zeroed TightPose must never be able to clear the payload's own cell";
+  }
+
+  // And a publisher that ships nothing keeps the shipped path.
+  osk::AttachedPrimitiveInput plain = honest;
+  plain.has_tight = false;
+  in.primitives = {plain};
+  ASSERT_EQ(osk::ingest_attached_objects({in}, {"base", "hand"}, 2, 4, 4, out),
+            osk::AttachIngestStatus::kOk);
+  EXPECT_EQ(out.primitives[0].hull_index, -1);
+}

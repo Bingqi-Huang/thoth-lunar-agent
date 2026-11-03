@@ -1,0 +1,20 @@
+# Analysis tools (post-hoc; simulator truth only for evaluation)
+
+Run on a ROS 2 Humble host, e.g.
+`source /opt/ros/humble/setup.bash && python3 experiments/analysis/<tool>.py <run>/bag`
+(`replay_pick_find.py` needs openral's venv: `cd openral && .venv/bin/python ...`).
+
+- `bag_loc_error.py` -- localization error over a run (truth `srb/env0/robot` vs `map->odom->chassis_base_link`).
+- `bag_freeze_scan.py` -- intervals where the local / global costmap footprint or AMCL's map->odom stops following
+  the sim clock.
+- `bag_plan_lag.py` -- global plan start vs the rover's pose.
+- `bag_tf_freshness.py` -- first / last stamp per /tf edge.
+- `freeze_probe.py` -- live: costmap footprint vs a fresh TF lookup; dumps thread states on a freeze.
+- `grab_costmap.py` -- live: one global costmap + AMCL pose to JSON.
+- `replay_pick_find.py` -- replays every recorded pick `find` stage against the current interface fit.
+
+Runs need `D0_BAG="<topics>"` to have a bag.
+
+- `bag_contacts.py <run>/bag`: non-wheel contact windows (per-body force) from a finished bag.
+- `bag_truth_at.py <run>/bag <t> <frame substrings...>`: ground-truth poses around bag time t (who touched what).
+- `run_summary.py <run>`: one page per Ours run -- verdict, steps, calls, operator exchanges with mission and wall time.

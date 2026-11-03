@@ -1,0 +1,34 @@
+/tf:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/tf_static:
+  reliability: reliable
+  durability: transient_local
+  history: keep_last
+  depth: 100
+# latched simulator-truth and safety topics (§R1): a plain bag-record subscription with the
+# recorder's usual default QoS never receives a TRANSIENT_LOCAL publisher's already-sent
+# message, so a run whose bag starts after these were published would show nothing -- same
+# reason /tf_static needs the override above.
+/srb/env0/mission_brief:
+  reliability: reliable
+  durability: transient_local
+  history: keep_last
+  depth: 1
+/srb/env0/inventory_record:
+  reliability: reliable
+  durability: transient_local
+  history: keep_last
+  depth: 1
+/srb/env0/space_context:
+  reliability: reliable
+  durability: transient_local
+  history: keep_last
+  depth: 1
+/openral/safety_status:
+  reliability: reliable
+  durability: transient_local
+  history: keep_last
+  depth: 1

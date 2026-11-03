@@ -1,0 +1,4 @@
+usd/**/*.usdc filter=lfs diff=lfs merge=lfs -text
+usd/**/textures/** filter=lfs diff=lfs merge=lfs -text
+usd/**/*.usdz filter=lfs diff=lfs merge=lfs -text
+authored/**/*.glb filter=lfs diff=lfs merge=lfs -text

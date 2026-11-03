@@ -1,0 +1,37 @@
+{
+ "press": {
+  "type": "press",
+  "xyz": [
+   0.092,
+   0.0,
+   0.78
+  ],
+  "normal": [
+   1,
+   0,
+   0
+  ],
+  "interface": {
+   "kind": "mushroom_button",
+   "cap_radius_m": 0.032,
+   "cap_centre_height_m": 0.039999999999999994,
+   "collar_radius_m": 0.036,
+   "collar_top_height_m": 0.02,
+   "travel_m": 0.01
+  }
+ },
+ "lamp": {
+  "type": "indicator",
+  "xyz": [
+   0.07400000000000001,
+   0.0,
+   1.02
+  ],
+  "normal": [
+   1,
+   0,
+   0
+  ],
+  "material": "StatusLamp"
+ }
+}

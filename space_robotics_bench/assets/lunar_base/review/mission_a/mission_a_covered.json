@@ -1,0 +1,317 @@
+{
+ "scenario": "covered",
+ "faulted": "pdu_2",
+ "reported": "pdu_2",
+ "sim_time_s": 195.2,
+ "wall_time_s": 346.8,
+ "final": {
+  "scenario": "covered",
+  "faulted_pdu": "pdu_2",
+  "reported_pdu": "pdu_2",
+  "faults": {
+   "pdu_1": false,
+   "pdu_2": false,
+   "pdu_3": false
+  },
+  "presses": {
+   "pdu_1": 0,
+   "pdu_2": 1,
+   "pdu_3": 0
+  },
+  "blocked_presses": 0,
+  "success": true,
+  "covered": {
+   "pdu_1": false,
+   "pdu_2": false,
+   "pdu_3": true
+  }
+ },
+ "phases": [
+  {
+   "t": 1.5,
+   "phase": "undock",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  },
+  {
+   "t": 1.5,
+   "phase": "drive to pdu_2 inspection pose",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  },
+  {
+   "t": 53.6,
+   "phase": "inspect pdu_2 status lamp",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  },
+  {
+   "t": 77.0,
+   "phase": "arm to pdu_2 reset button",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  },
+  {
+   "t": 91.8,
+   "phase": "press pdu_2 reset",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  },
+  {
+   "t": 100.2,
+   "phase": "stow arm",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  },
+  {
+   "t": 108.0,
+   "phase": "drive to pdu_2 inspection pose",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  },
+  {
+   "t": 139.3,
+   "phase": "inspect pdu_2 status lamp",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  },
+  {
+   "t": 141.3,
+   "phase": "verified pdu_2 lamp green",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  },
+  {
+   "t": 141.3,
+   "phase": "return to dock",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  },
+  {
+   "t": 193.2,
+   "phase": "mission complete",
+   "mission": {
+    "scenario": "covered",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": true,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": true
+    }
+   }
+  }
+ ]
+}

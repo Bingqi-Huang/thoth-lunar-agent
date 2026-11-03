@@ -1,0 +1,62 @@
+# SimplerEnv WidowX (Bridge Data V2) benchmark suite — real-to-sim correlator.
+#
+# Opt-in via `uv sync --group simpler-env`; without it `openral benchmark run`
+# fails at lazy import in the scene factory with a typed ROSConfigError
+# pointing at the install command.
+#
+# The four canonical WidowX eval tasks from Li et al. CoRL 2024 (Bridge V2
+# fragment of OXE that RT-1/RT-2/Octo/OpenVLA are typically benchmarked on),
+# wired end-to-end against ManiSkill3 v3.0.x: PutCarrotOnPlate,
+# PutSpoonOnTablecloth, StackGreenOnYellow, PutEggplantInBasket. Designed as a
+# real-to-sim correlator (MMRV/Pearson vs the real-robot eval), not a
+# stand-alone leaderboard — OpenRAL reports per-task success rate and the user
+# computes MMRV against the matching real-robot run. Paired with the in-tree
+# `rldx1-ft-simpler-widowx-nf4` rSkill.
+#
+# Shape: bare list of BenchmarkScenes; suite id = filename stem
+# ("simpler_env_widowx"). Shared scene/metadata anchored on the first item via
+# &simpler_scene; subsequent items merge and override only their task.
+# Invariants enforced by `openral_core.raise_on_invalid_suite`.
+#
+# Run:
+#   uv sync --group simpler-env
+#   openral benchmark run --suite simpler_env_widowx --rskill rldx1-ft-simpler-widowx-nf4
+
+- &simpler_scene
+  scene:
+    id: simpler_env
+    backend: mujoco       # SAPIEN under the hood; we reuse the mujoco enum slot
+    observation_height: 480
+    observation_width: 640
+    cameras: ["top"]
+  task: &task_proto
+    id: simpler_env/widowx_carrot_on_plate
+    scene_id: simpler_env
+    instruction: "put the carrot on the plate"
+    max_steps: 60
+    success_key: success
+  robot_id: widowx
+  n_episodes: 5
+  seed: 0
+  metadata:
+    paper: "https://arxiv.org/abs/2405.05941"
+    display_name: "SimplerEnv (WidowX / Bridge V2)"
+    simulator: "SimplerEnv (SAPIEN via ManiSkill)"
+    honest_scope: >
+      5 seeds on each of the 4 atomic WidowX tasks (20 rollouts total).
+      Bump n_episodes to N=50 for the paper-equivalent protocol.
+- <<: *simpler_scene
+  task:
+    <<: *task_proto
+    id: simpler_env/widowx_spoon_on_towel
+    instruction: "put the spoon on the towel"
+- <<: *simpler_scene
+  task:
+    <<: *task_proto
+    id: simpler_env/widowx_stack_cube
+    instruction: "stack the green cube on the yellow cube"
+- <<: *simpler_scene
+  task:
+    <<: *task_proto
+    id: simpler_env/widowx_put_eggplant_in_basket
+    instruction: "put the eggplant in the basket"

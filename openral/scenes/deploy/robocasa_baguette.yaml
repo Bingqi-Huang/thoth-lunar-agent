@@ -1,0 +1,90 @@
+# RoboCasa kitchen — deterministic baguette PnP (find→navigate→grab e2e).
+#
+# Same digital twin as robocasa_pnp.yaml (panda_mobile mobile manipulator, full
+# OpenRAL stack with SLAM + Nav2), but pins the PnP target object to a baguette
+# (obj_groups: baguette) so the object on the counter is deterministic across
+# seeds — "Pick the baguette from the counter and place it in the cabinet."
+# Used by the find→navigate→grab integration test so recall_object /
+# locate_in_view can query a known object name.
+#
+# Run: openral deploy sim --config scenes/deploy/robocasa_baguette.yaml
+# Setup: just sync --group robocasa  +  uv pip install -e _external/robocasa --no-deps
+
+scene:
+  id: robocasa/PickPlaceCounterToCabinet
+  backend: mujoco
+  # 512² (was 128²) so the open-vocab detector (LocateAnything-3B) can ground
+  # objects: at 128² the baguette is ~20 px and upscaling to the VLM's 1024
+  # input is too blurry to detect (every query returned found=False). VLA
+  # policies downsample their own input, so the higher source res is harmless
+  # to pi05/rldx. Costs more EGL render time per step.
+  observation_height: 512
+  observation_width: 512
+  backend_options:
+    mode: prebuilt
+    prebuilt_task: PickPlaceCounterToCabinet
+    robots: ["PandaMobile"]
+    controller: OSC_POSE
+    obj_groups: baguette
+
+# Pin the complete kitchen layout / robot start, not only the object group.
+# This is the real episode XR-1 completes in direct sim (197 steps).
+seed: 1
+
+# ADR-0097 place-phase declaration, DIRECT dispatch (no reasoner grounding the
+# target per goal). Scoped by the rSkill runner: armed at goal start, retracted
+# on goal end/cancel/E-stop, expired by every consumer on `timeout_s` regardless.
+# Licenses nothing on its own — makes measured support contact on the declared
+# target attestable as a place-phase witness, and buys the bounded approach
+# allowance the task needs to finish (round 6: 25 mm voxels inflate the
+# cabinet's thin opening, stopping the baguette 22-30 mm short without it).
+#
+# target_id — resolved per-seed by the task itself
+#   (`register_fixture_ref("cab", CABINET)` -> `rng.choice` over the layout's
+#   cabinets), so it's read off the live run, not guessed: at seed 1 the payload
+#   rests against `cab_1_left_group_reg_main`, so fixture root `cab_1_left_group_main`
+#   is declared. Confirmed live (Spark): evidence producer measured the subtree
+#   at half-extents 0.5001/0.439962/0.3001 m, region armed with 0.0375 m
+#   allowance — the one of #142's three declarations that was evidence-backed
+#   (the other two were wrong guesses; see robocasa_sink_cup.yaml /
+#   robocasa_fridge_drawer.yaml).
+# object_id — empty = "whichever payload is carried" (identity only known at
+#   attach time in direct dispatch).
+# timeout_s — 300 s in SIMULATOR clock (`clock_origin: simulation`), raised from
+#   #142's 120 s: that figure came from a 500-step/20 Hz BENCHMARK horizon
+#   (benchmarks/robocasa_pnp.yaml) that doesn't bound a continuous `deploy sim`
+#   goal. Measured arm->grasp took 92 s, leaving only ~28 s of a 120 s window for
+#   the whole place phase. 300 s gives >3x margin and stays under both
+#   `PlaceDeclaration.MAX_TIMEOUT_S` (600 s) and the largest in-tree
+#   `latency_budget.max_execution_s` (420 s). It only bounds the crash path
+#   (goal end/cancel/E-stop retract explicitly); a dead evidence producer is
+#   separately caught by the kernel's `attached_collision_deadline_s` gate.
+# stamp_ns — placeholder; runner re-stamps at goal start from its own clock.
+# No `region`: it's producer-measured in the (moving, mobile-base) robot frame;
+# a scene-supplied region is refused by `DeployScene`.
+#
+# HOW TO READ A PLACE TARGET OFF A LIVE ENV (canonical — other RoboCasa place
+# scenes point here). `target_id` names a MuJoCo body, resolved via
+# `mujoco.mj_name2id(model, mjOBJ_BODY, target_id.removeprefix("sim:"))`; that's
+# the only authority. Do NOT use `env.fixture_refs[...]` — its values are tuples
+# with no `.name`, name `None`, unusable (this is how #142 got 2 of 3 wrong).
+# Recipe (RoboCasa-installable host only):
+#   import mujoco
+#   from openral_hal.sim_bringup import build_sim_env_from_yaml
+#   env, seed = build_sim_env_from_yaml("scenes/deploy/robocasa_baguette.yaml")
+#   env.reset(seed=seed)                 # seed pins the layout
+#   model, _ = env.mujoco_handles()
+#   for i in range(model.nbody):
+#       name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)
+#       if name and "cab" in name:       # fixture token for THIS scene
+#           parent = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(model.body_parentid[i]))
+#           print(i, name, "parent:", parent)
+# Declare the body whose parent is `world`, or — when that subtree covers
+# geometry the payload must NOT touch — the tightest child that still contains
+# the resting surface; the whole subtree is attestable, so a parent chosen for
+# convenience exempts its siblings too (see robocasa_fridge_drawer.yaml).
+place_declaration:
+  target_id: "sim:cab_1_left_group_main"
+  object_id: ""
+  timeout_s: 300.0
+  stamp_ns: 0

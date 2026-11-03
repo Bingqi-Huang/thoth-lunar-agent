@@ -1,0 +1,84 @@
+# LIBERO-Spatial benchmark suite — fixed (robot, scenes, tasks, protocol).
+#
+# Only the VLA (rSkill) varies. Consumed by `openral benchmark run`; writes
+# RSkillEvalResult to rskills/<vla>/eval/libero_spatial.json
+# (reproduced_locally=true).
+#
+# Protocol mirrors the official LIBERO/OpenVLA eval (run_libero_eval): 10
+# tasks, 50 episodes/task, success_key is_success, max_steps 220 for Spatial
+# (object 280 / goal 300 / long 520).
+#
+# Render resolution 256x256 — matches the canonical lerobot LIBERO pipeline
+# smolvla-libero/pi05-libero-int8 were finetuned against. SmolVLA's
+# `resize_with_pad` always upsamples to 512x512 regardless of env render size
+# (lerobot/policies/smolvla/modeling_smolvla.py:421); native 512x512 rendering
+# was tried in PR #83 and reverted — sharp 512x512 frames were OOD for the
+# shipped checkpoint (libero_spatial avg dropped 0.64 -> 0.39 locally).
+#
+# Shape: bare list of BenchmarkScenes; suite id = filename stem
+# ("libero_spatial"). First scene fully spells out per-task fields;
+# subsequent scenes merge via `<<: *libero_scene` and override only the task
+# id (metadata like display_name/simulator propagates via anchor
+# inheritance). Invariants (uniform robot_id/n_episodes/seed/metadata, unique
+# task ids, non-empty) enforced by `openral_core.raise_on_invalid_suite`.
+# Per-task instructions come from LIBERO itself (env.task_description),
+# overriding TaskSpec.instruction at runtime.
+
+- &libero_scene
+  scene: &scene_block
+    id: libero_spatial
+    backend: mujoco
+    observation_height: 256
+    observation_width: 256
+  task: &task_proto
+    id: libero_spatial/0  # placeholder; overridden by index below
+    scene_id: libero_spatial
+    instruction: ""
+    max_steps: 220
+    success_key: is_success
+  robot_id: franka_panda
+  n_episodes: 50
+  seed: 0
+  metadata: &meta_block
+    paper: "https://arxiv.org/abs/2306.03310"
+    display_name: "LIBERO-Spatial"
+    simulator: "LIBERO (MuJoCo)"
+    honest_scope: >
+      Official LIBERO/OpenVLA protocol: 50 episodes per task across all 10
+      LIBERO-Spatial tasks (500 rollouts total), max 220 steps/episode.
+- <<: *libero_scene
+  task:
+    <<: *task_proto
+    id: libero_spatial/1
+- <<: *libero_scene
+  task:
+    <<: *task_proto
+    id: libero_spatial/2
+- <<: *libero_scene
+  task:
+    <<: *task_proto
+    id: libero_spatial/3
+- <<: *libero_scene
+  task:
+    <<: *task_proto
+    id: libero_spatial/4
+- <<: *libero_scene
+  task:
+    <<: *task_proto
+    id: libero_spatial/5
+- <<: *libero_scene
+  task:
+    <<: *task_proto
+    id: libero_spatial/6
+- <<: *libero_scene
+  task:
+    <<: *task_proto
+    id: libero_spatial/7
+- <<: *libero_scene
+  task:
+    <<: *task_proto
+    id: libero_spatial/8
+- <<: *libero_scene
+  task:
+    <<: *task_proto
+    id: libero_spatial/9

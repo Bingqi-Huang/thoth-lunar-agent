@@ -1,0 +1,3342 @@
+"""``openral deploy sim`` — boot the full ROS graph against a digital-twin HAL.
+
+Sibling of ``openral deploy run``: where ``deploy run`` drives a tight Python
+tick loop against a HAL + ``SafetyClient``, ``deploy sim`` shells
+``ros2 launch openral_rskill_ros deploy_e2e.launch.py`` so the operator gets
+dashboard + C++ safety kernel + reasoner + prompt router + runtime
+(world_state + skill_runner) + HAL in one command, against the HAL's
+digital-twin (MuJoCo viewer) mode.
+
+The launch graph is robot-agnostic — one ``deploy_e2e.launch.py`` for every
+robot; the CLI resolves everything robot-specific: the manifest at
+``robots/<robot_id>/robot.yaml``, and the HAL package/executable/node
+name/default params looked up by ``robot_id`` in ``_ROBOT_HAL_REGISTRY``
+(the lookup asserts the HAL's ``supported_robot_names`` matches the
+manifest's ``name``, so a mis-wired HAL fails loud).
+
+No envelope YAML file on either side: the robot manifest is the single
+source of truth for the safety kernel envelope.
+``deploy_e2e.launch.py``'s ``compose_runtime_graph`` callback loads
+``robot.yaml`` via Pydantic at launch time, calls
+``openral_safety.envelope_loader.compute_intersection(robot, skill=None)``
++ ``kernel_params_from_envelope(...)``, and forwards each field of the
+resulting ``EnvelopeIntersection`` as a ROS parameter on the kernel
+node (``cpp/openral_safety_kernel/src/envelope.cpp`` — `n_dof`,
+`joint_position_min/max`, `joint_velocity_max`, `joint_torque_max`, scalar
+caps, deadman flag). The legacy ``envelope_file:=PATH`` path was removed.
+
+The reasoner is NOT preselected: it walks ``rskills/`` and filters by the
+robot's capabilities at on_configure, so ``deploy sim`` intentionally takes
+no ``--rskill`` — switching skills is the reasoner's job, not the operator's
+bring-up command.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import importlib
+import importlib.metadata
+import importlib.util
+import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import sysconfig
+import tempfile
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Final
+
+import typer
+import yaml
+from openral_core.exceptions import ROSCapabilityMismatch, ROSConfigError
+from rich.console import Console
+
+if TYPE_CHECKING:
+    from openral_core import RobotDescription, RSkillManifest
+
+__all__ = [
+    "LaunchInvocation",
+    "assert_ros2_packages_discoverable",
+    "deploy_sim_command",
+    "resolve_launch_invocation",
+]
+
+_console = Console(soft_wrap=True)
+
+
+@dataclass(frozen=True)
+class _HalSpec:
+    """Per-robot HAL spawn descriptor.
+
+    ``package`` / ``executable`` / ``node_name`` parameterise the HAL
+    ``LifecycleNode`` in ``deploy_e2e.launch.py``. ``supported_robot_names``
+    is the set of ``RobotDescription.name`` values this HAL is willing
+    to drive — the CLI asserts the loaded manifest's name is in this
+    set so a mis-paired registry entry (openarm HAL routed at an so100
+    manifest) fails loud at resolution time, not at the HAL's first
+    actuation tick. ``default_params`` is the parameter dict the HAL
+    accepts via its ROS parameter interface; operator-supplied
+    ``--hal`` overrides win.
+    """
+
+    package: str
+    executable: str
+    node_name: str
+    supported_robot_names: frozenset[str]
+    default_params: dict[str, object] = field(default_factory=dict)
+    # HAL nodes that declare a `sim_env_yaml` ROS
+    # parameter (today: openral_hal_panda_mobile) opt in via this
+    # flag. When True, `openral deploy sim --config <yaml>` injects the
+    # resolved config path into hal_params so the HAL builds a live
+    # `openral_sim.SimRollout` env in-process. Other HALs leave it
+    # False so rclpy doesn't reject the unknown parameter at startup
+    # (`automatically_declare_parameters_from_overrides=False` is the
+    # default).
+    supports_sim_env_yaml: bool = False
+    # HAL nodes built via `make_lifecycle_main_from_manifest`
+    # (franka / ur5e / ur10e / aloha / g1 / h1 / rizon4 / so100 / so101) declare
+    # `robot_yaml` + `hal_mode` params and construct their HAL through
+    # `build_hal(mode=...)`. When True, `openral deploy sim` injects the resolved
+    # manifest path + `hal_mode="sim"`; `openral deploy run` injects
+    # `hal_mode="real"`.
+    manifest_driven: bool = False
+    # issue #191 Phase 2/3b — a manifest-driven arm that builds its OWN sim
+    # MJCF rather than scene-attaching: so100/so101 derive a bare
+    # `MujocoArmHAL` twin from the manifest's `sim:` block; openarm composes a
+    # tabletop MJCF from `scene_defaults.composition`. When True, the
+    # manifest-driven injection below skips `sim_env_yaml` so the node builds
+    # the explicit `hal.sim` HAL (with the composed mjcf threaded in) instead
+    # of a scene-attached `SimAttachedHAL`. Other manifest arms leave it
+    # False and scene-attach.
+    bare_twin_sim: bool = False
+
+
+_ROBOT_HAL_REGISTRY: dict[str, _HalSpec] = {
+    # Keys match the directory name under ``robots/<robot_id>/``; the
+    # CLI looks up ``robots/<robot_id>/robot.yaml`` against this key. To
+    # add a new robot to ``openral deploy sim``: ship a ``openral_hal_<X>``
+    # ROS package with a ``lifecycle_node.py`` executable, register it
+    # in the ros2-build Justfile target, and add an entry here. The
+    # Python HAL adapters under ``python/hal/src/openral_hal/`` are a
+    # different layer (used by ``openral deploy run`` / ``openral sim run``);
+    # they do not provide ROS lifecycle nodes by themselves.
+    "openarm": _HalSpec(
+        package="openral_hal_openarm",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_openarm",
+        supported_robot_names=frozenset({"openarm_v2", "openarm"}),
+        # issue #191 Phase 3b — migrated onto the manifest-driven node. Scene
+        # composition (robot_lift_z / robot_forward_x / white_background) moved to
+        # the manifest's `scene_defaults.composition`; HAL kwargs (settle_steps /
+        # gravity_enabled / staleness_limit_s) to `hal.parameters`; cameras via
+        # SimSensorBridge + OpenArmMujocoHAL.read_images. Only the viewer toggle
+        # remains a node ROS param.
+        default_params={
+            "viewer_enabled": True,
+        },
+        manifest_driven=True,
+        # openarm builds its own MJCF via scene COMPOSITION (the manifest's
+        # `scene_defaults.composition`), not scene-attach — so suppress the
+        # `sim_env_yaml` injection (see `bare_twin_sim`).
+        bare_twin_sim=True,
+    ),
+    "so100_follower": _HalSpec(
+        # issue #191 Phase 2 — migrated onto the manifest-driven node
+        # (`make_lifecycle_main_from_manifest`). `hal_mode="sim"` derives a bare
+        # `MujocoArmHAL` twin; `hal_mode="real"` builds `SO100FollowerHAL` with
+        # `port` / `calibrate_on_connect` from the manifest's `hal.parameters`
+        # (so no `port` ROS param — the node would reject the unknown override).
+        package="openral_hal_so100",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_so100",
+        supported_robot_names=frozenset({"so100_follower"}),
+        manifest_driven=True,
+        bare_twin_sim=True,
+    ),
+    "so101_follower": _HalSpec(
+        # The SO-101 is a hardware revision of the SO-100 (same 6-DoF chain,
+        # same lerobot Feetech STS3215 backend), so it reuses the
+        # ``openral_hal_so100`` ROS lifecycle node (manifest-driven) verbatim
+        # — no dedicated ``openral_hal_so101`` package (CLAUDE.md §1.13).
+        # ``deploy sim`` injects this manifest + ``hal_mode="sim"``; the node
+        # builds a bare ``MujocoArmHAL.from_description`` from
+        # ``robots/so101_follower/robot.yaml`` (``assets.mjcf`` →
+        # ``so101_new_calib``; so100 uses ``so_arm100``). The robot-name
+        # guard below binds this entry to so101.
+        package="openral_hal_so100",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_so100",
+        supported_robot_names=frozenset({"so101_follower"}),
+        manifest_driven=True,
+        bare_twin_sim=True,
+    ),
+    "panda_mobile": _HalSpec(
+        # panda_mobile publishes /joint_states + /odom +
+        # /scan and broadcasts the odom -> base_link TF that slam_toolbox + Nav2
+        # both need. issue #191 Phase 3 migrated it onto the manifest-driven node:
+        # MobileBaseBridge owns /odom + TF + /cmd_vel (gated on the manifest's
+        # `base_joints`), SimSensorBridge owns /scan + cameras + depth + viewer.
+        package="openral_hal_panda_mobile",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_panda_mobile",
+        supported_robot_names=frozenset({"panda_mobile"}),
+        default_params={
+            "odom_publish_rate_hz": 20.0,
+            # The /scan envelope (rate / beam count / range) is NOT hardcoded
+            # here: it's derived from the robot.yaml lidar_2d sensor at resolve
+            # time (see _resolve_deploy_target) so robot.yaml stays the single
+            # source of truth. viewer_enabled opens a non-blocking
+            # mujoco.viewer.launch_passive window (no-op headless).
+            "viewer_enabled": True,
+        },
+        # Scene-attach (SimAttachedHAL via sim_env_yaml) when a scene config is
+        # given; bare PandaMobileHAL digital twin otherwise.
+        manifest_driven=True,
+        supports_sim_env_yaml=True,
+    ),
+    # Lidar-less visual-SLAM twin of panda_mobile: same HAL node + sim
+    # composition, a different manifest (has_lidar false, has_vision_slam true).
+    # The HAL is manifest-driven so it reads the panda_mobile_vslam manifest's
+    # sensors/capabilities; robosuite still builds a PandaMobile from the scene's
+    # backend_options. Registered explicitly below (after the dict) to stay DRY.
+    "franka_panda": _HalSpec(
+        package="openral_hal_franka",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_franka",
+        supported_robot_names=frozenset({"franka_panda"}),
+        default_params={},
+        manifest_driven=True,
+    ),
+    "ur5e": _HalSpec(
+        package="openral_hal_ur5e",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_ur5e",
+        supported_robot_names=frozenset({"ur5e"}),
+        default_params={},
+        manifest_driven=True,
+    ),
+    "ur10e": _HalSpec(
+        package="openral_hal_ur10e",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_ur10e",
+        supported_robot_names=frozenset({"ur10e"}),
+        default_params={},
+        manifest_driven=True,
+    ),
+    "aloha_bimanual": _HalSpec(
+        package="openral_hal_aloha",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_aloha",
+        supported_robot_names=frozenset({"aloha_bimanual"}),
+        default_params={},
+        manifest_driven=True,
+    ),
+    "aloha_agilex": _HalSpec(
+        # RoboTwin owns the SAPIEN robot; deploy-sim only needs a ROS lifecycle
+        # host for SimAttachedHAL. This package is intentionally sim-only and
+        # generic, so it never claims a real AgileX hardware transport.
+        package="openral_hal_scene_attached",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_scene_attached",
+        supported_robot_names=frozenset({"aloha_agilex"}),
+        default_params={},
+        manifest_driven=True,
+        supports_sim_env_yaml=True,
+    ),
+    "widowx": _HalSpec(
+        # SimplerEnv owns the SAPIEN WidowX twin; OpenRAL has no real WidowX HAL.
+        # The generic scene-attached node is valid for deploy-sim only because
+        # build_hal(mode="sim", sim_env_yaml=...) bypasses hal.sim entirely.
+        package="openral_hal_scene_attached",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_scene_attached",
+        supported_robot_names=frozenset({"widowx"}),
+        default_params={},
+        manifest_driven=True,
+        supports_sim_env_yaml=True,
+    ),
+    "r1pro": _HalSpec(
+        package="openral_hal_scene_attached",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_scene_attached",
+        supported_robot_names=frozenset({"r1pro"}),
+        default_params={},
+        manifest_driven=True,
+        supports_sim_env_yaml=True,
+    ),
+    "g1": _HalSpec(
+        package="openral_hal_g1",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_g1",
+        supported_robot_names=frozenset({"g1"}),
+        default_params={},
+        manifest_driven=True,
+        # Bare MuJoCo twin from the manifest's `sim:` block (ADR-0087
+        # kinematic-glide base + camera-rigged head cam) — an env-only
+        # DeployScene must not scene-attach. Scene props still compose
+        # via `deploy_scene.composition`, like so100/so101.
+        bare_twin_sim=True,
+    ),
+    "h1": _HalSpec(
+        package="openral_hal_h1",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_h1",
+        supported_robot_names=frozenset({"h1"}),
+        default_params={},
+        manifest_driven=True,
+    ),
+    "rizon4": _HalSpec(
+        package="openral_hal_rizon4",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_rizon4",
+        supported_robot_names=frozenset({"rizon4"}),
+        default_params={},
+        manifest_driven=True,
+    ),
+    "galaxea_a1": _HalSpec(
+        package="openral_hal_galaxea_a1",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_galaxea_a1",
+        supported_robot_names=frozenset({"galaxea_a1"}),
+        default_params={},
+        manifest_driven=True,
+    ),
+    "lunar_bot": _HalSpec(
+        # SRB (Space Robotics Bench) is a ROS-attached external simulator, not
+        # a stepped SimRollout — `robot.yaml` declares the SAME topic-bridge
+        # class (`LunarBotSRBHAL`) as both `hal.sim` and `hal.real`.
+        # `bare_twin_sim=True` so the manifest-driven-node injection below
+        # never sets `sim_env_yaml`: this robot is never scene-attached via
+        # `openral_sim.SCENES`/`SimAttachedHAL` (there is nothing to step —
+        # see `openral_sim.backends.srb`'s module docstring). The scene's
+        # `DeployScene.simulator` (an `ExternalSimulatorSpec`) is what
+        # actually spawns and gates the SRB process itself — a launch-level
+        # concern, not a HAL-registry one. See the research repo's
+        # docs/srb_deploy_backend_plan.md.
+        package="openral_hal_lunar_bot",
+        executable="lifecycle_node.py",
+        node_name="openral_hal_lunar_bot",
+        supported_robot_names=frozenset({"lunar_bot"}),
+        default_params={},
+        manifest_driven=True,
+        bare_twin_sim=True,
+    ),
+}
+
+# The lidar-less visual-SLAM twin reuses panda_mobile's HAL verbatim (same node,
+# same sim composition, manifest-driven) — only the manifest name differs. Derive
+# it so the two never drift; see robots/panda_mobile_vslam/robot.yaml.
+_ROBOT_HAL_REGISTRY["panda_mobile_vslam"] = replace(
+    _ROBOT_HAL_REGISTRY["panda_mobile"],
+    supported_robot_names=frozenset({"panda_mobile_vslam"}),
+)
+
+
+@dataclass(frozen=True)
+class LaunchInvocation:
+    """Resolved ``ros2 launch`` argv + the metadata that built it.
+
+    Returned by ``resolve_launch_invocation`` so the dispatcher can
+    pretty-print under ``--dry-run`` and the unit tests can assert on
+    the resolved fields without touching ``subprocess``.
+    """
+
+    robot_id: str
+    robot_yaml: Path
+    robot_manifest_name: str
+    hal: _HalSpec
+    hal_params: dict[str, object]
+    hal_mode: str
+    """``"sim"`` (``openral deploy sim``) or ``"real"``
+    (``openral deploy run``). Forwarded into the launch as ``hal_mode:=…`` so
+    the reasoner's action-mode palette gate matches the HAL this graph
+    brings up (sim admits cartesian/OSC skills the scene's robosuite OSC
+    controller can execute; real admits only the robot's declared
+    ``supported_control_modes``)."""
+    reset_to_pose_service: str
+    approach_skill_id: str
+    """MoveIt approach rSkill URI (e.g. ``rskills/rskill-moveit-joints``)
+    forwarded into the launch as ``approach_skill_id:=…`` so the skill_runner
+    plans a collision-free MoveGroup motion to the next skill's ``starting_pose``
+    instead of the teleport snap. Empty (the default) keeps the legacy
+    best-effort ``ResetToPose`` snap — opt in with ``--approach-skill-id`` once a
+    ``move_group`` is in the graph."""
+    enable_slam: bool
+    """Opt-in. Set by ``openral deploy sim --enable-slam``;
+    forwarded into the launch as ``enable_slam:=true``."""
+    slam_backend: str
+    """Which SLAM backend the launch composes when
+    ``enable_slam`` is true: ``"lidar"`` (slam_toolbox, needs ``/scan``),
+    ``"visual"`` (cuVSLAM + nvblox, camera-based, for lidar-less robots),
+    or ``"none"`` (no SLAM). Resolved from capabilities — ``has_lidar``
+    selects ``lidar`` (it wins when both flags are set, needing no AI depth
+    model); else ``has_vision_slam`` selects ``visual``. Forwarded as
+    ``slam_backend:=…``."""
+    slam_visual_impl: str
+    """Which cuVSLAM engine the ``visual`` backend composes:
+    ``"isaac_ros"`` (composable ``isaac_ros_visual_slam`` C++ node, needs the
+    Isaac ROS apt stack) or ``"pycuvslam"`` (in-process PyCuVSLAM wheel, stereo
+    only). From ``DeployRuntime.slam_visual_impl``; defaults to ``"isaac_ros"``.
+    Forwarded as ``slam_visual_impl:=…``; only consumed when ``slam_backend`` is
+    ``"visual"``."""
+    slam_stereo_cameras: tuple[str, str] | None
+    """The ``(left, right)`` camera names for the visual SLAM stereo rig, from
+    ``DeployRuntime.slam_stereo_cameras``. Each maps to
+    ``/openral/cameras/<name>/image`` (+ ``/camera_info``). Forwarded as
+    ``slam_stereo_cameras:=<left>,<right>`` only when set, so the launch overrides
+    the visual impl's default ``left``/``right`` topics."""
+    slam_mono_camera: str | None
+    """The single RGB camera for the visual SLAM **mono RGBD** path, from
+    ``DeployRuntime.slam_mono_camera`` (pycuvslam only). Auto-composes the DA3
+    depth provider + nvblox so one camera yields pose + occupancy grid + voxels.
+    Forwarded as ``slam_mono_camera:=<name>`` only when set; mutually exclusive
+    with ``slam_stereo_cameras``."""
+    slam_depth_sidecar_autostart: bool
+    """Whether the launch spawns the DA3 depth sidecar for the mono RGBD path,
+    from ``DeployRuntime.slam_depth_sidecar_autostart`` (default ``True``).
+    Forwarded as ``slam_depth_sidecar_autostart:=false`` only when
+    ``slam_mono_camera`` is set and the scene opts out (operator-run /
+    shared sidecar)."""
+    enable_nav2: bool
+    """Opt-in for the Nav2 navigation stack. Set by
+    ``openral deploy sim --enable-nav2``; forwarded into the launch as
+    ``enable_nav2:=true``. Defaults to ``has_lidar`` — every robot
+    that runs slam_toolbox needs a planner to consume the resulting
+    map, so the two are auto-co-enabled."""
+    enable_octomap: bool
+    """Opt-in for the world-collision perception leg
+    (octomap_server + openral_octomap_bridge + the kernel's
+    capsule-vs-voxel check). Set by ``openral deploy sim --enable-octomap``;
+    forwarded as ``enable_octomap:=true``. Defaults to "auto" = the robot
+    manifest declares a depth SensorSpec (nothing to map otherwise)."""
+    octomap_cloud_topic: str | None
+    """The PointCloud2 ``octomap_server`` maps, from
+    ``DeployRuntime.octomap_cloud_topic``. Forwarded as
+    ``octomap_cloud_topic:=<topic>`` only when the scene pins it; ``None``
+    leaves the launch default (``/openral/cameras/front_depth/points``, the
+    sim sensor bridge's back-projected depth), which no node publishes under
+    ``hal_mode:=real``."""
+    clock_origin: str
+    """ClockAuthority origin forwarded as ``clock_origin:=…``. Derived from
+    the deployment: simulator-owned elapsed time for sim backends that expose
+    ``sim_time_ns``; host wall time for real deployments or clock-less scenes.
+    Operators do not choose ROS ``use_sim_time`` directly."""
+    enable_object_detector: bool
+    """Object-detection perception leg
+    (ros_image_detector_node → /openral/perception/objects → world-state
+    object-lift → /openral/world_voxels). **On by default**; disabled with
+    ``openral deploy sim --no-object-detector``. Forwarded as
+    ``enable_object_detector:=true|false``. Auto-downgrades to ``false`` when no
+    backend is available (omdet deps absent *and* the RT-DETR ONNX missing)."""
+    object_detector_onnx: Path
+    """Absolute path to the RT-DETR ONNX weights used by the legacy /
+    fallback detector path. Forwarded as ``object_detector_onnx:=<path>``.
+    Defaults to the in-tree ``rskills/rtdetr-coco-r18/model.onnx``; passing it
+    explicitly selects the fixed-label RT-DETR path over the omdet default."""
+    object_detector_manifest: str
+    """Path to a kind:detector rSkill manifest. When set,
+    the detector node builds its backend from the manifest (runtime:pytorch →
+    the open-vocab LocateAnything VLM sidecar; runtime:onnx → RT-DETR ONNX).
+    Forwarded as ``object_detector_manifest:=<path>``. Empty = the RT-DETR ONNX
+    fallback. By default (no explicit override) this resolves to the
+    ``omdet-turbo-indoor`` manifest when the omdet deps are importable."""
+    object_detector_query: str
+    """Initial open-vocabulary query for a VLM detector
+    (e.g. 'red mug'). Forwarded as ``object_detector_query:=<text>``. Empty =
+    the manifest's ``detector.labels`` default. Ignored by ONNX detectors."""
+    object_detector_locators: tuple[str, ...]
+    """Resolved manifest paths of the ``mode: on_demand`` open-vocab
+    locators to bring up alongside the continuous detector. The launch builds one
+    namespaced lifecycle node per entry (``/openral/perception/<alias>/locate_in_view``)
+    so the reasoner can choose a model via ``LocateInViewTool.detector``. Forwarded
+    as ``object_detector_locators:=<comma-joined paths>`` only when non-empty.
+    Defaults to the omdet-turbo-locator manifest when the detector is on and the
+    omdet deps are importable (LocateAnything is opt-in via an explicit path)."""
+    spatial_memory_ingest: bool
+    """Opt-in. Set by ``openral deploy sim --spatial-memory-ingest``;
+    forwarded as ``spatial_memory_ingest:=true``. The reasoner then accumulates
+    a durable SpatialMemory from the object-lift producer's
+    ``WorldState.detected_objects`` so ``recall_object`` recalls what the robot
+    has seen. Defaults to "auto" = enabled when the object detector is."""
+    enable_foxglove: bool
+    """Opt-in. Off by default. Set by ``openral deploy sim --foxglove``;
+    forwarded as ``enable_foxglove:=true``. Spawns the read-only
+    ``foxglove_bridge`` as part of the deploy-sim runtime graph so operators
+    can view the live scene (cameras, /tf, joint states, nav map) in
+    Foxglove Studio without an extra bring-up step. Cannot actuate the robot
+    (view-only; ``clientPublish``/``services`` capabilities omitted)."""
+    foxglove_port: int
+    """Foxglove WebSocket port. Forwarded as ``foxglove_port:=…``.
+    Default 8765 (the ``foxglove_bridge`` upstream default)."""
+    initial_task_prompt: str
+    """Operator goal delivered to the reasoner at startup (cli priority).
+
+    Sourced only from ``--initial-task`` (or a later live ``/openral/prompt``);
+    deploy never derives it from scene tasks. Forwarded as
+    ``initial_task_prompt:=<text>`` to the launch file. Empty = the reasoner
+    idles until an operator prompt arrives."""
+    enable_reward_monitor: bool
+    """Whether the Robometer reward monitor is brought up
+    co-active with the VLA. When true the deploy preflight checks the VLA↔reward
+    VRAM pairing (``_preflight_reward_vram_fit``) before bringing up ROS."""
+    reward_monitor_manifest: str
+    """The RESOLVED reward-monitor manifest path. Defaults from the
+    capability-matched VLA palette's ``reward_rskill_name`` (the pairing the
+    reasoner will honour) when ``--reward-monitor-manifest`` is not given; empty
+    when no reward monitor is active. Forwarded as ``reward_monitor_manifest:=…``."""
+    argv_template: list[str]
+    """``argv_template`` carries ``HAL_PARAMS_FILE_PLACEHOLDER`` where
+    the temp HAL-params YAML path goes. The dispatcher substitutes it
+    once the file exists."""
+
+
+def _repo_root_from(start: Path) -> Path:
+    """Locate the repo root holding the ``robots/`` + ``rskills/`` manifest trees.
+
+    Resolution order — first hit wins:
+
+        1. ``$OPENRAL_REPO_ROOT`` when set (explicit override always wins).
+        2. Walking up from ``start`` (normally this module's ``__file__``),
+           which resolves a source checkout or an editable install.
+        3. Walking up from the current working directory, which resolves a
+           **wheel** install (``pip``/``uv tool install openral-cli``) invoked
+           from inside a checkout.
+
+    Step 3 is what makes this work off a published wheel at all. The manifest
+    trees are repo data, not package data, so a site-packages ``__file__`` has
+    no ``robots/`` ancestor and step 2 can never succeed there — without a cwd
+    fallback ``openral deploy sim`` was unusable from any wheel install, with
+    no flag or env var to point it at a checkout.
+
+    Note this is a genuinely different problem from the one ``openral install
+    ros`` solved by packaging its bootstrap scripts as wheel data: ``robots/``
+    and ``rskills/`` are user-editable fixture trees that a deploy is expected
+    to read (and that operators add their own robots to), not fixed assets we
+    could vendor into the distribution.
+
+    Args:
+        start: Path to begin the upward walk from.
+
+    Returns:
+        The absolute repo root containing both ``robots/`` and ``rskills/``.
+
+    Raises:
+        ROSConfigError: When no candidate yields a directory holding both
+            manifest trees.
+
+    Example:
+        >>> from pathlib import Path
+        >>> root = _repo_root_from(Path(__file__))
+        >>> (root / "robots").is_dir() and (root / "rskills").is_dir()
+        True
+    """
+
+    def _walk_up(origin: Path) -> Path | None:
+        here = origin.resolve()
+        for ancestor in (here, *here.parents):
+            if (ancestor / "robots").is_dir() and (ancestor / "rskills").is_dir():
+                return ancestor
+        return None
+
+    env_root = os.environ.get("OPENRAL_REPO_ROOT")
+    if env_root:
+        candidate = Path(env_root).expanduser().resolve()
+        if (candidate / "robots").is_dir() and (candidate / "rskills").is_dir():
+            return candidate
+        raise ROSConfigError(
+            f"OPENRAL_REPO_ROOT={env_root} does not look like an OpenRAL checkout; "
+            f"expected {candidate} to contain both robots/ and rskills/."
+        )
+
+    for origin in (start, Path.cwd()):
+        found = _walk_up(origin)
+        if found is not None:
+            return found
+
+    raise ROSConfigError(
+        f"Could not locate the OpenRAL repo root (searched upward from {start} "
+        f"and from the current directory {Path.cwd()}); expected an ancestor "
+        "containing both robots/ and rskills/.\n"
+        "The robots/ and rskills/ manifest trees ship with the git repo, not "
+        "inside the installed package, so a wheel install needs to be pointed "
+        "at a checkout:\n"
+        "  git clone https://github.com/OpenRAL/openral.git\n"
+        "  cd openral && openral deploy sim --config <scene.yaml>\n"
+        "or set OPENRAL_REPO_ROOT=/path/to/openral."
+    )
+
+
+def _load_scene_robot_id(config: Path) -> str | None:
+    """Return the ``robot_id`` declared in a DeployScene YAML, or None.
+
+    Strict DeployScene loading: ``openral deploy sim --config``
+    accepts a DeployScene YAML only (scene + optional robot, no task).
+    SimScene / BenchmarkScene YAMLs are rejected with a redirect message.
+
+    Two paths to discover the robot:
+
+    1. ``robot_id:`` declared explicitly in the YAML → use it.
+    2. The scene id is registered with a ``fixed_robot=`` in
+       ``openral_sim.SCENES`` (every robocasa kitchen / LIBERO / ALOHA
+       / MetaWorld / PushT scene) → look it up. Lets robocasa-shaped
+       YAMLs (which forbid ``robot_id:`` per the schema's free-axis
+       guard) still resolve into ``openral deploy sim`` without the
+       operator passing ``--robot`` redundantly.
+    """
+    from openral_core import DeployScene, load_scene_strict  # reason: defer schema import
+
+    try:
+        env = load_scene_strict(str(config), DeployScene)
+    except (ROSConfigError, FileNotFoundError) as exc:
+        raise ROSConfigError(f"failed to load --config {config}: {exc}") from exc
+    if env.robot_id is not None:
+        return env.robot_id
+    # Fixed-robot scene fallback. The sim registry is the source of
+    # truth for which scene ids hard-fix a robot.
+    try:
+        from openral_sim import SCENES  # reason: defer optional dep
+    except ImportError:
+        return None
+    if env.scene.id in SCENES:
+        return SCENES.fixed_robot(env.scene.id)
+    return None
+
+
+def _scan_params_from_description(description: RobotDescription) -> dict[str, object]:
+    """Map a robot's ``lidar_2d`` sensor to HAL ``scan_*`` ROS params.
+
+    Single source of truth — ``openral deploy sim`` forwards these
+    to the HAL instead of hardcoding a per-robot scan envelope. Returns
+    an empty dict when the robot declares no LiDAR (non-mobile robots,
+    no scan synthesis), so the call site is a no-op for them.
+    """
+    lidar = description.lidar_sensor
+    if lidar is None:
+        return {}
+    params: dict[str, object] = {}
+    if lidar.rate_hz:
+        params["scan_publish_rate_hz"] = lidar.rate_hz
+    if lidar.n_channels is not None:
+        params["scan_n_beams"] = lidar.n_channels
+    if lidar.range_max_m is not None:
+        params["scan_max_range_m"] = lidar.range_max_m
+    if lidar.range_min_m is not None:
+        params["scan_min_range_m"] = lidar.range_min_m
+    return params
+
+
+def _scene_backend_has_sim_clock(config: Path | None) -> bool:
+    """Return whether a DeployScene backend can be the OpenRAL simulation clock authority."""
+    if config is None:
+        return False
+    from openral_core import DeployScene, PhysicsBackend, load_scene_strict
+
+    scene = load_scene_strict(str(config), DeployScene)
+    return scene.scene.backend in {
+        PhysicsBackend.MUJOCO,
+        PhysicsBackend.MUJOCO_MJX,
+        PhysicsBackend.ISAACSIM,
+        PhysicsBackend.SAPIEN,
+    }
+
+
+def _resolve_clock_origin(*, hal_mode: str, config: Path | None) -> str:
+    """Resolve the OpenRAL clock authority origin for the launch graph.
+
+    Real deployments use host wall time. Sim deployments use simulator elapsed
+    time when the deploy scene backend exposes a sim clock. Scene-attached HALs
+    and bare MuJoCo twins both expose ``sim_time_ns``; clock-less scenes stay in
+    host-wall time so ROS node clocks never pin at zero.
+    """
+    if hal_mode != "sim":
+        return "host_wall"
+    return "simulation" if _scene_backend_has_sim_clock(config) else "host_wall"
+
+
+def _omdet_runtime_available() -> bool:
+    """True when the OmDet-Turbo continuous detector's runtime deps are importable.
+
+    The default object detector is omdet-turbo-indoor (open-vocabulary, grounds
+    arbitrary indoor/kitchen objects rather than the fixed COCO-80 of RT-DETR).
+    Its in-process zero-shot backend
+    (``openral_runner.backends.gstreamer.omdet_turbo_detector.OmDetTurboDetector``)
+    needs ``transformers`` + ``timm`` — the ``omdet`` dependency group. When they
+    are absent (a checkout that only synced the base group),
+    ``resolve_launch_invocation`` gracefully falls back to the in-tree
+    RT-DETR COCO ONNX so ``deploy sim`` still brings up a detector instead of the
+    node hard-failing at backend build.
+
+    Patched in tests to exercise both branches without touching the environment.
+    """
+    # Local import: the probe is cheap and scoped to this one decision.
+    import importlib.util
+
+    return all(importlib.util.find_spec(mod) is not None for mod in ("transformers", "timm"))
+
+
+def _object_detector_onnx_present(path: Path) -> bool:
+    """True when the fallback RT-DETR COCO ONNX weights are on disk.
+
+    The weights (``rskills/rtdetr-coco-r18/model.onnx``, ~2 MB) are gitignored, so
+    they are present on a weights-fetched dev host but absent in a bare CI
+    checkout. ``resolve_launch_invocation`` downgrades the detector leg off
+    when neither omdet deps nor these weights can build a backend. Factored out so
+    tests can exercise the fallback-selection logic without the gitignored binary.
+    """
+    return path.is_file()
+
+
+def _resolve_slam_backend(*, has_lidar: bool, has_vision_slam: bool, enable_slam: bool) -> str:
+    """Pick the SLAM backend the launch composes.
+
+    Returns one of ``"lidar"`` (slam_toolbox; needs ``/scan``), ``"visual"``
+    (cuVSLAM + nvblox; camera-based, for lidar-less robots), or ``"none"``.
+
+    ``has_lidar`` wins when both flags are set: the 2D-lidar leg is the
+    cheaper, proven path and needs no AI depth model. A resolved
+    ``enable_slam`` of ``False`` (an explicit ``--no-enable-slam``) forces
+    ``"none"`` so the forwarded ``slam_backend:=`` arg never contradicts the
+    ``enable_slam:=false`` arg.
+
+    Args:
+        has_lidar: ``RobotCapabilities.has_lidar``.
+        has_vision_slam: ``RobotCapabilities.has_vision_slam``.
+        enable_slam: The resolved SLAM-on decision (manifest auto or flag).
+
+    Returns:
+        The backend identifier forwarded as the ``slam_backend`` launch arg.
+
+    Example:
+        >>> _resolve_slam_backend(has_lidar=False, has_vision_slam=True, enable_slam=True)
+        'visual'
+        >>> _resolve_slam_backend(has_lidar=True, has_vision_slam=True, enable_slam=True)
+        'lidar'
+        >>> _resolve_slam_backend(has_lidar=True, has_vision_slam=False, enable_slam=False)
+        'none'
+    """
+    if not enable_slam:
+        return "none"
+    if has_lidar:
+        return "lidar"
+    if has_vision_slam:
+        return "visual"
+    return "none"
+
+
+def _memory_bundle_launch_args(memory_dir: str) -> list[str]:
+    """Derive the deploy_e2e.launch.py bundle args from a deploy memory-bundle dir.
+
+    The bundle is a directory holding any of ``MEMORY.md`` (semantic memory),
+    ``scene_graph.json`` (3D world-state graph), and ``map.yaml`` (2D occupancy grid).
+    Each artifact is forwarded to its own consumer's launch arg. The dir must exist
+    (the robot writes ``MEMORY.md`` into it); ``scene_graph.json`` / ``map.yaml`` are
+    forwarded only when present, so a fresh bundle (empty dir) just starts the reasoner
+    with empty memory and no preloaded scene/map.
+    """
+    from openral_core.exceptions import ROSConfigError
+
+    d = Path(memory_dir).expanduser()
+    if not d.is_dir():
+        raise ROSConfigError(
+            f"--memory-dir {memory_dir!r} is not an existing directory. Create the bundle "
+            "dir first (the robot writes MEMORY.md into it; place scene_graph.json / map.yaml "
+            "there to preload the scene graph + occupancy grid)."
+        )
+    # memory_md_path may not exist yet — the reasoner creates it on the first memory_write.
+    args = [f"memory_md_path:={d / 'MEMORY.md'}"]
+    scene_graph = d / "scene_graph.json"
+    if scene_graph.is_file():
+        args.append(f"spatial_memory_path:={scene_graph}")
+    map_yaml = d / "map.yaml"
+    if map_yaml.is_file():
+        args.append(f"map_path:={map_yaml}")
+    return args
+
+
+# the in-tree directory of the default reward/progress-monitor rSkill
+# the deploy pairs with a VLA when nothing names one. Mirrors the reasoner's
+# launch default (``rskills/robometer-4b/rskill.yaml``, deploy_e2e.launch.py).
+_DEFAULT_REWARD_RSKILL_DIR = "robometer-4b"
+
+
+def _detect_gpu_vram_gb(field: str) -> float:
+    """VRAM (GB) of GPU 0 for an ``nvidia-smi`` field, or ``0.0`` when unavailable.
+
+    Torch-free probe (the CLI must not import torch just to size the GPU). Any
+    failure (no nvidia-smi, no GPU, parse error) returns ``0.0`` → the caller
+    skips the pair check rather than blocking a launch on a host where the budget
+    cannot be read. ``field`` is a ``--query-gpu`` column, e.g. ``memory.total`` or
+    ``memory.free``.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={field}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    lines = out.stdout.strip().splitlines()
+    if not lines:
+        return 0.0
+    try:
+        return float(lines[0].strip()) / 1024.0  # MiB → GiB
+    except ValueError:
+        return 0.0
+
+
+def _detect_gpu_free_vram_gb() -> float:
+    """Free VRAM (GB) of GPU 0 at launch — the real pre-load budget for the VLA+reward pair.
+
+    The launch preflight runs before any OpenRAL model is loaded, so *free* VRAM
+    (not total) is the honest headroom the VLA + reward pair must fit into. On a
+    shared dev box a desktop compositor or a sibling worktree's process can hold
+    GBs the pair will never see; budgeting against total would greenlight a pair
+    that OOMs the moment both models load (the failure mode `--no-enable-reward-monitor`
+    masks by dropping the reward model).
+    """
+    return _detect_gpu_vram_gb("memory.free")
+
+
+def _capability_matched_manifests(
+    repo_root: Path,
+    description: RobotDescription,
+    *,
+    commercial_deployment: bool = False,
+) -> list[RSkillManifest]:
+    """In-tree rSkill manifests that match this robot's reasoner palette.
+
+    Loads every ``rskills/*/rskill.yaml`` and runs the same
+    capability/role/license filter the reasoner seeds at ``on_configure``
+    (``openral_reasoner.palette.build_tool_palette``), returning the matched
+    manifests. ``openral deploy sim`` does not preselect a VLA — the reasoner picks
+    one at runtime from exactly this set — so reward resolution + the VRAM
+    preflight both reason over it (the "VLA known at launch" is the *palette*, not a
+    single policy). Unloadable manifests are skipped (the reasoner skips them too).
+    """
+    from openral_core import RSkillManifest
+    from openral_reasoner.palette import build_tool_palette
+
+    manifests: list[RSkillManifest] = []
+    for path in sorted((repo_root / "rskills").glob("*/rskill.yaml")):
+        try:
+            manifests.append(RSkillManifest.from_yaml(str(path)))
+        except (OSError, ValueError):
+            continue
+    if not manifests:
+        return []
+    palette = build_tool_palette(
+        installed_skills=manifests,
+        robot_capabilities=description.capabilities,
+        commercial_deployment=commercial_deployment,
+    )
+    matched = set(palette.execute_rskill_ids)
+    return [m for m in manifests if m.name in matched]
+
+
+def _resolve_reward_monitor_manifest(
+    *,
+    repo_root: Path,
+    description: RobotDescription,
+    explicit_manifest: str | None,
+) -> str:
+    """Resolve the reward-monitor manifest, defaulting from the VLA pairing.
+
+    The pairing used to be implicit: the reward model was chosen by a flag
+    (``--reward-monitor-manifest``) wholly decoupled from the VLA the reasoner
+    picks. The pairing is recorded on the VLA manifest
+    (``reward_rskill_name``); this honours it at launch. Because ``deploy sim``
+    does not preselect a single VLA, we read the pairing across the
+    capability-matched VLA palette:
+
+    * An explicit ``--reward-monitor-manifest`` always wins (operator override).
+    * Else, if the palette's VLAs agree on a single ``reward_rskill_name``, resolve
+      that rSkill ``name`` to its in-tree manifest path.
+    * Else (no VLA names a reward model, the named model is not in-tree, or the
+      palette VLAs disagree) fall back to the deployment default
+      (``robometer-4b``). A disagreement is warned — the reasoner additionally
+      warns per-VLA at dispatch when a VLA's ``reward_rskill_name`` differs from
+      the loaded reward model.
+
+    Returns the resolved manifest path as a string (empty only when even the
+    default is missing from the tree).
+    """
+    if explicit_manifest:
+        return explicit_manifest
+
+    from openral_core import RSkillManifest
+
+    default_path = repo_root / "rskills" / _DEFAULT_REWARD_RSKILL_DIR / "rskill.yaml"
+    default = str(default_path.resolve()) if default_path.is_file() else ""
+
+    # name → manifest path for every in-tree kind:reward rSkill.
+    reward_index: dict[str, Path] = {}
+    for path in sorted((repo_root / "rskills").glob("*/rskill.yaml")):
+        try:
+            man = RSkillManifest.from_yaml(str(path))
+        except (OSError, ValueError):
+            continue
+        if man.kind == "reward":
+            reward_index[man.name] = path
+
+    named = {
+        m.reward_rskill_name
+        for m in _capability_matched_manifests(repo_root, description)
+        if m.kind == "vla" and m.reward_rskill_name
+    }
+    if not named:
+        return default
+    if len(named) > 1:
+        _console.print(
+            "[yellow]warning:[/yellow] capability-matched VLAs name different reward "
+            f"models {sorted(named)!r}; defaulting the reward monitor to "
+            f"{_DEFAULT_REWARD_RSKILL_DIR!r}. The reasoner re-checks each VLA's pairing "
+            "at dispatch."
+        )
+        return default
+    (target_name,) = tuple(named)
+    target_path = reward_index.get(target_name)
+    if target_path is None:
+        _console.print(
+            f"[yellow]warning:[/yellow] VLA(s) pair with reward model {target_name!r} "
+            " but no in-tree kind:reward rSkill declares that name; "
+            f"defaulting the reward monitor to {_DEFAULT_REWARD_RSKILL_DIR!r}."
+        )
+        return default
+    return str(target_path.resolve())
+
+
+def _preflight_reward_vram_fit(  # noqa: PLR0912  # reason: linear per-VLA classification (fit / oom / undeclared) + the three notify branches read clearest inline
+    *,
+    repo_root: Path,
+    description: RobotDescription,
+    reward_manifest_path: str,
+    gpu_budget_gb: float,
+    commercial_deployment: bool = False,
+) -> None:
+    """Fail fast before launch when no VLA can co-reside with the reward model.
+
+    A VLA emits no success signal of its own, so it must run with its reward model
+    resident alongside it. The reasoner enforces this per-VLA at
+    dispatch (``_refuse_unfittable_vla``) — but only *after* ROS is up. This is the
+    pre-LAUNCH gate: build the same capability-matched VLA palette the reasoner
+    will, and run ``openral_core.schemas.assert_vla_reward_fits`` for each VLA
+    against the reward model + the GPU budget.
+
+    The contract mirrors ``_preflight_palette_deps``: it is advisory per-VLA
+    (the reasoner drops a non-fitting VLA from dispatch anyway) and a HARD gate only
+    when the palette would be empty of *runnable* policies — i.e. **no** matched VLA
+    can dispatch with the reward model resident. In that case the deploy could
+    actuate nothing, so we notify and ``typer.Exit(1)`` before bringing up ROS
+    instead of booting a graph that dispatches a VLA blind or OOMs mid-run.
+
+    ``gpu_budget_gb`` is *free* VRAM at launch (nothing of ours is loaded yet), not
+    total — so a desktop compositor or a sibling worktree's process holding GBs is
+    counted against the pair, which is the whole point (it's the difference between
+    a preflight that greenlights an OOM and one that catches it).
+
+    Skipped (returns) when ``gpu_budget_gb <= 0.0`` (budget unreadable — defer to the
+    reasoner's runtime check), when no reward model is active, or when the robot has
+    no capability-matched VLA palette to check.
+    """
+    if gpu_budget_gb <= 0.0 or not reward_manifest_path:
+        return
+    from openral_core import RSkillManifest
+    from openral_core.exceptions import ROSGPUMemoryError
+    from openral_core.schemas import assert_vla_reward_fits
+
+    try:
+        reward = RSkillManifest.from_yaml(reward_manifest_path)
+    except (OSError, ValueError) as exc:
+        _console.print(
+            f"[red]config error:[/red] reward monitor manifest {reward_manifest_path!r} "
+            f"failed to load (VLA+reward VRAM preflight): {exc}"
+        )
+        raise typer.Exit(code=1) from exc
+
+    vlas = [
+        m
+        for m in _capability_matched_manifests(
+            repo_root, description, commercial_deployment=commercial_deployment
+        )
+        if m.kind == "vla"
+    ]
+    if not vlas:
+        return
+
+    fits: list[str] = []
+    oom: list[str] = []
+    undeclared: list[str] = []
+    for vla in vlas:
+        try:
+            combined = assert_vla_reward_fits(vla, reward, gpu_budget_gb)
+        except ROSGPUMemoryError as exc:
+            oom.append(f"{vla.name}: {exc}")
+        except ROSConfigError:
+            # min_vram_gb undeclared for the active dtype — the pair cannot be
+            # verified, so the reasoner will refuse this VLA at dispatch too.
+            undeclared.append(vla.name)
+        else:
+            fits.append(f"{vla.name} ({combined:.2f} GB)")
+
+    if not fits:
+        _console.print()
+        _console.print(
+            "[red]preflight failed:[/red] no capability-matched VLA can co-reside with "
+            f"the reward model {reward.name!r} on this GPU "
+            f"({gpu_budget_gb:.2f} GB free at launch) — every paired policy would be "
+            "refused at dispatch, so the deploy could actuate nothing."
+        )
+        for line in oom:
+            _console.print(f"  • too large: {line}")
+        if undeclared:
+            _console.print(
+                "  • undeclared min_vram_gb (cannot verify the required co-residency): "
+                f"{undeclared!r}"
+            )
+        _console.print(
+            "  Remedies: use a smaller-footprint VLA/reward pair or a larger GPU; "
+            "declare min_vram_gb on the VLA manifest(s); or run with "
+            "--no-enable-reward-monitor (accepting the VLA runs without a live reward "
+            "signal)."
+        )
+        raise typer.Exit(code=1)
+
+    if oom:
+        _console.print(
+            f"[yellow]preflight:[/yellow] {len(oom)} VLA(s) cannot fit beside the reward "
+            f"model {reward.name!r} in {gpu_budget_gb:.2f} GB free and will be refused at "
+            "dispatch:"
+        )
+        for line in oom:
+            _console.print(f"  • {line}")
+    if undeclared:
+        _console.print(
+            f"[yellow]preflight:[/yellow] {len(undeclared)} VLA(s) do not declare "
+            "min_vram_gb for their active dtype, so the reward pairing cannot be "
+            f"verified and the reasoner will refuse them while a reward model is active "
+            f": {undeclared!r}"
+        )
+    _console.print(
+        f"[green]preflight:[/green] {len(fits)} VLA(s) fit beside reward "
+        f"{reward.name!r} in {gpu_budget_gb:.2f} GB free: {fits!r}"
+    )
+
+
+def resolve_launch_invocation(  # noqa: PLR0912, PLR0915  # reason: a flat resolve sequence (robot_id → manifest → per-feature slam/nav2/octomap + sim/real hal_mode gating); splitting hurts readability
+    *,
+    config: Path | None = None,
+    robot_override: str | None,
+    dashboard_port: int,
+    reset_to_pose_service: str | None,
+    approach_skill_id: str | None = None,
+    dataset_out: str | None = None,
+    dataset_repo_id: str | None = None,
+    dataset_license: str | None = None,
+    deploy_config: Path | None = None,
+    hal_param_overrides: dict[str, object] | None = None,
+    hal_mode: str = "sim",
+    enable_reasoner: bool | None = None,
+    enable_slam: bool | None = None,
+    enable_nav2: bool | None = None,
+    enable_octomap: bool | None = None,
+    enable_octomap_kernel_check: bool | None = None,
+    enable_object_detector: bool | None = None,
+    object_detector_onnx: Path | None = None,
+    object_detector_manifest: str | None = None,
+    object_detector_query: str | None = None,
+    enable_reward_monitor: bool | None = None,
+    reward_monitor_manifest: str | None = None,
+    reward_monitor_task: str | None = None,
+    enable_critic: bool | None = None,
+    enable_scene_vlm: bool | None = None,
+    scene_vlm_manifest: str | None = None,
+    object_detector_locators: list[str] | None = None,
+    spatial_memory_ingest: bool | None = None,
+    memory_dir: str | None = None,
+    enable_dashboard: bool = True,
+    enable_foxglove: bool = False,
+    foxglove_port: int = 8765,
+    initial_task_prompt: str | None = None,
+) -> LaunchInvocation:
+    """Resolve every input into the ``ros2 launch`` argv to execute.
+
+    Shared by ``openral deploy sim`` (``hal_mode="sim"``) and ``openral deploy
+    run`` (``hal_mode="real"``) from the same ``DeployScene`` config. In real
+    mode the sim-twin / scene-attach injections are skipped so the HAL node
+    builds the real hardware HAL via ``build_hal(mode="real")``.
+
+    Returned ``argv_template`` carries a ``HAL_PARAMS_FILE_PLACEHOLDER``
+    sentinel the caller substitutes after writing the ephemeral HAL params
+    YAML. No envelope file is ever written — the launch reads ``robot_yaml``
+    and feeds the kernel via ROS params.
+    """
+    from openral_core import DeployScene, RobotDescription  # reason: defer schema import
+
+    if hal_mode not in ("sim", "real"):
+        raise ROSConfigError(f"hal_mode must be 'sim' or 'real', got {hal_mode!r}.")
+
+    deploy_scene = DeployScene.from_yaml(str(config)) if config is not None else None
+    scene_robot_id = (
+        deploy_scene.robot_id
+        if deploy_scene is not None and deploy_scene.robot_id is not None
+        else _load_scene_robot_id(config)
+        if config is not None
+        else None
+    )
+    robot_id = robot_override or scene_robot_id
+    if not robot_id:
+        raise ROSConfigError(
+            "robot_id is undefined: pass ``--robot <id>`` or (for ``deploy sim``) "
+            "set ``robot_id:`` in the DeployScene YAML / use a fixed-robot scene."
+        )
+
+    # The deploy startup prompt comes ONLY from the operator (--initial-task /
+    # a live /openral/prompt). Deploy never reads sim-predefined scene tasks —
+    # that is `sim run`'s job (deploy ≠ benchmark).
+    _resolved_initial_prompt: str = initial_task_prompt or ""
+
+    # Visual-SLAM impl + stereo rig are scene-committed only (no CLI flag):
+    # which cuVSLAM binary the host has and which cameras form the rig are
+    # workcell properties. Seeded None so the scene runtime can pin them below.
+    slam_visual_impl: str | None = None
+    slam_stereo_cameras: tuple[str, str] | None = None
+    slam_mono_camera: str | None = None
+    slam_depth_sidecar_autostart: bool = True
+    # Scene-only for the same reason: which topic carries the depth cloud is a
+    # property of the workcell's driver, not of this invocation.
+    octomap_cloud_topic: str | None = None
+    # Scene-only: how the base is localized is a property of the site (is there a surveyed map?).
+    localization = "none"
+
+    # DeployScene.runtime — the committed deploy posture. Field-by-field
+    # precedence: explicit CLI flag > scene runtime > auto/built-in default
+    # (the per-feature autos below). None on both = auto, as before.
+    rt = deploy_scene.runtime if deploy_scene is not None else None
+    if rt is not None:
+        scene_dir = config.parent if config is not None else None
+
+        def _scene_path(value: str | None) -> str | None:
+            # A relative path that exists next to the scene YAML resolves
+            # against it (CWD-independent committed workcells); anything else
+            # (alias, repo-relative default, hf:// URI) passes through verbatim.
+            if value and scene_dir is not None and not Path(value).is_absolute():
+                cand = (scene_dir / value).resolve()
+                if cand.exists():
+                    return str(cand)
+            return value
+
+        if enable_reasoner is None:
+            enable_reasoner = rt.enable_reasoner
+        enable_slam = enable_slam if enable_slam is not None else rt.enable_slam
+        enable_nav2 = enable_nav2 if enable_nav2 is not None else rt.enable_nav2
+        localization = rt.localization or "none"
+        enable_octomap = enable_octomap if enable_octomap is not None else rt.enable_octomap
+        if enable_octomap_kernel_check is None:
+            enable_octomap_kernel_check = rt.enable_octomap_kernel_check
+        if enable_object_detector is None:
+            enable_object_detector = rt.enable_object_detector
+        if object_detector_onnx is None and rt.object_detector_onnx:
+            object_detector_onnx = Path(_scene_path(rt.object_detector_onnx) or "")
+        object_detector_manifest = object_detector_manifest or _scene_path(
+            rt.object_detector_manifest
+        )
+        object_detector_query = object_detector_query or rt.object_detector_query
+        if object_detector_locators is None:
+            object_detector_locators = rt.object_detector_locators
+        if enable_reward_monitor is None:
+            enable_reward_monitor = rt.enable_reward_monitor
+        reward_monitor_manifest = reward_monitor_manifest or _scene_path(rt.reward_monitor_manifest)
+        reward_monitor_task = reward_monitor_task or rt.reward_monitor_task
+        if enable_critic is None:
+            enable_critic = rt.enable_critic
+        if enable_scene_vlm is None:
+            enable_scene_vlm = rt.enable_scene_vlm
+        scene_vlm_manifest = scene_vlm_manifest or _scene_path(rt.scene_vlm_manifest)
+        if spatial_memory_ingest is None:
+            spatial_memory_ingest = rt.spatial_memory_ingest
+        approach_skill_id = approach_skill_id or rt.approach_skill_id
+        if slam_visual_impl is None:
+            slam_visual_impl = rt.slam_visual_impl
+        if slam_stereo_cameras is None:
+            slam_stereo_cameras = rt.slam_stereo_cameras
+        if slam_mono_camera is None:
+            slam_mono_camera = rt.slam_mono_camera
+        slam_depth_sidecar_autostart = rt.slam_depth_sidecar_autostart
+        if octomap_cloud_topic is None:
+            octomap_cloud_topic = rt.octomap_cloud_topic
+    # Built-in defaults for the tri-state flags nothing pinned.
+    if enable_reasoner is None:
+        enable_reasoner = True
+    if enable_octomap_kernel_check is None:
+        enable_octomap_kernel_check = True
+    if enable_reward_monitor is None:
+        enable_reward_monitor = False
+    if enable_critic is None:
+        enable_critic = False
+    if enable_scene_vlm is None:
+        enable_scene_vlm = False
+    if not enable_reasoner and _resolved_initial_prompt:
+        raise ROSConfigError(
+            "an initial task requires runtime.enable_reasoner=true; "
+            "submit a specific rSkill through /openral/execute_rskill when "
+            "running a direct-rSkill deployment"
+        )
+    # Established default: the Isaac ROS composable node. Do NOT auto-pick
+    # pycuvslam just because its wheel is importable (§1.4 — explicit).
+    if slam_visual_impl is None:
+        slam_visual_impl = "isaac_ros"
+
+    # a --robot override that differs from the scene's declared robot
+    # composes a different arm than the scene was authored for. The scene's cameras
+    # + asset mounts (e.g. tabletop_push's wrist_camera_mount_body="gripper") are
+    # tuned for the declared robot, so on the override they may be mis-mounted or
+    # unmatched — some /openral/cameras/* topics will be empty. Warn loudly.
+    if robot_override and scene_robot_id and robot_override != scene_robot_id:
+        _console.print(
+            f"[yellow]warning:[/yellow] --robot {robot_override!r} overrides the scene's "
+            f"declared robot_id {scene_robot_id!r}; the scene's cameras + asset mounts are "
+            f"authored for {scene_robot_id!r} and may not match {robot_override!r} (expect "
+            "empty /openral/cameras/* for non-matching sensors). Override only with a "
+            "kinematically-compatible arm on a free-axis scene."
+        )
+
+    hal = _ROBOT_HAL_REGISTRY.get(robot_id)
+    if hal is None:
+        supported = ", ".join(sorted(_ROBOT_HAL_REGISTRY))
+        raise ROSConfigError(
+            f"robot {robot_id!r} has no HAL entry in _ROBOT_HAL_REGISTRY. "
+            f"Supported: {supported}. The registry key matches the "
+            "``robots/<robot_id>/`` directory name — e.g. ``--robot "
+            "franka_panda`` (not ``--robot franka``). To add a new robot, "
+            "ship a ROS ``openral_hal_<X>`` package with a "
+            "``lifecycle_node.py`` executable, add it to the ros2-build "
+            "Justfile target, and register it here."
+        )
+
+    repo_root = _repo_root_from(Path(__file__))
+    robot_yaml = repo_root / "robots" / robot_id / "robot.yaml"
+    if not robot_yaml.is_file():
+        raise ROSConfigError(
+            f"robot manifest not found at {robot_yaml}; expected robots/{robot_id}/robot.yaml."
+        )
+
+    # Validate the manifest carries the e2e fields (joint position /
+    # velocity / effort limits) and assert the manifest's declared name
+    # is one the registered HAL accepts — protects against a typo
+    # routing the wrong HAL at a robot.
+    description = RobotDescription.from_yaml(str(robot_yaml))
+    description.validate_for_e2e_pipeline()
+
+    # fail fast before shelling the launch if real mode is asked of
+    # a simulation-only robot (better UX than a graph that dies at HAL
+    # configure with the same ROSCapabilityMismatch).
+    if hal_mode == "real" and description.hal.real is None:
+        raise ROSCapabilityMismatch(
+            f"robot {robot_id!r} has no real-hardware HAL (hal.real is null); it is "
+            "simulation-only. Use `openral deploy sim` instead of `openral deploy run`."
+        )
+
+    # SLAM is ON BY DEFAULT for any robot that can localise/map: a lidar
+    # (slam_toolbox) or camera-based visual SLAM (cuVSLAM+nvblox, for
+    # lidar-less robots). A SLAM-capable robot always brings up the `map`
+    # frame the object lift / spatial-memory ingest depend on, unless the
+    # operator opts out with `--no-enable-slam`. Fixed-base arms with
+    # neither stay off — no base to localise, nothing to map.
+    # `enable_slam is None` means "auto": honour the manifest; an explicit
+    # flag wins.
+    if enable_slam is None:
+        enable_slam = bool(
+            description.capabilities.has_lidar or description.capabilities.has_vision_slam
+        )
+    # backend selection (pure helper, unit-tested directly).
+    slam_backend = _resolve_slam_backend(
+        has_lidar=bool(description.capabilities.has_lidar),
+        has_vision_slam=bool(description.capabilities.has_vision_slam),
+        enable_slam=enable_slam,
+    )
+    # Nav2 auto-enables alongside slam_toolbox: every
+    # lidar-equipped mobile robot needs a planner to consume the map.
+    # Operators that want the map alone (recording / inspection) pass
+    # ``--no-enable-nav2``.
+    if enable_nav2 is None:
+        enable_nav2 = enable_slam
+    # the octomap world-collision leg auto-enables when the
+    # robot manifest declares a usable depth SensorSpec (a camera the HAL
+    # can ray-cast a PointCloud2 from); there is nothing to map otherwise.
+    # ``--enable-octomap`` / ``--no-enable-octomap`` overrides.
+    if enable_octomap is None:
+        enable_octomap = any(
+            s.modality in ("depth", "point_cloud") and s.intrinsics is not None
+            for s in description.sensors
+        )
+    clock_origin = _resolve_clock_origin(hal_mode=hal_mode, config=config)
+
+    # The object-detection leg is ON by default (deploy sim is a
+    # perception-driven stack; ``--no-object-detector`` turns it off). The default
+    # backend is the open-vocabulary ``omdet-turbo-indoor`` continuous detector,
+    # which grounds arbitrary indoor/kitchen objects instead of the fixed COCO-80
+    # of RT-DETR; when its runtime deps (transformers/timm — the ``omdet`` group)
+    # are not importable we gracefully fall back to the in-tree RT-DETR COCO ONNX
+    # so the graph still comes up. Explicit ``--object-detector-manifest`` /
+    # ``--object-detector-onnx`` override the default selection.
+    default_rtdetr_onnx = repo_root / "rskills" / "rtdetr-coco-r18" / "model.onnx"
+    default_omdet_manifest = repo_root / "rskills" / "omdet-turbo-indoor" / "rskill.yaml"
+    if object_detector_manifest:
+        resolved_object_detector_manifest = str(Path(object_detector_manifest).resolve())
+        resolved_object_detector_onnx = (
+            object_detector_onnx.resolve()
+            if object_detector_onnx is not None
+            else default_rtdetr_onnx
+        )
+    elif object_detector_onnx is not None:
+        # Explicit ONNX → the legacy fixed-label RT-DETR path (no manifest).
+        resolved_object_detector_manifest = ""
+        resolved_object_detector_onnx = object_detector_onnx.resolve()
+    elif _omdet_runtime_available():
+        resolved_object_detector_manifest = str(default_omdet_manifest.resolve())
+        resolved_object_detector_onnx = default_rtdetr_onnx
+    else:
+        # Graceful fallback: omdet deps absent → in-tree RT-DETR COCO-80 ONNX.
+        resolved_object_detector_manifest = ""
+        resolved_object_detector_onnx = default_rtdetr_onnx
+
+    if enable_object_detector is None:
+        enable_object_detector = True
+    # Downgrade to off (rather than let the node hard-fail at backend build) when
+    # the detector is requested but no usable backend is present — a checkout that
+    # has neither the omdet deps nor the gitignored RT-DETR ONNX weights.
+    if (
+        enable_object_detector
+        and not resolved_object_detector_manifest
+        and not _object_detector_onnx_present(resolved_object_detector_onnx)
+    ):
+        _console.print(
+            "[yellow]object detector requested but no backend is available[/yellow] "
+            "(omdet deps not importable and RT-DETR ONNX missing at "
+            f"{resolved_object_detector_onnx}); disabling the detector leg. Run "
+            "`just sync --group omdet --inexact` for the open-vocab default, fetch "
+            "the RT-DETR weights, or pass --no-object-detector to silence."
+        )
+        enable_object_detector = False
+
+    # When the leg is off (explicit --no-object-detector or the downgrade above),
+    # do not forward a continuous-detector manifest: ros2 launch would otherwise
+    # carry a manifest for a node that never starts (and, with omdet deps present,
+    # a non-empty manifest:= for a disabled leg is simply wrong).
+    if not enable_object_detector:
+        resolved_object_detector_manifest = ""
+
+    # on-demand open-vocab locators co-resident alongside the
+    # continuous detector. Each token is a manifest path (``…/rskill.yaml``) or a
+    # short alias resolved to ``rskills/<alias>/rskill.yaml``; the launch builds one
+    # namespaced locate_in_view node per entry so the reasoner can pick a model.
+    # Default = omdet-turbo-locator when the detector is on and the omdet deps are
+    # importable (LocateAnything is opt-in — NVIDIA non-commercial, 5 GB VRAM).
+    resolved_object_detector_locators: list[str] = []
+    # An explicit ``--object-detector-locator`` is an independent grounding source —
+    # honour it even with ``--no-object-detector`` (a lean deploy that grounds via
+    # the on-demand locator alone, no always-on detector holding VRAM). The implicit
+    # omdet-turbo-locator default only applies when the continuous detector is on.
+    if object_detector_locators is not None:
+        locator_tokens = object_detector_locators
+    elif enable_object_detector and _omdet_runtime_available():
+        locator_tokens = ["omdet-turbo-locator"]
+    else:
+        locator_tokens = []
+    for token in locator_tokens:
+        candidate = Path(token)
+        manifest_path = (
+            candidate
+            if candidate.suffix == ".yaml"
+            else repo_root / "rskills" / token / "rskill.yaml"
+        )
+        resolved_object_detector_locators.append(str(manifest_path.resolve()))
+
+    # auto-enable durable spatial-memory ingest whenever the object
+    # detector runs (the producer that feeds it); an explicit flag overrides.
+    if spatial_memory_ingest is None:
+        spatial_memory_ingest = enable_object_detector
+
+    if description.name not in hal.supported_robot_names:
+        raise ROSConfigError(
+            f"HAL/robot mismatch: robot_id={robot_id!r} (registry → "
+            f"{hal.package!r}) declares supported_robot_names="
+            f"{sorted(hal.supported_robot_names)}, but "
+            f"{robot_yaml} has name={description.name!r}. Either fix the "
+            "manifest's `name:` field or register the right HAL for this "
+            "robot in openral_cli.deploy_sim._ROBOT_HAL_REGISTRY."
+        )
+
+    hal_params: dict[str, object] = {**hal.default_params}
+    # a DeployScene ``hal:`` binding carries the workcell's
+    # host-specific HAL defaults (serial ``port`` + lerobot ``id`` /
+    # ``calibration_dir`` + ``calibrate_on_connect``), the HAL analogue of a
+    # sensor ``deploy_binding``, so ``deploy run --config <scene>`` is
+    # self-contained (no ``--hal`` needed). Merged above the robot-manifest
+    # defaults (which the HAL node reads from ``robot.yaml``) but below any
+    # explicit ``--hal`` override. A relative ``calibration_dir`` resolves
+    # against the scene file's dir — mirrors the ``--hal calibration_dir=``
+    # handling in ``main.deploy_run`` so a committed calibration works from any CWD.
+    if deploy_scene is not None and deploy_scene.hal is not None and config is not None:
+        scene_hal = dict(deploy_scene.hal.defaults)
+        _scene_cal_dir = scene_hal.get("calibration_dir")
+        if (
+            isinstance(_scene_cal_dir, str)
+            and _scene_cal_dir
+            and not Path(_scene_cal_dir).is_absolute()
+        ):
+            scene_hal["calibration_dir"] = str((config.parent / _scene_cal_dir).resolve())
+        hal_params.update(scene_hal)
+    if hal_param_overrides:
+        hal_params.update(hal_param_overrides)
+
+    # derive the /scan envelope from robot.yaml's lidar_2d
+    # sensor (single source of truth) instead of hardcoding it in the
+    # HAL registry. ``setdefault`` so an explicit ``--hal scan_*=…``
+    # operator override still wins.
+    for _scan_key, _scan_value in _scan_params_from_description(description).items():
+        hal_params.setdefault(_scan_key, _scan_value)
+
+    # forward the sim config to HALs that declare
+    # `sim_env_yaml` support. Gated on the per-HAL opt-in flag because
+    # rclpy rejects unknown parameters at startup
+    # (`automatically_declare_parameters_from_overrides=False` is the
+    # default), so blanket-forwarding would break every other HAL.
+    if hal.supports_sim_env_yaml and hal_mode == "sim" and config is not None:
+        hal_params.setdefault("sim_env_yaml", str(config.resolve()))
+
+    # manifest-driven nodes build their HAL via build_hal(mode).
+    # `deploy sim` → hal_mode="sim"; `deploy run` → hal_mode="real". The node
+    # raises ROSCapabilityMismatch for a sim-only-vs-real mismatch.
+    if hal.manifest_driven:
+        hal_params.setdefault("robot_yaml", str(robot_yaml))
+        hal_params.setdefault("hal_mode", hal_mode)
+        # deploy sim is inherently a scene; forward the resolved
+        # config so the manifest-driven node scene-attaches (SimAttachedHAL)
+        # instead of building a bare twin. Sim mode only; real never attaches.
+        # `bare_twin_sim` arms (so100 / so101) opt out: they build a bare
+        # `MujocoArmHAL` twin from their `sim:` block (issue #191 Phase 2),
+        # preserving the pre-migration `supports_sim_robot_yaml` behaviour.
+        if hal_mode == "sim" and config is not None and not hal.bare_twin_sim:
+            hal_params.setdefault("sim_env_yaml", str(config.resolve()))
+        # forward the DeployScene's own MJCF composition (its arena)
+        # to the manifest-driven node so the SCENE owns its environment instead
+        # of the robot manifest. Sim-mode bare-twin robots only (scene-attach
+        # robots build the scene's SimRollout directly via sim_env_yaml).
+        if hal_mode == "sim" and deploy_scene is not None and hal.bare_twin_sim:
+            scene_composition = deploy_scene.composition
+            if scene_composition is not None:
+                hal_params.setdefault("scene_composition_json", scene_composition.model_dump_json())
+
+    service = reset_to_pose_service or f"/openral/{robot_id}/reset_to_pose"
+    # Empty by default — the legacy ResetToPose snap stays until a move_group is
+    # wired into the graph; opt in with --approach-skill-id.
+    approach_skill = approach_skill_id or ""
+
+    argv_template: list[str] = [
+        *_ros2_argv_head(),
+        "launch",
+        "openral_rskill_ros",
+        "deploy_e2e.launch.py",
+        f"robot_yaml:={robot_yaml}",
+        f"hal_package:={hal.package}",
+        f"hal_executable:={hal.executable}",
+        f"hal_node_name:={hal.node_name}",
+        "hal_params_file:=HAL_PARAMS_FILE_PLACEHOLDER",
+        f"reset_to_pose_service:={service}",
+        f"dashboard_port:={dashboard_port}",
+        # forward the deploy path so the reasoner's action-mode
+        # palette gate matches the HAL this graph brings up. ``deploy sim``
+        # → ``hal_mode="sim"`` (default; the scene's robosuite OSC controller
+        # synthesises cartesian/OSC modes); ``deploy run`` → ``"real"``.
+        f"hal_mode:={hal_mode}",
+        f"enable_reasoner:={'true' if enable_reasoner else 'false'}",
+        f"enable_slam:={'true' if enable_slam else 'false'}",
+        f"slam_backend:={slam_backend}",
+        f"slam_visual_impl:={slam_visual_impl}",
+        f"enable_nav2:={'true' if enable_nav2 else 'false'}",
+        f"localization:={localization}",
+        f"enable_octomap:={'true' if enable_octomap else 'false'}",
+        f"enable_octomap_kernel_check:={'true' if enable_octomap_kernel_check else 'false'}",
+        # OpenRAL clock authority. The launch maps this to ROS
+        # use_sim_time internally: simulation → use_sim_time=true + HAL /clock;
+        # host_wall → system time and no OpenRAL /clock publisher.
+        f"clock_origin:={clock_origin}",
+        f"enable_object_detector:={'true' if enable_object_detector else 'false'}",
+        f"object_detector_onnx:={resolved_object_detector_onnx}",
+        # reward monitor co-active with the VLA; the reasoner polls
+        # /openral/perception/query_task_progress when task_progress_available.
+        f"enable_reward_monitor:={'true' if enable_reward_monitor else 'false'}",
+        # Tier-C critic producer; emits FailureTrigger on
+        # /openral/failure/critic when a reward model's score stalls.
+        f"enable_critic:={'true' if enable_critic else 'false'}",
+        # scene VLM co-active with the VLA; the reasoner asks
+        # /openral/perception/query_scene when scene_query_available.
+        f"enable_scene_vlm:={'true' if enable_scene_vlm else 'false'}",
+        f"spatial_memory_ingest:={'true' if spatial_memory_ingest else 'false'}",
+        f"enable_dashboard:={'true' if enable_dashboard else 'false'}",
+        # read-only Foxglove live-scene bridge. Off by default;
+        # ``--foxglove`` opts in. The bridge starts after the topic producers
+        # (HAL, SLAM, octomap, robot_state_publisher) via a TimerAction in the
+        # launch to avoid the foxglove-sdk-cpp v0.18.0 stale-bridge bug.
+        f"enable_foxglove:={'true' if enable_foxglove else 'false'}",
+        f"foxglove_port:={foxglove_port}",
+    ]
+    # ``ros2 launch`` rejects an empty ``name:=`` argument, so only forward the
+    # optional detector overrides when set; the launch file defaults both to "".
+    if resolved_object_detector_manifest:
+        argv_template.append(f"object_detector_manifest:={resolved_object_detector_manifest}")
+    if object_detector_query:
+        argv_template.append(f"object_detector_query:={object_detector_query}")
+    # resolve the reward-monitor manifest from the VLA pairing when
+    # the operator did not pin one. ``deploy sim`` does not preselect a VLA, so the
+    # default is derived from the capability-matched VLA palette's
+    # ``reward_rskill_name`` (the pairing the reasoner will honour) instead of an
+    # independent flag. Only when the reward monitor is active; otherwise empty.
+    resolved_reward_monitor_manifest = (
+        _resolve_reward_monitor_manifest(
+            repo_root=repo_root,
+            description=description,
+            explicit_manifest=reward_monitor_manifest,
+        )
+        if enable_reward_monitor
+        else ""
+    )
+    # Forward the resolved reward manifest (ros2 launch rejects an empty ``name:=``
+    # value; the launch file defaults it to "" and the reasoner/monitor fall back
+    # to the robometer default when unset).
+    if resolved_reward_monitor_manifest:
+        argv_template.append(f"reward_monitor_manifest:={resolved_reward_monitor_manifest}")
+    # Same empty-value rule for the scene-VLM manifest: the launch file defaults
+    # it to "" and falls back to the in-tree qwen35-4b-nf4 rSkill.
+    if enable_scene_vlm and scene_vlm_manifest:
+        argv_template.append(f"scene_vlm_manifest:={scene_vlm_manifest}")
+    # The reward monitor's always-on critic_score path scores against its
+    # `task` param; an empty task makes `_publish_critic_score` silently skip
+    # every tick. Default
+    # it to the operator goal so a deploy with `--initial-task` gets a
+    # background progress signal out of the box (an explicit
+    # `--reward-monitor-task` still wins; the reasoner's `query_task_progress`
+    # polls already carry the live subtask when it dispatches with a deadline).
+    effective_reward_task = reward_monitor_task
+    if not effective_reward_task and _resolved_initial_prompt:
+        effective_reward_task = _resolved_initial_prompt.strip()
+    if effective_reward_task:
+        argv_template.append(f"reward_monitor_task:={effective_reward_task}")
+    # only forward the locator list when non-empty (ros2 launch rejects
+    # an empty ``name:=`` value; the launch file defaults it to "").
+    if resolved_object_detector_locators:
+        argv_template.append(
+            "object_detector_locators:=" + ",".join(resolved_object_detector_locators)
+        )
+    # only forward the approach skill when opted in (empty default;
+    # ros2 launch rejects an empty ``name:=`` value, and the launch file
+    # defaults ``approach_skill_id`` to "").
+    if approach_skill:
+        argv_template.append(f"approach_skill_id:={approach_skill}")
+    # only forward the stereo rig when the scene pins it (empty default; the
+    # launch file defaults the visual impl's own left/right topics otherwise).
+    if slam_stereo_cameras is not None:
+        argv_template.append(f"slam_stereo_cameras:={','.join(slam_stereo_cameras)}")
+    if slam_mono_camera:
+        argv_template.append(f"slam_mono_camera:={slam_mono_camera}")
+        if not slam_depth_sidecar_autostart:
+            argv_template.append("slam_depth_sidecar_autostart:=false")
+    # only forward the cloud topic when the scene pins it; the launch file
+    # carries the sim default and ros2 launch rejects an empty ``name:=``.
+    if octomap_cloud_topic:
+        argv_template.append(f"octomap_cloud_topic:={octomap_cloud_topic}")
+
+    # only forward the dataset args when recording is opted in
+    # (empty defaults; ros2 launch rejects an empty ``name:=`` value, and the
+    # launch file defaults all three so omitting them disables recording).
+    if dataset_out:
+        argv_template.append(f"dataset_out:={dataset_out}")
+        if dataset_repo_id:
+            argv_template.append(f"dataset_repo_id:={dataset_repo_id}")
+        if dataset_license:
+            argv_template.append(f"dataset_license:={dataset_license}")
+
+    if deploy_scene is not None and (
+        deploy_scene.safety is not None or deploy_scene.extra_allowed_collision_pairs
+    ):
+        argv_template.append(f"workcell_json:={deploy_scene.model_dump_json(exclude_unset=True)}")
+
+    # ADR-0097 — the scene's committed place-phase declaration, for a DIRECT
+    # dispatch (no reasoner in the loop to ground the place target per goal).
+    # Forwarded to the rSkill runner, which scopes it to each goal it
+    # dispatches. Absent — every scene today — means no place witness can arm.
+    if deploy_scene is not None and deploy_scene.place_declaration is not None:
+        argv_template.append(
+            f"place_declaration_json:={deploy_scene.place_declaration.model_dump_json()}"
+        )
+
+    # The deploy memory bundle. ``--memory-dir`` (CLI) wins;
+    # otherwise the DeployScene's own ``memory_dir`` field. Derive the per-modality
+    # launch paths by convention and forward them (each to its consumer's arg).
+    effective_memory_dir = memory_dir
+    if effective_memory_dir is None and deploy_scene is not None:
+        effective_memory_dir = deploy_scene.memory_dir
+    if effective_memory_dir:
+        argv_template.extend(_memory_bundle_launch_args(effective_memory_dir))
+
+    # Forward the startup prompt only when non-empty. The launch
+    # file defaults ``initial_task_prompt`` to "" (no prompt), so omitting it
+    # leaves the reasoner in idle mode until an operator prompt arrives.
+    if _resolved_initial_prompt:
+        argv_template.append(f"initial_task_prompt:={_resolved_initial_prompt}")
+
+    # Real deploys — forward the DeployScene YAML so the runtime node
+    # opens every deploy-bound sensor (robot manifest + scene `sensors:`)
+    # and publishes the physical cameras onto
+    # /openral/cameras/<name>/image (sim keeps the HAL bridge as the
+    # only camera source; empty default in the launch file).
+    if deploy_config is not None and hal_mode == "real":
+        argv_template.append(f"deploy_config:={Path(deploy_config).resolve()}")
+    # Also forward `--config` (not the separate `deploy_config` param above,
+    # which `deploy sim` never populates) on the sim path when the scene
+    # declares an `ExternalSimulatorSpec` (DeployScene.simulator) — that
+    # robot's sim IS a real ROS-attached process (SRB today), so
+    # `compose_runtime_graph` needs `deploy_config:=` to spawn + gate it,
+    # unlike every other sim backend that renders its own cameras in-process.
+    elif (
+        config is not None
+        and hal_mode == "sim"
+        and deploy_scene is not None
+        and deploy_scene.simulator is not None
+    ):
+        argv_template.append(f"deploy_config:={Path(config).resolve()}")
+
+    return LaunchInvocation(
+        robot_id=robot_id,
+        robot_yaml=robot_yaml,
+        robot_manifest_name=description.name,
+        hal=hal,
+        enable_slam=enable_slam,
+        slam_backend=slam_backend,
+        slam_visual_impl=slam_visual_impl,
+        slam_stereo_cameras=slam_stereo_cameras,
+        slam_mono_camera=slam_mono_camera,
+        slam_depth_sidecar_autostart=slam_depth_sidecar_autostart,
+        enable_nav2=enable_nav2,
+        enable_octomap=enable_octomap,
+        octomap_cloud_topic=octomap_cloud_topic,
+        clock_origin=clock_origin,
+        enable_object_detector=enable_object_detector,
+        object_detector_onnx=resolved_object_detector_onnx,
+        object_detector_manifest=resolved_object_detector_manifest,
+        object_detector_query=object_detector_query or "",
+        object_detector_locators=tuple(resolved_object_detector_locators),
+        spatial_memory_ingest=spatial_memory_ingest,
+        hal_params=hal_params,
+        hal_mode=hal_mode,
+        reset_to_pose_service=service,
+        approach_skill_id=approach_skill,
+        enable_foxglove=enable_foxglove,
+        foxglove_port=foxglove_port,
+        initial_task_prompt=_resolved_initial_prompt,
+        enable_reward_monitor=enable_reward_monitor,
+        reward_monitor_manifest=resolved_reward_monitor_manifest,
+        argv_template=argv_template,
+    )
+
+
+def _alloc_conf_var() -> str:
+    """Return the allocator-config env var name this workspace's torch reads.
+
+    torch renamed ``PYTORCH_CUDA_ALLOC_CONF`` to ``PYTORCH_ALLOC_CONF`` in
+    2.9; the old name still works there but logs a deprecation warning at
+    every process start. Resolved from installed metadata rather than by
+    importing torch, which would add seconds to CLI startup for one string.
+
+    Falls back to the old spelling when torch is absent or its version is
+    unparseable: every torch that reads either name understands that one, so the
+    worst case is the warning, never a lost allocator setting.
+    """
+    try:
+        version = importlib.metadata.version("torch")
+        major, minor = (int(part) for part in version.split(".")[:2])
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        return "PYTORCH_CUDA_ALLOC_CONF"
+    return "PYTORCH_ALLOC_CONF" if (major, minor) >= (2, 9) else "PYTORCH_CUDA_ALLOC_CONF"
+
+
+def _ros2_argv_head() -> list[str]:
+    """Return the argv prefix that runs ``ros2`` under the **workspace venv** interpreter.
+
+    ``/opt/ros/<distro>/bin/ros2`` has a ``#!/usr/bin/python3`` shebang, so a
+    bare ``ros2 launch`` parses ``deploy_e2e.launch.py`` under the *system*
+    interpreter. ``_prepare_launch_env`` puts the venv site dir on
+    ``PYTHONPATH``, but ``PYTHONPATH`` only prepends — any distribution the
+    venv does not carry still resolves out of ``/usr/lib/python3/dist-packages``,
+    an ABI risk when mixing apt-compiled extensions with the venv's NumPy.
+
+    Measured on a Jetson AGX Thor with ``python3-pandas`` installed:
+    ``openral deploy run`` aborted with ``ValueError: numpy.dtype size
+    changed, may indicate binary incompatibility. Expected 96 from C header,
+    got 88 from PyObject`` via ``openral_hal.sim_bringup`` → ``lerobot`` →
+    ``deepdiff`` → ``import pandas`` (apt build against NumPy 1.26, inside a
+    process that had already imported the venv's NumPy 2.2); ``deepdiff``'s
+    ``except ImportError`` guard does not catch the resulting ``ValueError``.
+
+    Running the launch parser under ``sys.executable`` makes the venv's
+    ``pyvenv.cfg`` (``include-system-site-packages = false``) actually apply,
+    taking ``dist-packages`` off ``sys.path`` entirely. ROS's own Python
+    packages are unaffected — they arrive via the ``/opt/ros/<distro>`` entry
+    ``PYTHONPATH`` already carries.
+
+    Wrapping requires both: (1) ``sys.executable`` can import ``ros2cli`` —
+    true for a sourced deb ROS (``PYTHONPATH`` carries its site-packages);
+    false for ROS from conda/RoboStack/pip elsewhere, where wrapping would
+    raise ``PackageNotFoundError: ros2cli`` — checked via ``find_spec`` rather
+    than assumed. (2) ``ros2`` is actually a Python script (a console-script
+    entry point, not a shell wrapper) — verified by reading its shebang. Any
+    check failing (no ``ros2`` on PATH, ``ros2cli`` not importable, unreadable
+    file, non-Python shebang) falls back to the bare ``["ros2"]`` this
+    function replaced.
+
+    Returns:
+        ``[sys.executable, "<abs path to ros2>"]`` when ``ros2`` is a Python
+        script this interpreter can run, else ``["ros2"]``.
+
+    Example:
+        >>> head = _ros2_argv_head()
+        >>> head == ["ros2"] or head[0] == sys.executable
+        True
+    """
+    ros2_bin = shutil.which("ros2")
+    if ros2_bin is None or importlib.util.find_spec("ros2cli") is None:
+        return ["ros2"]
+    try:
+        with open(ros2_bin, "rb") as handle:
+            shebang = handle.readline(256)
+    except OSError:
+        return ["ros2"]
+    if not shebang.startswith(b"#!") or b"python" not in shebang:
+        return ["ros2"]
+    return [sys.executable, ros2_bin]
+
+
+def _prepare_launch_env(*, hal_mode: str = "sim") -> dict[str, str]:
+    """Build the environment for the ``ros2 launch`` subprocess (deploy sim + deploy run).
+
+    Shared by both shelling paths so the wiring stays identical:
+
+    * Export ``OPENRAL_VENV_SITE`` + prepend the venv site / bin so the launch
+      parser and every spawned node import ``openral_core`` from the workspace
+      venv (the editable ``.pth`` files are processed via ``site.py``).
+    * Default the **expandable-segments CUDA allocator**. The
+      ``runtime_node`` loads VLA weights (pi05 / molmoact2 …) onto the GPU; on a
+      tight 8 GiB card the default allocator fragments and OOMs at the forward
+      pass even for an NF4 model that otherwise fits (molmoact2-libero-nf4 peaks
+      ~7.6 GiB; without this it dies on a small alloc with ~165 MiB stuck in
+      reserved-but-unallocated). ``setdefault`` so an operator override wins.
+      The name was renamed across torch releases
+      (``PYTORCH_CUDA_ALLOC_CONF`` → ``PYTORCH_ALLOC_CONF`` in 2.9), so the
+      spelling is chosen from the installed torch rather than setting both:
+      the old name still works on 2.9 but logs a deprecation warning on every
+      process start, which is noise on every launch.
+    * Clean stale Fast-DDS SHM (``_apply_rmw_default``).
+    * **Confine a sim to its own host and DDS domain** (``hal_mode="sim"``,
+      ``confine_sim_scope``). A sim graph lives on
+      one host; left on the default domain 0 with subnet discovery it joins
+      whatever else is on the LAN, which on 2026-09-05 was a live OpenArm
+      (#227). ``deploy run`` is deliberately **not** confined — a real robot's
+      graph may legitimately span machines — and is covered by the occupancy
+      guard instead.
+
+    Args:
+        hal_mode: ``"sim"`` or ``"real"``; only a sim is scope-confined.
+    """
+    from openral_cli._dds_scope import confine_sim_scope  # reason: deferred
+
+    env = os.environ.copy()
+    if hal_mode == "sim":
+        confine_sim_scope(env)
+    venv_site = sysconfig.get_paths()["purelib"]
+    env["OPENRAL_VENV_SITE"] = venv_site
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{venv_site}{os.pathsep}{existing}" if existing else venv_site
+    venv_bin = os.path.dirname(sys.executable)
+    existing_path = env.get("PATH", "")
+    env["PATH"] = f"{venv_bin}{os.pathsep}{existing_path}" if existing_path else venv_bin
+    env.setdefault(_alloc_conf_var(), "expandable_segments:True")
+    _apply_rmw_default(env)
+    return env
+
+
+def run_launch_invocation(invocation: LaunchInvocation, *, run_preflight: bool = True) -> int:
+    """Write the HAL params YAML, set the venv env, and shell ``ros2 launch``.
+
+    Returns the launch exit code. The shared shelling path used by both
+    ``openral deploy sim`` and ``openral deploy run``
+    . Exports ``OPENRAL_VENV_SITE`` + prepends the venv bin/PATH so
+    the launch parser and spawned nodes import ``openral_core`` from the
+    workspace venv (the editable ``.pth`` files are processed via ``site.py``).
+    ``run_preflight`` probes the rSkill palette extras.
+    """
+    if run_preflight:
+        repo_root = _repo_root_from(Path(__file__))
+        # Same preflight sequence, and order, as ``deploy sim``: overlay
+        # check → orphan reap → palette extras → VRAM pair. Runs here too
+        # (not sim-only) because a crashed ``deploy run`` leaves orphaned
+        # graph processes holding GPU memory + ``/dev/shm/fastrtps_*``
+        # lockfiles, surfacing on the next launch as ``Failed init_port
+        # fastrtps_port7000`` — real hardware is where a stale HAL matters
+        # most.
+        try:
+            assert_ros2_packages_discoverable(_required_ros2_packages(invocation))
+        except ROSConfigError as exc:
+            _console.print(f"[red]config error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+        _reap_orphans_with_log()
+
+        _preflight_palette_deps(
+            repo_root=repo_root,
+            robot_yaml=Path(invocation.robot_yaml),
+        )
+        # VLA↔reward VRAM pair preflight (deploy run path). No-op
+        # unless a reward monitor is active and the GPU budget is readable.
+        if invocation.enable_reward_monitor and invocation.reward_monitor_manifest:
+            from openral_core import RobotDescription
+
+            _preflight_reward_vram_fit(
+                repo_root=repo_root,
+                description=RobotDescription.from_yaml(str(invocation.robot_yaml)),
+                reward_manifest_path=invocation.reward_monitor_manifest,
+                gpu_budget_gb=_detect_gpu_free_vram_gb(),
+            )
+    hal_params_tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115  # reason: HAL reads after this scope
+        mode="w",
+        prefix=f"openral-hal-params-{invocation.robot_id}-",
+        suffix=".yaml",
+        delete=False,
+        encoding="utf-8",
+    )
+    try:
+        yaml.safe_dump(
+            {"/**": {"ros__parameters": invocation.hal_params}},
+            hal_params_tmp,
+            sort_keys=False,
+        )
+        hal_params_tmp.close()
+        argv = [
+            arg.replace("HAL_PARAMS_FILE_PLACEHOLDER", hal_params_tmp.name)
+            for arg in invocation.argv_template
+        ]
+        _console.print(f"  hal_params_tmp:{hal_params_tmp.name}")
+        _console.print(f"  argv: {shlex.join(argv)}")
+        venv_env = _prepare_launch_env(hal_mode=invocation.hal_mode)
+        # Both directions, one rule: a sim must not start beside a robot and a
+        # robot must not start beside a sim (#227). Checked against the scope
+        # actually about to be used, so a confined sim sees the empty graph it
+        # just confined itself to — which is why it cannot live in the
+        # ``run_preflight`` block above, where ``venv_env`` does not exist yet.
+        # It is still a preflight check, so it honours the same flag: a caller
+        # passing ``run_preflight=False`` means it.
+        if run_preflight:
+            _assert_graph_unoccupied_or_exit(venv_env, hal_mode=invocation.hal_mode)
+        return _run_launch(argv, venv_env)
+    finally:
+        with contextlib.suppress(OSError):
+            Path(hal_params_tmp.name).unlink(missing_ok=True)
+
+
+def _assert_graph_unoccupied_or_exit(env: dict[str, str], *, hal_mode: str) -> None:
+    """Refuse the launch when another robot is already on this ROS graph.
+
+    Thin CLI wrapper: the rule and its wording live in
+    ``openral_cli._dds_scope``; this turns the typed refusal into the exit
+    code the operator sees. Kept out of ``run_preflight`` on purpose — it has to
+    run against ``venv_env``, the scope actually about to be used, which does
+    not exist until ``_prepare_launch_env`` has confined it.
+    """
+    from openral_cli._dds_scope import assert_graph_unoccupied  # reason: deferred
+
+    try:
+        assert_graph_unoccupied(env, hal_mode=hal_mode)
+    except ROSConfigError as exc:
+        _console.print(f"[red]refusing to launch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+def _parse_hal_overrides(raw: list[str] | None) -> dict[str, object]:
+    """Parse ``--hal key=value`` flags into a typed override dict.
+
+    Accepts bool / int / float / string. JSON-encoded values are tried
+    first so ``--hal cameras='["top"]'`` works.
+    """
+    out: dict[str, object] = {}
+    for entry in raw or []:
+        if "=" not in entry:
+            raise ROSConfigError(f"--hal {entry!r} is malformed; expected ``key=value``.")
+        key, value = entry.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        try:
+            out[key] = json.loads(value)
+        except json.JSONDecodeError:
+            out[key] = value
+    return out
+
+
+def _ros2_pkg_prefix(pkg: str) -> str | None:
+    """Return the install prefix for ``pkg`` per ``ros2 pkg prefix``, or None.
+
+    Uses ``ros2 pkg prefix`` because it is the same lookup ``ros2 launch``
+    performs internally. A package is "discoverable" iff this exits 0
+    and prints a path.
+    """
+    try:
+        completed = subprocess.run(
+            ["ros2", "pkg", "prefix", pkg],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    out = completed.stdout.strip()
+    return out or None
+
+
+def _reap_orphans_with_log() -> None:
+    """Kill orphan openral-graph processes and log the count.
+
+    Reap orphan graph processes from a prior crashed/Ctrl-C'd run.
+    Without this, a stale HAL still holds the robocasa MJCF env +
+    ``/dev/shm/fastrtps_*`` lockfiles, and the new launch surfaces
+    as ``[RTPS_TRANSPORT_SHM Error] Failed init_port
+    fastrtps_port7000`` on the safety_kernel, slam_toolbox,
+    prompt_router, etc.
+    """
+    if os.environ.get("OPENRAL_SKIP_ORPHAN_REAP") == "1":
+        # Parallel workers (``tools/ceiling_battery.sh``) share a host and an
+        # argv signature, so this sweep cannot tell a concurrent sibling from a
+        # crash leftover — worker B's startup reap kills worker A's live graph.
+        # The battery has exported this since it went parallel and the docs
+        # describe it as load-bearing, but nothing read it until now, which is
+        # why worker 1 "never got its action server" and idled 626 s to its
+        # timeout. Opting out means opting into a teardown-side sweep that CAN
+        # tell siblings apart: `_reap_domain` in ``tools/_ceiling_probe.py``,
+        # scoped by ``ROS_DOMAIN_ID``.
+        _console.print("[yellow]orphan reap skipped (OPENRAL_SKIP_ORPHAN_REAP=1)[/yellow]")
+        return
+    killed = _kill_orphan_openral_graph_processes()
+    if killed:
+        _console.print(
+            f"[yellow]reaped {killed} orphan openral-graph process(es) from a prior run[/yellow]"
+        )
+
+
+# Argv substrings that identify a process as belonging to the openral
+# deploy graph. Each entry must be specific enough that a coincidental
+# unrelated invocation never matches — the reaper additionally scopes to
+# the calling user's PIDs (the ``st_uid`` guard) so a shared host is safe.
+#: A needle is either a substring, or a tuple of substrings that must ALL be
+#: present (logical AND) — needed when the distinguishing evidence is split
+#: across a cmdline, e.g. an executable path before ``--ros-args`` and the node
+#: remap after it.
+_ORPHAN_GRAPH_NEEDLES: tuple[str | tuple[str, ...], ...] = (
+    "deploy_e2e.launch.py",
+    "openral_rskill_ros/runtime_node",
+    "install/lib/openral_hal_",
+    "openral_reasoner_ros/reasoner_node.py",
+    "openral_prompt_router/prompt_router_node.py",
+    "openral_safety_kernel/safety_kernel_node",
+    "openral dashboard",
+    "async_slam_toolbox_node",
+    # Nav2 sub-nodes spawned by openral_nav2_bringup's
+    # IncludeLaunchDescription. The upstream binaries live under
+    # ``/opt/ros/<distro>/lib/nav2_*``; matching the path keeps the
+    # predicate specific (won't catch unrelated ``nav2_*`` python
+    # imports). Without these, a previously-crashed Nav2 graph leaves
+    # zombie controller_server / planner_server / collision_monitor /
+    # bt_navigator / opennav_docking processes alive, and the next
+    # ``openral deploy sim`` hangs in ``Configuring controller_server``
+    # while multiple lifecycle_managers fight over the same nodes.
+    "/lib/nav2_controller/",
+    "/lib/nav2_smoother/",
+    "/lib/nav2_planner/",
+    "/lib/nav2_route/",
+    "/lib/nav2_behaviors/",
+    "/lib/nav2_bt_navigator/",
+    "/lib/nav2_waypoint_follower/",
+    "/lib/nav2_velocity_smoother/",
+    "/lib/nav2_collision_monitor/",
+    "/lib/opennav_docking/",
+    "/lib/nav2_lifecycle_manager/",
+    # TF chain spawned by ``deploy_e2e.launch.py``. A `static_transform_publisher`
+    # orphaned before the URDF mount-z was zeroed kept publishing stale
+    # `base_link → panda_link0 z=0.4` on TRANSIENT_LOCAL `/tf_static`; tf2
+    # picks non-deterministically among same-name static frames, so the next
+    # launch's `z=0.0` publisher couldn't override it (rldx-rc365 "arm
+    # reaches 40cm high" bug). Reaping the renamed static publisher
+    # (`static_<base>_to_<root>`) + `robot_state_publisher` closes the hole.
+    #
+    # TUPLES — every element required — because the executable path alone
+    # isn't ours: `zed_wrapper` runs the same `robot_state_publisher` binary
+    # for its own `zed_state_publisher`; reaping it broke ZED's optical
+    # frames and silently emptied `octomap_server` (observed on hardware
+    # 2026-09-07). Pairing executable + node name scopes the sweep to our TF chain.
+    ("/lib/tf2_ros/static_transform_publisher", "__node:=static_"),
+    (
+        "/lib/robot_state_publisher/robot_state_publisher",
+        "__node:=robot_state_publisher",
+    ),
+    # rldx out-of-process sidecar (ADR auto-spawn). It runs in its OWN
+    # session (``start_new_session=True`` in ``openral_sim.policies.rldx``)
+    # so the launch group's SIGINT never reaches it; if the runtime node
+    # dies before its adapter ``close()`` runs, the sidecar keeps the
+    # GR00T/RLDX weights resident and starves the GPU (~6.5 GiB) of the
+    # next run. The cache dir is openral-specific, so this is unambiguous.
+    "/.cache/openral/rldx-sidecar/",
+    # Perception / critic graph nodes spawned by ``deploy_e2e.launch.py``. These
+    # were absent from the sweep, so under a heavy graph whose graceful
+    # shutdown doesn't finish within ``grace_s`` they orphaned (the reward
+    # monitor holds the sidecar; the detector holds its model). Scoped to the
+    # in-tree node entry points so we never touch an unrelated process.
+    "openral_perception_ros/reward_monitor_node.py",
+    "openral_perception_ros/ros_image_detector_node.py",
+    "openral_reasoner_ros/critic_producer_node.py",
+    # World-voxel nodes. These were the ONE graph member missing from the set,
+    # and `ros2 launch` starts them in their own session, so neither this sweep
+    # nor a caller's ``killpg`` reached them: every run leaked an
+    # ``octomap_server_node`` + ``octomap_voxel_bridge`` pair that kept holding
+    # ``/dev/shm/fastrtps_*`` and its ``fastrtps_port<N>_el`` lock file. The
+    # next run on that domain then failed ``open_and_lock_file``, its policy
+    # was handed 0 chunks, and it scored as an ordinary non-completion. 46 such
+    # orphans, oldest 23.7 h, were found on q-laptop on 2026-09-10 — every one
+    # octomap, nothing else, which is what a single missing needle looks like.
+    # The bridge is our own package binary, so the path alone is unambiguous.
+    # ``octomap_server_node`` is upstream and shared — the same ZED lesson as
+    # the TF publishers above — so it is scoped by our node name.
+    "openral_octomap_bridge/octomap_voxel_bridge",
+    ("/lib/octomap_server/octomap_server_node", "__node:=openral_octomap_server"),
+)
+
+
+def _cmdline_is_openral_graph_process(cmdline: str) -> bool:
+    """Return True when ``cmdline`` matches an openral deploy-graph process.
+
+    Pure predicate over a space-joined ``/proc/<pid>/cmdline`` string so
+    the needle set (``_ORPHAN_GRAPH_NEEDLES``) is unit-testable
+    without spawning real processes.
+
+    A tuple needle matches only when EVERY element is present, which is how
+    the shared-executable cases (``robot_state_publisher``,
+    ``static_transform_publisher``) stay scoped to this launch's own nodes
+    instead of any co-running stack's.
+    """
+    return any(
+        all(part in cmdline for part in needle) if isinstance(needle, tuple) else needle in cmdline
+        for needle in _ORPHAN_GRAPH_NEEDLES
+    )
+
+
+_ORPHAN_GROUP_LEADER_NEEDLES: tuple[str, ...] = ("tools/process_group_wrapper.py",)
+"""argv signatures of graph processes that must be SIGTERMed, never SIGKILLed.
+
+These are process-group leaders (``os.setsid``) that forward a SIGTERM to
+their whole group and escalate to SIGKILL themselves; killing the leader
+outright would orphan the group it guards. Today: the external simulator
+wrapper spawned by ``deploy_e2e.launch.py`` around ``srb agent ros``.
+"""
+
+
+def _cmdline_is_process_group_leader(cmdline: str) -> bool:
+    """Return True when ``cmdline`` is one of our group-leader wrappers."""
+    return any(needle in cmdline for needle in _ORPHAN_GROUP_LEADER_NEEDLES)
+
+
+def _kill_orphan_openral_graph_processes() -> int:
+    """SIGKILL orphaned openral-graph processes from a prior ``openral deploy sim``.
+
+    Group-leader wrappers (``_ORPHAN_GROUP_LEADER_NEEDLES``) get SIGTERM
+    instead, so they take their whole group down rather than orphaning it.
+
+    A graceful ``Ctrl-C`` doesn't always propagate through ``ros2
+    launch`` to every child — under load, the launch dispatcher
+    exits before the HAL has finished tearing down its in-process
+    robocasa env, and the HAL python process keeps running. On the
+    next ``openral deploy sim``:
+
+    * the prior dashboard still holds ``127.0.0.1:4318`` →
+      ``[Errno 98] address already in use`` on the new dashboard;
+    * the prior HAL still holds ``/dev/shm/fastrtps_*`` lockfiles →
+      ``[RTPS_TRANSPORT_SHM Error] Failed init_port fastrtps_port7000``
+      on the new safety_kernel/slam_toolbox/prompt_router;
+    * the prior HAL still holds the MJCF env handle → the new HAL's
+      configure step hangs waiting for the robocasa loader.
+
+    Match orphans by argv signature so we never reach into other
+    users' processes or unrelated python invocations. Best-effort:
+    SIGKILL failures (permission denied, race) are silently
+    skipped. Returns the count of processes killed for logging.
+    """
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        # No procfs (macOS dev hosts) — nothing to sweep. Deployment
+        # targets are Linux; on Darwin the reap is a no-op rather than a
+        # FileNotFoundError crash inside _run_launch.
+        return 0
+    me = os.getuid()
+    killed = 0
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            st = entry.stat()
+        except (FileNotFoundError, PermissionError):
+            continue
+        if st.st_uid != me:
+            continue  # other users' processes are not ours to kill
+        try:
+            cmdline = (
+                (entry / "cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode(
+                    errors="replace",
+                )
+            )
+        except (FileNotFoundError, PermissionError):
+            continue
+        if _cmdline_is_process_group_leader(cmdline):
+            # The external-simulator wrapper (``tools/process_group_wrapper.py``)
+            # is a session leader whose only job is to take its whole group
+            # (Isaac Sim's ``python.sh`` → kit-python) down with it: SIGTERM
+            # lets it do that, then escalate to SIGKILL on its own. SIGKILLing
+            # the wrapper itself would orphan the multi-GiB kit process — the
+            # exact leak the wrapper exists to prevent.
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.kill(pid, signal.SIGTERM)
+                killed += 1
+            continue
+        if not _cmdline_is_openral_graph_process(cmdline):
+            continue
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+    return killed
+
+
+def _terminate_launch_group(proc: subprocess.Popen[bytes], *, grace_s: float = 12.0) -> None:
+    """SIGINT the launch's session, then SIGKILL any straggler after a grace.
+
+    ``proc`` was spawned with ``start_new_session=True`` so its PGID
+    equals its PID and names the whole launch tree. SIGINT (not SIGTERM)
+    is what ``ros2 launch`` translates into a graceful lifecycle
+    shutdown; we give it ``grace_s`` to drain, then SIGKILL the group so
+    no node — or the launch-spawned static_transform_publisher /
+    robot_state_publisher — survives to orphan and poison the next run.
+    """
+    if proc.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError, OSError):
+        os.killpg(proc.pid, signal.SIGINT)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=grace_s)
+        return
+    with contextlib.suppress(ProcessLookupError, OSError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=5.0)
+
+
+_SIGNAL_RESET_TRAMPOLINE: Final[str] = (
+    "import os, signal, sys; "
+    "[signal.signal(s, signal.SIG_DFL) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)]; "
+    "os.execvp(sys.argv[1], sys.argv[1:])"
+)
+"""``python -c`` body that resets the shutdown signals to default, then ``exec``s argv.
+
+Used instead of ``preexec_fn`` (unsafe in a threaded parent, ruff PLW1509):
+the trampoline ``exec``s in place, so the launch keeps the ``Popen`` PID and
+``killpg`` semantics are unchanged.
+"""
+
+
+def _with_default_signal_dispositions(argv: list[str]) -> list[str]:
+    """Wrap ``argv`` so it starts with SIGINT/SIGTERM/SIGHUP at ``SIG_DFL``."""
+    return [sys.executable, "-c", _SIGNAL_RESET_TRAMPOLINE, *argv]
+
+
+def _run_launch(argv: list[str], env: dict[str, str], *, grace_s: float = 12.0) -> int:
+    """Run ``ros2 launch`` in its own session, reaping the whole tree on exit.
+
+    The legacy ``subprocess.run(argv)`` left the launch a sibling in the
+    CLI's process group: a ``kill -INT`` of this CLI (or any non-terminal
+    exit) signalled only the CLI, and ``ros2 launch`` plus every node it
+    spawned — the HAL (holding the MuJoCo render context, ~1.2 GiB GPU),
+    robot_state_publisher, the ``static_<base>_to_<root>`` static TF
+    publisher — were reparented to init and kept running. Those orphans
+    accumulated across dev iterations and poisoned the TRANSIENT_LOCAL
+    ``/tf_static`` topic (see ``_kill_orphan_openral_graph_processes``).
+
+    Teardown runs in three escalating stages so nothing survives,
+    whatever the process-group topology:
+
+    1. Forward SIGINT/SIGTERM to the launch's session so ``ros2 launch``
+       runs its graceful shutdown. Each node then unwinds its own
+       ``main()``: rclpy's SIGINT handler shuts the context and raises out
+       of ``spin``, and the ``finally`` runs the teardown — for the HAL
+       that is ``shutdown_hal()``, which releases the MJCF env and emits
+       the terminal ``sim.task_success_final`` verdict; the skill adapter's
+       ``close()`` terminates the rldx sidecar. Note this is NOT the
+       lifecycle ``shutdown`` transition — rclpy requests none on a signal,
+       so ``on_shutdown`` does not fire.
+    2. After ``grace_s`` escalate to SIGKILL on the launch's process
+       group (``_terminate_launch_group``).
+    3. Sweep by argv signature (``_kill_orphan_openral_graph_processes``).
+       This is the bulletproof backstop: ``ros2 launch`` spawns its nodes
+       in their OWN process groups (and the rldx sidecar in its own
+       session), so neither ``killpg`` reaches them directly — under a
+       heavy graph the graceful shutdown often doesn't finish before the
+       launch exits, and stage 1+2 alone leak nodes. The signature sweep
+       matches every graph process regardless of parentage.
+
+    Returns the launch process's exit code (0 if it exited via signal
+    with no recorded returncode).
+
+    The launch is started with default signal dispositions
+    (``_with_default_signal_dispositions``). A CLI started in the
+    background of a non-interactive shell (``openral deploy sim … &`` in a
+    script, the normal shape of an experiment runner) inherits
+    ``SIGINT=SIG_IGN`` per POSIX, and CPython leaves an ignored SIGINT
+    ignored — so ``ros2 launch`` never saw the SIGINT stage 1 forwards,
+    never ran its shutdown, and the external simulator (in its own session,
+    unreachable by ``killpg``) kept ticking after every node had exited
+    (observed live 2026-09-14, twice).
+    """
+    proc = subprocess.Popen(
+        _with_default_signal_dispositions(argv), env=env, start_new_session=True
+    )
+
+    def _forward(_signum: int, _frame: object) -> None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(proc.pid, signal.SIGINT)
+
+    prev_int = signal.signal(signal.SIGINT, _forward)
+    prev_term = signal.signal(signal.SIGTERM, _forward)
+    try:
+        proc.wait()
+    finally:
+        signal.signal(signal.SIGINT, prev_int)
+        signal.signal(signal.SIGTERM, prev_term)
+        _terminate_launch_group(proc, grace_s=grace_s)
+        # ``ros2 launch`` spawns its nodes in their OWN process groups, so
+        # ``killpg`` on the launch's group only reaps them via ros2
+        # launch's *graceful* shutdown — which, under a heavy graph
+        # (nav2 + slam + sidecar), routinely does not finish before the
+        # launch process itself exits, leaving the nodes (and the
+        # own-session rldx sidecar) orphaned. Sweep by argv signature as
+        # the bulletproof backstop: it matches every graph process
+        # regardless of parentage or process group. Safe because two
+        # deploy graphs can't coexist (they collide on DDS/ports), so on
+        # exit the only matching processes are this run's survivors -- unless the operator runs
+        # sibling graphs on separate domains/GPUs and opted out of the sweep (research repo F51:
+        # this exit sweep killed a parallel graph the moment another run tore down).
+        if os.environ.get("OPENRAL_SKIP_ORPHAN_REAP") != "1":
+            _kill_orphan_openral_graph_processes()
+    return proc.returncode if proc.returncode is not None else 0
+
+
+DDS_TRANSPORT_READY_MARKER: Final[str] = "dds_transport_ready:"
+"""Printed once the DDS transport is settled and safe to join.
+
+Everything destructive to an existing Fast-DDS participant — the orphan reap
+and the ``/dev/shm/fastrtps_*`` purge — has run by the time this line appears,
+and ``ros2 launch`` has not been spawned yet. A co-process that wants to
+observe the graph (the validation matrix's evidence monitor) waits for this
+line in the deploy log before creating its own participant; starting earlier
+gets its shared-memory segments unlinked underneath it, after which it runs
+happily and receives nothing at all.
+"""
+
+
+def _apply_rmw_default(env: dict[str, str]) -> None:
+    """Clean stale Fast-DDS SHM lockfiles before spawning ``ros2 launch``.
+
+    ROS 2 Jazzy defaults to Fast-DDS, whose per-participant SHM
+    files live under ``/dev/shm/fastrtps_*``. When a prior launch
+    exited uncleanly (Ctrl-C, OOM kill, ``pkill -9``), those
+    lockfiles persist, and the next Fast-DDS participant fails to
+    bind with ``[RTPS_TRANSPORT_SHM Error] Failed init_port
+    fastrtps_port7000: open_and_lock_file failed`` — breaking every
+    subsequent ``openral deploy sim`` until the operator manually
+    cleans them. CLAUDE.md §2 names Cyclone as the OpenRAL default,
+    but the launch_ros lifecycle_event_manager in Jazzy has a
+    sharp edge with Cyclone (deserialisation race on the
+    auto-CONFIGURE → ACTIVATE chain) that takes down the
+    prompt_router; until that's resolved we stay on Fast-DDS and
+    aggressively clean its stale state.
+
+    Best-effort: only files owned by the calling user are
+    unlinked — other users' SHM segments are silently skipped.
+    Operators that explicitly opt into Cyclone or Zenoh via
+    ``RMW_IMPLEMENTATION`` keep theirs untouched.
+
+    **The purge is destructive to participants that already exist.**
+    It unlinks *every* ``/dev/shm/fastrtps_*`` this user owns, not
+    only the stale ones, so any Fast-DDS participant already running
+    on this host loses its shared-memory segments and goes silent
+    without erroring. The validation matrix lost a 24-run round to
+    exactly that: its evidence monitor attached ~6 ms after the
+    deploy started, and every one of the 24 ``run_monitor.jsonl``
+    files contains two lines. The purge is therefore *announced*:
+    ``DDS_TRANSPORT_READY_MARKER`` is printed on the line after
+    it, so a co-process can wait for it and create its participant on
+    the far side. It is printed on the Cyclone/Zenoh paths too, where
+    nothing was purged — a waiter needs the signal either way.
+    """
+    rmw = env.get("RMW_IMPLEMENTATION", "")
+    # -1 = the operator opted out of Fast-DDS, so nothing was cleaned.
+    opted_out = "rmw_cyclonedds" in rmw or "rmw_zenoh" in rmw
+    # Sibling graphs on one host (OPENRAL_SKIP_ORPHAN_REAP=1) keep their live SHM segments.
+    opted_out = opted_out or os.environ.get("OPENRAL_SKIP_ORPHAN_REAP") == "1"
+    purged = -1 if opted_out else _clean_stale_fastrtps_shm()
+    _console.print(
+        f"  {DDS_TRANSPORT_READY_MARKER} rmw={rmw or 'default'} "
+        f"shm_purged={'n/a' if purged < 0 else purged}"
+    )
+    # A waiter reads this line out of a redirected stdout, so it must not sit
+    # in a block buffer while the graph comes up around it.
+    sys.stdout.flush()
+
+
+def _clean_stale_fastrtps_shm() -> int:
+    """Best-effort: remove stale Fast-DDS SHM lock files in ``/dev/shm``.
+
+    Fast-DDS lock files are owned by the user that created them — we
+    silently skip anything we can't unlink (another user's file) so
+    this never escalates to ``sudo``-required cleanup. Cyclone-DDS
+    deployments never call this path.
+
+    Returns:
+        How many entries were unlinked, for the readiness line.
+    """
+    shm = Path("/dev/shm")
+    if not shm.is_dir():
+        return 0
+    purged = 0
+    for entry in shm.iterdir():
+        if not entry.name.startswith("fastrtps_"):
+            continue
+        with contextlib.suppress(OSError, PermissionError):
+            entry.unlink()
+            purged += 1
+    return purged
+
+
+def _required_ros2_packages(invocation: LaunchInvocation) -> list[str]:
+    """Build the package-list the preflight discovery check must validate.
+
+    Pulled out of ``deploy_sim_command`` for line-count hygiene
+    and so future opt-in bringup wrappers extend a single list.
+    """
+    pkgs = ["openral_rskill_ros", invocation.hal.package]
+    if invocation.enable_slam:
+        pkgs.append("openral_slam_bringup")
+    if invocation.enable_nav2:
+        pkgs.append("openral_nav2_bringup")
+    return pkgs
+
+
+def assert_ros2_packages_discoverable(
+    packages: Iterable[str],
+    *,
+    prefix_lookup: Callable[[str], str | None] = _ros2_pkg_prefix,
+) -> None:
+    """Raise ``ROSConfigError`` listing every ``pkg`` ``ros2`` cannot find.
+
+    Catches the most common operator failure for ``openral deploy sim``:
+    ``ros2`` itself is on PATH (so the system overlay is sourced) but
+    the OpenRAL workspace overlay (``install/setup.bash``) is not, so
+    ``ros2 launch`` can't find ``openral_rskill_ros`` or the per-robot
+    ``openral_hal_<X>`` package. The same error fires for a stale build
+    that simply hasn't included the requested HAL package yet.
+
+    ``prefix_lookup`` is injectable so unit tests can drive the path
+    with a deterministic fake without shelling out (CLAUDE.md §1.11
+    process-boundary fake).
+    """
+    missing = [pkg for pkg in packages if prefix_lookup(pkg) is None]
+    if not missing:
+        return
+    quoted = ", ".join(repr(p) for p in missing)
+    raise ROSConfigError(
+        f"ros2 cannot find ROS package(s): {quoted}. The OpenRAL workspace "
+        "overlay is not sourced (or the build is stale). From the repo root, "
+        "run:\n"
+        "  just ros2-build && source install/setup.bash\n"
+        "then re-run ``openral deploy sim``. Note: the package is named "
+        "``openral_rskill_ros`` (not ``rskill``) — the Python sub-package "
+        "under ``python/rskill/`` is a different layer."
+    )
+
+
+def _preflight_scene_assets(config: Path | None) -> None:
+    """Provision the scene's sim backend BEFORE ``ros2 launch``.
+
+    Some backends do slow first-run setup (RoboCasa clones+downloads ~11 GB;
+    Isaac Sim/RoboTwin build multi-GB sidecar venvs; RLBench/BEHAVIOR/VLABench
+    need an externally-provisioned install). That work normally happens
+    inside the scene factory, called from the HAL's ``on_configure`` —
+    bounded at 300 s by ``tools/lifecycle_autostart.py``, while the nav2
+    palette re-seed helper alongside it waits only 120 s for
+    ``/navigate_to_pose``. On a fresh machine both helpers time out before a
+    tens-of-minutes download finishes: the HAL never reaches ACTIVE and the
+    reasoner's palette silently loses ``navigate_to_pose``, with no reported
+    cause.
+
+    Running it here, before the launch, makes it an ordinary foreground
+    download against a TTY (so license banners / ``typer.confirm()`` are
+    reachable) instead of hidden work on a lifecycle deadline.
+
+    Which scenes need it is the backend's own declaration: each passes
+    ``provision=`` to ``SCENES.register``, and the same callable runs on the
+    build path, so preflight and build cannot drift. A scene with no hook
+    (LIBERO, MetaWorld, ManiSkill3, native MuJoCo — pip installs, nothing to
+    fetch) is a no-op. Idempotent and near-free once warm (each hook
+    short-circuits on an install probe/readiness sentinel). Advisory: a
+    provisioning failure is reported and the launch continues — the backend
+    retries at ``on_configure`` and raises its own typed error there.
+
+    Args:
+        config: DeployScene YAML path, or None when the caller resolved the
+            scene some other way (then this is a no-op).
+    """
+    if config is None:
+        return
+    try:
+        from openral_core import DeployScene, load_scene_strict
+    except ImportError:  # pragma: no cover - openral_core is a hard dep
+        return
+    try:
+        scene_id = load_scene_strict(str(config), DeployScene).scene.id
+    except (ROSConfigError, FileNotFoundError):
+        # Scene errors are the launch resolver's to report, not ours.
+        return
+
+    try:
+        # Importing the package fires `_register_backends()`, which is what
+        # populates the provisioner table. Decoration-time imports are thin by
+        # construction (the heavy backends load inside the factory bodies), so
+        # this costs well under a second.
+        from openral_sim import SCENES
+    except ImportError:
+        # No openral_sim in this env — the HAL will fail with its own
+        # actionable error rather than us guessing at one.
+        return
+
+    provision = SCENES.provision(scene_id)
+    if provision is None:
+        return
+
+    _console.print(
+        f"[dim]preflight: provisioning the {scene_id!r} backend (a first run may "
+        "clone repos and download several GB; cached afterwards)[/dim]"
+    )
+    try:
+        provision()
+    except Exception as exc:  # reason: advisory — the backend retries and raises typed
+        _console.print(
+            f"[yellow]preflight: could not provision {scene_id!r} ({exc}); "
+            "continuing — the HAL will retry at on_configure[/yellow]"
+        )
+
+
+_HEAD_CAM_ENV = "OPENRAL_ROBOCASA_HEAD_CAM"
+_HEAD_CAM_FEATURE_KEY = "observation.images.head"
+
+
+def _apply_palette_head_cam(matched: Iterable[RSkillManifest]) -> bool:
+    """Enable the synthetic RoboCasa ``head`` camera when the palette needs it.
+
+    RoboCasa synthesises a forward egocentric ``head`` camera for navigation
+    policies (``openral_sim.backends.robocasa.render_head_view``), gated on
+    ``OPENRAL_ROBOCASA_HEAD_CAM`` because the robosuite scenes own no such
+    camera and every manipulation run would otherwise pay for a second
+    offscreen render — unset by default, which silently starved
+    ``scenes/deploy/robocasa_navigate.yaml`` + InternVLA-N1 of
+    ``observation.images.head`` (issue #91).
+
+    Derived from the palette, not per-scene bookkeeping: if any
+    capability-matched rSkill declares ``observation.images.head`` in
+    ``sensors_required``, turn it on (setting ``os.environ`` here carries into
+    the HAL via ``_prepare_launch_env``'s ``os.environ.copy()``). Matched
+    against the capability-matched set rather than the post-drop dispatchable
+    one — a nav skill blocked on missing extras costs one wasted render per
+    step, cheaper than one that boots blind.
+
+    An operator-set ``OPENRAL_ROBOCASA_HEAD_CAM`` always wins (including
+    ``=0``, to force it off). Returns True iff this call turned it on.
+    """
+    if _HEAD_CAM_ENV in os.environ:
+        return False
+    if not any(
+        sensor.vla_feature_key == _HEAD_CAM_FEATURE_KEY
+        for manifest in matched
+        for sensor in manifest.sensors_required
+    ):
+        return False
+    os.environ[_HEAD_CAM_ENV] = "1"
+    _console.print(
+        f"[cyan]preflight:[/cyan] {_HEAD_CAM_ENV}=1 — a capability-matched rSkill "
+        f"consumes {_HEAD_CAM_FEATURE_KEY} (RoboCasa renders the forward nav camera)."
+    )
+    return True
+
+
+def _preflight_palette_deps(  # noqa: PLR0912, PLR0915  # reason: linear flow — split would obscure the prompt → install → re-probe contract
+    *,
+    repo_root: Path,
+    robot_yaml: Path,
+    commercial_deployment: bool = False,
+) -> None:
+    """Prompt to install missing extras before the reasoner palette empties.
+
+    Mirrors ``ReasonerNode._maybe_seed_palette_from_search_paths``:
+    loads ``<repo_root>/rskills/*/rskill.yaml``, builds the
+    capability-filtered ``ToolPalette``
+    against the robot's ``RobotCapabilities``, then
+    probes each capability-matching manifest's ``model_family`` for
+    importability. Surfaces missing extras *before* the launch
+    instead of letting the reasoner silently drop them at
+    ``on_configure`` time (the operator only finds out via
+    ``palette_empty`` ticks once everything is up).
+
+    This is ADVISORY, not a gate. The reasoner ALREADY drops
+    unimportable rSkills at ``on_configure``
+    (``openral_sim.policy_deps.filter_importable_manifests``) and
+    runs the importable remainder. The palette is robot-WIDE — a single
+    franka config matches six model families (act / molmoact2 / pi05 /
+    rldx / smolvla / xvla), so a partially-installed venv is the common
+    case and demanding every family's extras to run ONE skill is the
+    wrong contract. So we warn-and-drop, and hard-fail only when the
+    palette would be left empty (nothing dispatchable).
+
+    Behaviour (when ≥1 matching skill is blocked on missing extras):
+
+    * default / ``OPENRAL_AUTO_INSTALL_DEPS=1`` → install the union of
+      missing groups via ``just sync --all-packages --group …``
+      (cwd=repo_root), re-probe, and continue. Same env var honoured by
+      ``openral_sim._assets`` / ``openral_sim._deps``. A non-zero
+      ``just sync`` is a real failure → ``typer.Exit``.
+    * ``OPENRAL_AUTO_INSTALL_DEPS=0`` on a TTY → ``typer.confirm`` the
+      same install; on yes install+re-probe; on no → drop blocked skills.
+    * ``OPENRAL_AUTO_INSTALL_DEPS=0`` non-TTY → drop the blocked skills
+      and proceed, printing the install command as a hint.
+    * In every "proceed" path above: if EVERY matching skill is blocked
+      (palette would be empty) → print the install command and
+      ``typer.Exit(1)`` instead, since the graph could dispatch nothing.
+    * No capability-matching skills are blocked → silent return.
+    """
+    from openral_core import RobotDescription, RSkillManifest
+    from openral_reasoner.palette import build_tool_palette
+    from openral_sim.policy_deps import (
+        can_import_policy_manifest,
+        manifest_install_groups,
+        manifest_install_hint,
+    )
+
+    rskills_dir = repo_root / "rskills"
+    manifest_paths = sorted(rskills_dir.glob("*/rskill.yaml"))
+    if not manifest_paths:
+        return
+
+    try:
+        description = RobotDescription.from_yaml(str(robot_yaml))
+    except (OSError, ValueError):
+        # Robot.yaml will fail loudly downstream — don't double-report here.
+        return
+
+    manifests: list[RSkillManifest] = []
+    for path in manifest_paths:
+        try:
+            manifests.append(RSkillManifest.from_yaml(str(path)))
+        except (OSError, ValueError):
+            # Same "skip unloadable" behaviour as the reasoner seed.
+            continue
+
+    matching = build_tool_palette(
+        installed_skills=manifests,
+        robot_capabilities=description.capabilities,
+        commercial_deployment=commercial_deployment,
+    )
+    matching_ids = matching.execute_rskill_ids
+    if not matching_ids:
+        # Palette would be empty for capability / role / license reasons,
+        # not deps. Reasoner already logs this clearly at on_configure.
+        return
+
+    # Both entrypoints route their palette build through here, so this is the
+    # one place that knows what the reasoner may dispatch before launch.
+    matched_names = set(matching_ids)
+    _apply_palette_head_cam(m for m in manifests if m.name in matched_names)
+
+    blocked: list[tuple[str, str]] = []  # (manifest_name, model_family)
+    install_groups: set[str] = set()
+    for m in manifests:
+        if m.name not in matching_ids:
+            continue
+        family = getattr(m, "model_family", None) or ""
+        ok, _ = can_import_policy_manifest(m)
+        if ok:
+            continue
+        blocked.append((m.name, family))
+        install_groups.update(manifest_install_groups(m))
+
+    if not blocked:
+        return
+
+    _console.print()
+    _console.print(
+        f"[yellow]preflight:[/yellow] {len(blocked)} of "
+        f"{len(matching_ids)} capability-matched rSkill(s) are missing "
+        "Python extras:"
+    )
+    for name, family in blocked:
+        _console.print(f"  • {name}  (model_family={family!r})")
+        manifest = next(item for item in manifests if item.name == name)
+        _console.print(f"      {manifest_install_hint(manifest)}")
+
+    install_cmd: list[str] | None = None
+    if install_groups:
+        groups_argv: list[str] = []
+        for g in sorted(install_groups):
+            groups_argv.extend(["--group", g])
+        # Route through ``just sync`` (not bare ``uv sync``):
+        #   1. ``--all-packages`` is required — without it ``uv sync --group
+        #      <X>`` uninstalls the workspace members (openral-core, ...) and
+        #      the next ROS launch fails with ``No module named
+        #      'openral_core'`` (the exact symptom this preflight prevents).
+        #   2. The libero/robocasa groups pull in ``hf-libero==0.1.3``, whose
+        #      sdist installs both modern and legacy uninstall metadata;
+        #      ``just sync`` repairs that via
+        #      ``scripts/repair_hf_libero_install.py`` so the next
+        #      ``uv sync --all-packages`` doesn't bail with ``Unable to
+        #      uninstall hf-libero==0.1.3``.
+        #   3. ``--inexact`` makes the install additive — without it, ``uv
+        #      sync --group <X>`` exact-matches the group set and uninstalls
+        #      run-critical packages from sibling groups (``timm``/omdet,
+        #      ``robosuite``/robocasa, rldx's ``pyzmq``/``msgpack``). Observed:
+        #      installing the rldx extras wiped ``timm``, breaking the OmDet
+        #      detector every frame — ``/openral/perception/objects`` stayed
+        #      empty (issue #12). ``openral_sim._deps._robocasa_kitchen_plan``
+        #      already uses ``--inexact`` for the same reason.
+        # Resolved eagerly: `just` is a separate binary from the workspace's
+        # `uv`, and a rig provisioned without it fails here with a bare
+        # `FileNotFoundError: 'just'` from subprocess — a traceback that names
+        # neither the missing tool's purpose nor how to get it. Observed on the
+        # lab Thor, whose deploy died after a clean build for want of one
+        # `uv tool install`.
+        if shutil.which("just") is None:
+            raise ROSConfigError(
+                f"this deploy needs extras {sorted(install_groups)} installed, which "
+                "goes through `just sync` — and `just` is not on PATH. Install it with "
+                "`uv tool install rust-just` (then ensure ~/.local/bin is on PATH), or "
+                "set OPENRAL_AUTO_INSTALL_DEPS=0 to skip the install and launch with "
+                "whatever is already in the venv. Refusing rather than dropping to a "
+                "bare `uv sync`, which without --all-packages uninstalls the workspace "
+                "members and breaks the launch it was meant to enable."
+            )
+        install_cmd = ["just", "sync", "--all-packages", "--inexact", *groups_argv]
+
+    # Install by default; set OPENRAL_AUTO_INSTALL_DEPS=0 to prompt on a
+    # TTY or skip on non-TTY (honoured by openral_sim._assets / _deps).
+    auto_install = os.environ.get("OPENRAL_AUTO_INSTALL_DEPS", "1") == "1"
+    is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    attempt_install = install_cmd is not None and (
+        auto_install
+        or (
+            is_interactive
+            and typer.confirm(
+                f"Install missing extras now with `{shlex.join(install_cmd)}`?",
+                default=True,
+            )
+        )
+    )
+
+    if attempt_install:
+        assert install_cmd is not None  # narrowed by attempt_install guard
+        # Propagate the operator's install-consent to the launched graph. The
+        # scene backend's on_configure asset/dep install (openral_sim._assets,
+        # gated on OPENRAL_AUTO_INSTALL_DEPS) must then proceed WITHOUT a second
+        # prompt — otherwise the graph blocks before the MuJoCo viewer opens and
+        # the operator is forced to set the env var by hand. run_launch_invocation
+        # builds the launch env via os.environ.copy(), so setting it here carries
+        # the single "yes, install" answer to every downstream group/asset install,
+        # not just this rSkill-extras step.
+        os.environ["OPENRAL_AUTO_INSTALL_DEPS"] = "1"
+        _console.print(f"[cyan]running:[/cyan] {shlex.join(install_cmd)}")
+        # cwd=repo_root so ``just`` resolves the workspace ``Justfile``
+        # regardless of where the user invoked ``openral deploy sim`` from.
+        completed = subprocess.run(install_cmd, check=False, cwd=str(repo_root))
+        if completed.returncode != 0:
+            # The operator explicitly asked to install (env var / confirm)
+            # and it failed — surface it, don't silently drop and boot a
+            # degraded graph.
+            _console.print(
+                f"[red]uv sync failed (exit {completed.returncode}).[/red] "
+                "Fix the install and re-run ``openral deploy sim``."
+            )
+            raise typer.Exit(code=completed.returncode)
+        # Flush importer caches so the freshly-installed packages are
+        # discoverable on the re-probe (the .venv is the same one this
+        # process runs from; new files on disk need an invalidate to
+        # show up via PathFinder), then recompute the blocked set.
+        importlib.invalidate_caches()
+        blocked = [
+            (name, family)
+            for name, family in blocked
+            if not can_import_policy_manifest(
+                next(manifest for manifest in manifests if manifest.name == name)
+            )[0]
+        ]
+        if not blocked:
+            _console.print("[green]preflight:[/green] extras installed; continuing launch.")
+            return
+        # Partial success — fall through to the drop/empty decision with
+        # the reduced ``blocked`` set.
+
+    # We did NOT fully resolve the missing extras (declined / non-TTY /
+    # no install command / partial install). Preflight is advisory: drop
+    # the blocked skills and proceed so the reasoner runs the importable
+    # remainder — UNLESS that remainder is empty, in which case the graph
+    # could dispatch nothing and we fail fast with the install command.
+    kept_count = len(matching_ids) - len(blocked)
+    if kept_count <= 0:
+        _console.print()
+        if install_cmd is not None:
+            _console.print(
+                "[red]preflight failed:[/red] every capability-matched rSkill is "
+                "blocked on missing extras — the reasoner palette would be empty. "
+                f"Install them:\n  {shlex.join(install_cmd)}"
+            )
+        else:
+            _console.print(
+                "[red]preflight failed:[/red] every capability-matched rSkill is "
+                "blocked — see per-skill hints above."
+            )
+        raise typer.Exit(code=1)
+
+    _console.print()
+    _console.print(
+        f"[yellow]preflight:[/yellow] proceeding — {len(blocked)} skill(s) will be "
+        f"dropped from the reasoner palette; {kept_count} remain dispatchable."
+    )
+    if install_cmd is not None:
+        _console.print(f"  to enable the dropped skill(s): {shlex.join(install_cmd)}")
+
+
+def deploy_sim_command(  # noqa: PLR0915  # reason: linear resolve → print → preflight → launch flow; splitting would scatter the flag contract
+    config: Path = typer.Option(  # reason: typer Option idiom
+        ...,
+        "--config",
+        "-c",
+        exists=True,
+        readable=True,
+        dir_okay=False,
+        help=(
+            "Path to a DeployScene YAML (scenes/deploy/, scene + optional "
+            "robot, no task). Strict: SimScene / BenchmarkScene YAMLs are "
+            "rejected with a redirect to `openral sim run` / "
+            "`openral benchmark scene`."
+        ),
+    ),
+    robot: str | None = typer.Option(
+        None,
+        "--robot",
+        help=(
+            "Override the DeployScene's ``robot_id``. Required when the YAML omits ``robot_id``."
+        ),
+    ),
+    dashboard_port: int = typer.Option(
+        4318,
+        "--dashboard-port",
+        help="OTLP/HTTP port passed through to the launch's dashboard child.",
+    ),
+    reset_to_pose_service: str | None = typer.Option(
+        None,
+        "--reset-to-pose-service",
+        help=(
+            "Override the HAL ``reset_to_pose`` service path. Defaults to "
+            "``/openral/<robot_id>/reset_to_pose``."
+        ),
+    ),
+    approach_skill_id: str | None = typer.Option(
+        None,
+        "--approach-skill-id",
+        help=(
+            "MoveIt approach rSkill URI (e.g. "
+            "``rskills/rskill-moveit-joints``). When set, the runner plans a "
+            "collision-free MoveGroup motion to each skill's starting_pose "
+            "instead of the teleport snap (needs a running move_group). Empty "
+            "keeps the legacy ResetToPose snap."
+        ),
+    ),
+    dataset_out: str | None = typer.Option(
+        None,
+        "--dataset-out",
+        help=(
+            "record the deploy session (proprio + action + camera "
+            "frames + episode markers) to this rosbag2 mcap FILE (not a bag "
+            "directory): its parent must exist and the file must not. "
+            "Recording is segmented by episode markers, which only an "
+            "EXECUTING rSkill emits — a session where every dispatch is "
+            "rejected writes no file (reported as "
+            "`dataset_recorder.nothing_recorded` at shutdown). Convert to a "
+            "LeRobotDataset v3 offline with `openral dataset from-bag`. Empty "
+            "disables recording."
+        ),
+    ),
+    dataset_repo_id: str | None = typer.Option(
+        None,
+        "--dataset-repo-id",
+        help="repo_id for the recorded dataset (default openral/dataset-<robot>).",
+    ),
+    dataset_license: str | None = typer.Option(
+        None,
+        "--dataset-license",
+        help="SPDX license carried into `openral dataset from-bag` (default CC-BY-4.0).",
+    ),
+    hal: list[str] = typer.Option(  # reason: typer Option idiom
+        None,
+        "--hal",
+        help=(
+            "Per-robot HAL parameter override, ``key=value`` (repeatable). "
+            "Value is parsed as JSON when possible (so ``--hal "
+            "viewer_enabled=false`` works); otherwise treated as a string. "
+            "Overrides the per-robot defaults in ``_ROBOT_HAL_REGISTRY``."
+        ),
+    ),
+    enable_slam: bool | None = typer.Option(
+        None,
+        "--enable-slam/--no-enable-slam",
+        help=(
+            "bring up slam_toolbox as a Reasoner-managed "
+            "background service. **Auto by default**: enabled when the "
+            "robot's manifest declares ``capabilities.has_lidar: true``. "
+            "Pass ``--enable-slam`` / ``--no-enable-slam`` to override the "
+            "manifest. The launcher auto-transitions slam_toolbox to "
+            "INACTIVE; the Reasoner promotes to ACTIVE via "
+            'LifecycleTransitionTool(node="/openral_slam_toolbox"). '
+            "Requires ros-${ROS_DISTRO}-slam-toolbox apt-installed and "
+            "the openral_slam_bringup package colcon-built in the "
+            "workspace."
+        ),
+    ),
+    enable_nav2: bool | None = typer.Option(
+        None,
+        "--enable-nav2/--no-enable-nav2",
+        help=(
+            "bring up the Nav2 navigation stack so the "
+            "``OpenRAL/rskill-nav2-mobile_base-navigate_to_pose`` wrapped-action "
+            "rSkill has a ``/navigate_to_pose`` server to dispatch to. "
+            "**Auto by default**: tracks ``--enable-slam`` (lidar-"
+            "equipped robots need a planner to consume the map). "
+            "Requires ros-${ROS_DISTRO}-nav2-bringup apt-installed "
+            "and the openral_nav2_bringup package colcon-built."
+        ),
+    ),
+    object_detector_locator: list[str] | None = typer.Option(
+        None,
+        "--object-detector-locator",
+        help=(
+            "on-demand open-vocab locator to bring up alongside the "
+            "continuous detector (repeatable). A manifest path or a short alias "
+            "(e.g. 'omdet-turbo-locator', 'locateanything-3b-nf4'). Each becomes a "
+            "namespaced locate_in_view node the reasoner picks via the tool's "
+            "'detector' field. Default = omdet-turbo-locator when the detector is "
+            "on and the omdet deps are present; LocateAnything is opt-in (NVIDIA "
+            "non-commercial, 5 GB VRAM, needs the sidecar venv)."
+        ),
+    ),
+    enable_octomap: bool | None = typer.Option(
+        None,
+        "--enable-octomap/--no-enable-octomap",
+        help=(
+            "bring up the world-collision perception leg: "
+            "octomap_server (3-D OcTree from the HAL's depth PointCloud2) "
+            "+ openral_octomap_bridge (octree → /openral/world_voxels) + "
+            "the C++ safety kernel's capsule-vs-voxel check. **Auto by "
+            "default**: enabled when the robot manifest declares a depth "
+            "SensorSpec. Requires ros-${ROS_DISTRO}-octomap-server "
+            "apt-installed and the openral_octomap_bridge package "
+            "colcon-built."
+        ),
+    ),
+    enable_octomap_kernel_check: bool | None = typer.Option(
+        None,
+        "--enable-octomap-kernel-check/--no-enable-octomap-kernel-check",
+        help=(
+            "When --no-enable-octomap-kernel-check, the octomap "
+            "perception leg still publishes /openral/world_voxels (so the "
+            "world-state object-lift works) but the C++ safety kernel's "
+            "capsule-vs-voxel check stays OFF (its --no-enable-octomap posture: "
+            "envelope + self-collision only). Use with --enable-octomap to let "
+            "perception use the world map without the dense-scene false-positive "
+            "E-stop. Unset = the scene's runtime block, else on (bundled "
+            "world-collision-leg behaviour)."
+        ),
+    ),
+    enable_object_detector: bool | None = typer.Option(
+        None,
+        "--object-detector/--no-object-detector",
+        help=(
+            "bring up the ROS-Image object detector "
+            "(openral_perception_ros/ros_image_detector_node): publishes "
+            "ObjectsMetadata to /openral/perception/objects, which the "
+            "world-state node's object-lift raises into /openral/world_voxels. "
+            "**On by default** (unset = the scene's runtime block, else on). "
+            "The default backend is the open-vocabulary "
+            "omdet-turbo-indoor continuous detector (falls back to the in-tree "
+            "RT-DETR COCO ONNX when the omdet deps are absent). Pass "
+            "--no-object-detector to turn the leg off. Requires the "
+            "openral_perception_ros package colcon-built."
+        ),
+    ),
+    object_detector_onnx: Path | None = typer.Option(
+        None,
+        "--object-detector-onnx",
+        help=(
+            "path to the RT-DETR ONNX weights for the legacy / "
+            "fallback detector path. Defaults to the in-tree "
+            "rskills/rtdetr-coco-r18/model.onnx. Passing a path explicitly "
+            "selects the fixed-label RT-DETR backend over the omdet default."
+        ),
+    ),
+    object_detector_manifest: str | None = typer.Option(
+        None,
+        "--object-detector-manifest",
+        help=(
+            "path to a kind:detector rSkill manifest "
+            "(e.g. rskills/locateanything-3b-nf4/rskill.yaml). When set, the "
+            "detector node is manifest-driven: runtime:pytorch brings up the "
+            "open-vocabulary LocateAnything VLM sidecar; runtime:onnx uses "
+            "RT-DETR. A manifest path auto-enables the detector leg (no ONNX "
+            "file needed). The VLM sidecar needs an isolated transformers==4.57.1 "
+            "venv (OPENRAL_LOCATEANYTHING_SIDECAR_VENV) + OPENRAL_ALLOW_NONCOMMERCIAL=1."
+        ),
+    ),
+    object_detector_query: str | None = typer.Option(
+        None,
+        "--object-detector-query",
+        help=(
+            "initial open-vocabulary query for a VLM "
+            "detector (e.g. 'red mug'). Empty = the manifest's detector.labels "
+            "default. Retarget live by publishing a std_msgs/String to "
+            "/openral/perception/detector_query."
+        ),
+    ),
+    enable_reward_monitor: bool | None = typer.Option(
+        None,
+        "--enable-reward-monitor/--no-enable-reward-monitor",
+        help=(
+            "bring up the Robometer reward monitor "
+            "(openral_perception_ros/reward_monitor_node) PARALLEL to the VLA: it "
+            "buffers the agentview RGB stream and serves "
+            "/openral/perception/query_task_progress, and the reasoner is told "
+            "task_progress_available=True so its LLM may poll per-frame "
+            "progress/success whenever it sees fit. Advisory-only. Unset = the "
+            "scene's runtime block, else off. "
+            "Needs the openral_perception_ros package colcon-built and "
+            "Robometer/TOPReward deps in the current env; "
+            "co-resident with a VLA wants a small NF4 VLA on an 8 GB GPU (~3.3 GB)."
+        ),
+    ),
+    enable_scene_vlm: bool | None = typer.Option(
+        None,
+        "--enable-scene-vlm/--no-enable-scene-vlm",
+        help=(
+            "bring up the scene-VLM query service "
+            "(openral_perception_ros/scene_vlm_node) alongside the detectors: it "
+            "caches every manifest RGB camera's latest frame and serves "
+            "/openral/perception/query_scene, and the reasoner is told "
+            "scene_query_available=True so its LLM may ask open-ended questions "
+            "about the current view ('has the robot grasped the mug?'). Read-only. "
+            "Unset = the scene's runtime block, else off. "
+            "Needs the openral_perception_ros package colcon-built and the Qwen VLM "
+            "sidecar provisionable (~3 GB VRAM co-resident)."
+        ),
+    ),
+    enable_critic: bool | None = typer.Option(
+        None,
+        "--enable-critic/--no-enable-critic",
+        help=(
+            "bring up the Tier-C critic producer "
+            "(openral_reasoner_ros/critic_producer_node). It watches the generic "
+            "/openral/critic/score topic that reward models publish (Robometer, a "
+            "future SARM, success classifiers) and emits a Tier-C FailureTrigger on "
+            "/openral/failure/critic when a critic stalls — the reasoner already maps "
+            "that to a forced Tier-C tick (replanning). Advisory-only. Unset = "
+            "the scene's runtime block, else off."
+        ),
+    ),
+    reward_monitor_manifest: str | None = typer.Option(
+        None,
+        "--reward-monitor-manifest",
+        help=(
+            "path to a kind:reward rSkill manifest. Empty defaults to "
+            "the in-tree rskills/robometer-4b/rskill.yaml. weights_uri may be "
+            "hf://org/repo or local:///abs/path (a pre-quantized NF4 checkpoint "
+            "loaded directly as 4-bit). Ignored unless --enable-reward-monitor."
+        ),
+    ),
+    reward_monitor_task: str | None = typer.Option(
+        None,
+        "--reward-monitor-task",
+        help=(
+            "default task instruction the reward monitor scores when a "
+            "query leaves task empty. The reasoner normally passes the active task "
+            "per query. Ignored unless --enable-reward-monitor."
+        ),
+    ),
+    spatial_memory_ingest: bool | None = typer.Option(
+        None,
+        "--spatial-memory-ingest/--no-spatial-memory-ingest",
+        help=(
+            "have the reasoner accumulate a durable "
+            "SpatialMemory from the object-lift producer's "
+            "WorldState.detected_objects so recall_object recalls what the robot "
+            "has seen, and the dashboard shows a scene-objects card + SLAM-map "
+            "markers. **Auto by default**: enabled whenever the object "
+            "detector is."
+        ),
+    ),
+    memory_dir: str | None = typer.Option(
+        None,
+        "--memory-dir",
+        help=(
+            "path to a deploy memory bundle directory. The reasoner "
+            "loads MEMORY.md (semantic memory + memory_write/search tools) from it; "
+            "if the dir also holds scene_graph.json it preloads the 3D world-state "
+            "graph (recall_object), and if it holds map.yaml a nav2 map_server seeds "
+            "the 2D occupancy grid. The dir must exist (the robot writes MEMORY.md "
+            "into it). Overrides the DeployScene's own memory_dir."
+        ),
+    ),
+    dashboard: bool = typer.Option(
+        True,
+        "--dashboard/--no-dashboard",
+        help=(
+            "Auto-spawn the live observability dashboard alongside "
+            "``ros2 launch`` and point OTLP exporters at it. Default: "
+            "on. The dashboard binds to ``--dashboard-port`` (default "
+            "4318) and serves the OpenRAL UI + OTLP/HTTP receiver. "
+            "``--no-dashboard`` is a true headless mode: the dashboard "
+            "child is skipped AND ``OTEL_EXPORTER_OTLP_ENDPOINT`` is "
+            "omitted from every node's env, so the OTel SDK short-"
+            "circuits to no-op (no BatchSpanProcessor → no shutdown "
+            "stall on dead-port retries). Set ``OTEL_EXPORTER_OTLP_"
+            "ENDPOINT`` in the parent shell to forward to an external "
+            "collector instead."
+        ),
+    ),
+    foxglove: bool = typer.Option(
+        False,
+        "--foxglove/--no-foxglove",
+        help=(
+            "spawn the read-only Foxglove WebSocket bridge "
+            "as part of the deploy-sim runtime graph. Default: off. "
+            "When enabled, open Foxglove Studio and connect via "
+            "``ws://127.0.0.1:<foxglove-port>`` to see live cameras, "
+            "joint states, /tf, and the navigation map. **View-only** "
+            "(cannot actuate the robot): ``clientPublish``, "
+            "``services``, and ``parameters`` capabilities are omitted "
+            "from the bridge. Only Bucket-1 topics are exposed "
+            "(safety/e-stop/action topics are never forwarded). "
+            "Requires ``foxglove_bridge`` installed in the workspace "
+            "(ros-${ROS_DISTRO}-foxglove-bridge)."
+        ),
+    ),
+    foxglove_port: int = typer.Option(
+        8765,
+        "--foxglove-port",
+        help=(
+            "Foxglove WebSocket port (ws://127.0.0.1:<port>). "
+            "Default 8765 (the foxglove_bridge upstream default). "
+            "Ignored unless ``--foxglove`` is set."
+        ),
+    ),
+    initial_task: str | None = typer.Option(
+        None,
+        "--initial-task",
+        help=(
+            "Single natural-language goal the reasoner decomposes into ordered subtasks "
+            "via ``decompose_mission``, e.g. ``--initial-task 'pick the bowl and place "
+            "it on the plate, then push the mug back'``. Passed as "
+            "``initial_task_prompt`` to the launch. When omitted, no startup prompt is "
+            "set and the reasoner idles until a manual ``openral prompt`` or dashboard "
+            "prompt arrives."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Print the resolved ``ros2 launch`` argv + HAL params and exit "
+            "without writing the HAL params temp file or shelling out."
+        ),
+    ),
+) -> None:
+    r"""Boot the full ROS graph against a robot's digital-twin HAL.
+
+    Example::
+
+        openral deploy sim --config scenes/deploy/openarm_tabletop.yaml
+        openral deploy sim --config scenes/deploy/openarm_tabletop.yaml \
+                       --hal viewer_enabled=false
+    """
+    try:
+        overrides = _parse_hal_overrides(hal)
+        invocation = resolve_launch_invocation(
+            config=config,
+            robot_override=robot,
+            dashboard_port=dashboard_port,
+            reset_to_pose_service=reset_to_pose_service,
+            approach_skill_id=approach_skill_id,
+            dataset_out=dataset_out,
+            dataset_repo_id=dataset_repo_id,
+            dataset_license=dataset_license,
+            hal_param_overrides=overrides,
+            enable_slam=enable_slam,
+            enable_nav2=enable_nav2,
+            enable_octomap=enable_octomap,
+            enable_octomap_kernel_check=enable_octomap_kernel_check,
+            enable_object_detector=enable_object_detector,
+            object_detector_onnx=object_detector_onnx,
+            object_detector_manifest=object_detector_manifest,
+            object_detector_query=object_detector_query,
+            enable_reward_monitor=enable_reward_monitor,
+            reward_monitor_manifest=reward_monitor_manifest,
+            reward_monitor_task=reward_monitor_task,
+            enable_critic=enable_critic,
+            enable_scene_vlm=enable_scene_vlm,
+            object_detector_locators=object_detector_locator,
+            spatial_memory_ingest=spatial_memory_ingest,
+            memory_dir=memory_dir,
+            enable_dashboard=dashboard,
+            enable_foxglove=foxglove,
+            foxglove_port=foxglove_port,
+            initial_task_prompt=initial_task,
+        )
+    except ROSConfigError as exc:
+        _console.print(f"[red]config error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    _console.print(
+        f"[cyan]deploy sim[/cyan] → robot=[bold]{invocation.robot_id}[/bold] "
+        f"(manifest.name=[bold]{invocation.robot_manifest_name}[/bold]) "
+        f"hal_package=[bold]{invocation.hal.package}[/bold] "
+        f"hal_node_name=[bold]{invocation.hal.node_name}[/bold]"
+    )
+    _console.print(f"  robot_yaml:    {invocation.robot_yaml}")
+    _console.print(f"  reset_service:    {invocation.reset_to_pose_service}")
+    _console.print(f"  approach_skill:   {invocation.approach_skill_id or '(snap)'}")
+    _console.print(f"  hal_params:    {invocation.hal_params}")
+    _console.print(
+        "  slam:          "
+        + (
+            "[green]enabled[/green] (auto from robot.capabilities.has_lidar — "
+            "Reasoner drives → ACTIVE via LifecycleTransitionTool)"
+            if invocation.enable_slam
+            else "[dim]disabled[/dim] (robot.capabilities.has_lidar=false; "
+            "pass --enable-slam to force on)"
+        )
+    )
+    _console.print(
+        "  nav2:          "
+        + (
+            "[green]enabled[/green] (Nav2 advertises /navigate_to_pose; "
+            "Reasoner dispatches OpenRAL/rskill-nav2-mobile_base-navigate_to_pose)"
+            if invocation.enable_nav2
+            else "[dim]disabled[/dim] (tracks --enable-slam; pass --enable-nav2 to force on)"
+        )
+    )
+    _console.print(
+        "  octomap:       "
+        + (
+            "[green]enabled[/green] (octomap_server + bridge → "
+            "/openral/world_voxels; kernel voxel check on when the robot "
+            "has collision capsules)"
+            if invocation.enable_octomap
+            else "[dim]disabled[/dim] (no depth SensorSpec; pass --enable-octomap to force on)"
+        )
+    )
+    _console.print(
+        "  detector:      "
+        + (
+            f"[green]enabled[/green] (ros_image_detector_node → "
+            f"/openral/perception/objects → object-lift; onnx="
+            f"{invocation.object_detector_onnx})"
+            if invocation.enable_object_detector
+            else "[dim]disabled[/dim] (onnx weights not found at "
+            f"{invocation.object_detector_onnx}; pass --enable-object-detector "
+            "to force on)"
+        )
+    )
+    _console.print(
+        "  dashboard:     "
+        + (
+            f"[green]auto-spawn[/green] at http://127.0.0.1:{dashboard_port}/"
+            if dashboard
+            else "[dim]disabled[/dim] (pass --dashboard to auto-spawn)"
+        )
+    )
+    _console.print(
+        "  foxglove:      "
+        + (
+            f"[green]enabled[/green] (view-only, cannot actuate) at ws://127.0.0.1:{foxglove_port}"
+            if foxglove
+            else "[dim]disabled[/dim] (pass --foxglove to enable read-only live scene view)"
+        )
+    )
+    _console.print("  envelope:      synthesised at launch time from robot.yaml (no envelope file)")
+    _console.print(
+        "  startup_prompt: "
+        + (
+            f"[green]{invocation.initial_task_prompt!r}[/green] "
+            "(from --initial-task; delivered to reasoner at activate)"
+            if invocation.initial_task_prompt
+            else "[dim](none — reasoner idles until openral prompt or dashboard)[/dim]"
+        )
+    )
+
+    if dry_run:
+        printed = [
+            arg.replace("HAL_PARAMS_FILE_PLACEHOLDER", "<hal-params-tmp>")
+            for arg in invocation.argv_template
+        ]
+        _console.print(f"  argv: {shlex.join(printed)}")
+        return
+
+    if shutil.which("ros2") is None:
+        _console.print(
+            "[red]ros2 not found on PATH.[/red] Source your ROS 2 install "
+            "(e.g. ``source /opt/ros/jazzy/setup.bash``) and the OpenRAL "
+            "workspace overlay (``source install/setup.bash``) before "
+            "``openral deploy sim``."
+        )
+        raise typer.Exit(code=1)
+
+    # Pre-flight: ``ros2`` is on PATH, but is the OpenRAL workspace
+    # overlay sourced and current? ``ros2 launch`` would otherwise fail
+    # with a terse "Package 'openral_rskill_ros' not found, searching:
+    # ['/opt/ros/jazzy']" — the same wording for missing overlay AND
+    # for a stale build that omits the HAL. Catch both up front.
+    try:
+        assert_ros2_packages_discoverable(_required_ros2_packages(invocation))
+    except ROSConfigError as exc:
+        _console.print(f"[red]config error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    # Provision the scene's sim backend now, not inside the HAL's
+    # ``on_configure``. Deliberately AFTER the overlay check above, so a
+    # missing ``openral_rskill_ros`` fails in a second instead of after an
+    # 11 GB download. See ``_preflight_scene_assets``.
+    _preflight_scene_assets(config)
+
+    _reap_orphans_with_log()
+
+    # Probe the in-tree rSkill registry against this robot's
+    # capabilities. If every capability-matching skill is blocked by a
+    # missing extras group, prompt-and-install on a TTY, or fail with
+    # the install command non-interactively. Without this the reasoner
+    # silently degrades to ``palette_empty`` ticks once everything is
+    # up — the user gets a running but useless deploy.
+    _preflight_palette_deps(
+        repo_root=_repo_root_from(Path(__file__)),
+        robot_yaml=Path(invocation.robot_yaml),
+    )
+
+    # VLA↔reward VRAM pair preflight. A VLA must run with its reward
+    # model resident; verify the pair fits the GPU BEFORE bringing up
+    # ROS. No-op unless the reward monitor is active and the GPU budget is readable;
+    # hard-exits (before launch) when no capability-matched VLA can co-reside with
+    # the reward model.
+    if invocation.enable_reward_monitor and invocation.reward_monitor_manifest:
+        from openral_core import RobotDescription
+
+        _preflight_reward_vram_fit(
+            repo_root=_repo_root_from(Path(__file__)),
+            description=RobotDescription.from_yaml(str(invocation.robot_yaml)),
+            reward_manifest_path=invocation.reward_monitor_manifest,
+            gpu_budget_gb=_detect_gpu_free_vram_gb(),
+        )
+
+    # Write the ephemeral HAL params YAML (lifetime = subprocess) and
+    # substitute its path into argv. ROS 2 parameter YAML uses the
+    # ``/**`` wildcard so the file binds against the HAL's node name
+    # regardless of robot. SIM115's "use a context manager" doesn't
+    # fit — the file must outlive the Python ``with`` block so the
+    # spawned HAL process can open it.
+    hal_params_tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115  # reason: HAL reads after this scope
+        mode="w",
+        prefix=f"openral-hal-params-{invocation.robot_id}-",
+        suffix=".yaml",
+        delete=False,
+        encoding="utf-8",
+    )
+    try:
+        yaml.safe_dump(
+            {"/**": {"ros__parameters": invocation.hal_params}},
+            hal_params_tmp,
+            sort_keys=False,
+        )
+        hal_params_tmp.close()
+
+        argv = [
+            arg.replace("HAL_PARAMS_FILE_PLACEHOLDER", hal_params_tmp.name)
+            for arg in invocation.argv_template
+        ]
+        _console.print(f"  hal_params_tmp:{hal_params_tmp.name}")
+        _console.print(f"  argv: {shlex.join(argv)}")
+
+        # `ros2 launch` runs under the system Python by default; deferred
+        # imports (openral_core, openral_safety) live in the workspace venv.
+        # Export `OPENRAL_VENV_SITE` (the launch file processes editable
+        # .pth files via `site.addsitedir` keyed on it) alongside PYTHONPATH,
+        # and prepend the venv's bin dir to PATH so `#!/usr/bin/env python3`
+        # shebangs on spawned nodes resolve to the venv interpreter — the
+        # only one that processes .pth files via site.py at startup
+        # (PYTHONPATH alone does not trigger that).
+        venv_env = _prepare_launch_env(hal_mode=invocation.hal_mode)
+        # Both directions, one rule — see the twin call in
+        # ``run_launch_invocation``. Runs against ``venv_env`` because that is
+        # the scope the launch will actually use (#227).
+        _assert_graph_unoccupied_or_exit(venv_env, hal_mode=invocation.hal_mode)
+
+        # The dashboard child is spawned by ``deploy_e2e.launch.py`` itself
+        # (gated on ``enable_dashboard:=true`` forwarded from ``dashboard``
+        # above) — do not also wrap this in ``attached_dashboard(...)``,
+        # which double-spawns it and trips ``[Errno 98] address already in
+        # use``.
+        #
+        # ``_run_launch`` (not a bare ``subprocess.run``) puts the launch
+        # in its own session and forwards SIGINT/SIGTERM to the group so
+        # every node — and the static_transform_publisher /
+        # robot_state_publisher / HAL it spawns — is reaped on shutdown
+        # instead of orphaning onto ``/tf_static`` + the GPU.
+        returncode = _run_launch(argv, venv_env)
+        raise typer.Exit(code=returncode)
+    finally:
+        with contextlib.suppress(OSError):
+            Path(hal_params_tmp.name).unlink(missing_ok=True)

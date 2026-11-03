@@ -1,0 +1,735 @@
+"""Unit tests for openral doctor check functions."""
+
+from __future__ import annotations
+
+import json
+import sys
+from importlib.metadata import PackageNotFoundError
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+from openral_cli.main import (
+    CheckResult,
+    _check_colcon,
+    _check_compute_spec,
+    _check_gpu,
+    _check_just,
+    _check_openral_core,
+    _check_platform,
+    _check_python,
+    _check_reasoner_llm,
+    _check_ros2,
+    _check_usb,
+    _gather_checks,
+    app,
+)
+from typer.testing import CliRunner
+
+runner = CliRunner()
+
+
+# ── _check_python ─────────────────────────────────────────────────────────────
+
+
+def test_check_python_ok() -> None:
+    assert _check_python().status == "ok"
+    assert _check_python().check == "Python"
+
+
+def test_check_python_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "version_info", (3, 9, 0))
+    assert _check_python().status == "fail"
+
+
+# ── _check_platform ───────────────────────────────────────────────────────────
+
+
+def test_check_platform_info() -> None:
+    result = _check_platform()
+    assert result.status == "info"
+    assert result.details != ""
+
+
+# ── _check_openral_core ───────────────────────────────────────────────────
+
+
+def test_check_openral_core_ok() -> None:
+    with patch("openral_cli.main.version", return_value="0.1.0"):
+        result = _check_openral_core()
+    assert result.status == "ok"
+    assert result.details == "0.1.0"
+
+
+def test_check_openral_core_missing() -> None:
+    with patch("openral_cli.main.version", side_effect=PackageNotFoundError("x")):
+        result = _check_openral_core()
+    assert result.status == "fail"
+
+
+# ── _check_ros2 ───────────────────────────────────────────────────────────────
+
+
+def test_check_ros2_binary_absent() -> None:
+    # `absent`, not `missing`: Tier-0 (the curl-bash installer) ships no ROS 2
+    # by design, and `missing` is fatal to `openral doctor`'s exit code.
+    with patch("openral_cli.main.shutil.which", return_value=None):
+        results = _check_ros2()
+    assert len(results) == 1
+    assert results[0].status == "absent"
+    assert "openral install ros" in results[0].details
+
+
+def test_check_ros2_binary_found_distro_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ROS_DISTRO", "jazzy")
+    monkeypatch.delenv("RMW_IMPLEMENTATION", raising=False)
+    with patch("openral_cli.main.shutil.which", return_value="/usr/bin/ros2"):
+        results = _check_ros2()
+    checks = {r.check: r for r in results}
+    assert checks["ROS 2 binary"].status == "ok"
+    assert checks["ROS 2 distro"].status == "ok"
+    assert checks["ROS 2 distro"].details == "jazzy"
+    assert checks["RMW"].status == "info"
+
+
+def test_check_ros2_distro_not_sourced(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ROS_DISTRO", raising=False)
+    monkeypatch.delenv("RMW_IMPLEMENTATION", raising=False)
+    with (
+        patch("openral_cli.main.shutil.which", return_value="/usr/bin/ros2"),
+        patch("openral_cli.main.glob", return_value=["/opt/ros/jazzy/setup.bash"]),
+    ):
+        results = _check_ros2()
+    checks = {r.check: r for r in results}
+    assert checks["ROS 2 distro"].status == "info"
+    assert "jazzy" in checks["ROS 2 distro"].details
+
+
+def test_check_ros2_no_opt_ros(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ROS_DISTRO", raising=False)
+    with (
+        patch("openral_cli.main.shutil.which", return_value="/usr/bin/ros2"),
+        patch("openral_cli.main.glob", return_value=[]),
+    ):
+        results = _check_ros2()
+    checks = {r.check: r for r in results}
+    assert checks["ROS 2 distro"].status == "missing"
+
+
+# ── _check_colcon ─────────────────────────────────────────────────────────────
+
+
+def test_check_colcon_present() -> None:
+    with patch("openral_cli.main.shutil.which", return_value="/usr/bin/colcon"):
+        assert _check_colcon().status == "ok"
+
+
+def test_check_colcon_absent() -> None:
+    # Same reasoning as test_check_ros2_binary_absent: colcon arrives with the
+    # ROS 2 bootstrap, which Tier-0 does not run.
+    with patch("openral_cli.main.shutil.which", return_value=None):
+        result = _check_colcon()
+    assert result.status == "absent"
+    assert "openral install ros" in result.details
+
+
+# ── _check_gpu ────────────────────────────────────────────────────────────────
+
+
+def _gpu_probe_stub(*, nvidia=None, jetson=None, apple_silicon=None, backend="none"):
+    from openral_detect.report import GpuProbeResult
+
+    return GpuProbeResult(
+        nvidia=nvidia or [],
+        jetson=jetson,
+        apple_silicon=apple_silicon,
+        backend=backend,
+    )
+
+
+def test_check_gpu_nvidia_ok() -> None:
+    from openral_detect.report import NvidiaGpuInfo
+
+    nv = NvidiaGpuInfo(
+        index=0,
+        name="NVIDIA GeForce RTX 4090",
+        vram_total_mib=24576,
+        vram_free_mib=24000,
+        pci_bus_id="0000:01:00.0",
+        driver_version="550.78",
+        cuda_compute_capability=(8, 9),
+    )
+    probe = _gpu_probe_stub(nvidia=[nv], backend="nvml")
+    results = _check_gpu(probe, [])
+    assert len(results) == 1
+    assert results[0].status == "ok"
+    assert "RTX 4090" in results[0].details
+    assert "24576 MiB" in results[0].details
+
+
+def test_check_gpu_multi() -> None:
+    from openral_detect.report import NvidiaGpuInfo
+
+    cards = [
+        NvidiaGpuInfo(
+            index=0,
+            name="Tesla T4",
+            vram_total_mib=15360,
+            vram_free_mib=15000,
+            pci_bus_id="0000:01:00.0",
+            driver_version="550",
+            cuda_compute_capability=(7, 5),
+        ),
+        NvidiaGpuInfo(
+            index=1,
+            name="RTX 3090",
+            vram_total_mib=24576,
+            vram_free_mib=24000,
+            pci_bus_id="0000:02:00.0",
+            driver_version="550",
+            cuda_compute_capability=(8, 6),
+        ),
+    ]
+    probe = _gpu_probe_stub(nvidia=cards, backend="nvml")
+    results = _check_gpu(probe, [])
+    assert len(results) == 2
+    assert results[0].check == "GPU 0"
+    assert results[1].check == "GPU 1"
+
+
+def test_check_gpu_nvsmi_query_fails() -> None:
+    # Probe failed → empty result with a warning; doctor surfaces "absent".
+    probe = _gpu_probe_stub()
+    results = _check_gpu(probe, ["nvml unavailable"])
+    assert results[0].status == "absent"
+
+
+def test_check_gpu_absent_non_mac() -> None:
+    probe = _gpu_probe_stub()
+    results = _check_gpu(probe, [])
+    assert results[0].status == "absent"
+
+
+def test_check_gpu_apple_silicon() -> None:
+    from openral_detect.report import AppleSiliconInfo
+
+    probe = _gpu_probe_stub(
+        apple_silicon=AppleSiliconInfo(chip="Apple M3 Max", gpu_cores=40),
+        backend="system_profiler",
+    )
+    results = _check_gpu(probe, [])
+    assert results[0].status == "info"
+    assert "Apple Silicon" in results[0].details
+
+
+# ── _check_usb ────────────────────────────────────────────────────────────────
+
+
+def test_check_usb_linux_devices_found() -> None:
+    with (
+        patch("openral_cli.main.platform.system", return_value="Linux"),
+        patch(
+            "openral_cli.main.glob",
+            side_effect=lambda p: ["/dev/ttyUSB0"] if "ttyUSB" in p else [],
+        ),
+    ):
+        results = _check_usb()
+    assert results[0].status == "ok"
+    assert "/dev/ttyUSB0" in results[0].details
+
+
+def test_check_usb_linux_none() -> None:
+    with (
+        patch("openral_cli.main.platform.system", return_value="Linux"),
+        patch("openral_cli.main.glob", return_value=[]),
+    ):
+        results = _check_usb()
+    assert results[0].status == "info"
+    assert "none" in results[0].details
+
+
+def test_check_usb_windows() -> None:
+    with patch("openral_cli.main.platform.system", return_value="Windows"):
+        results = _check_usb()
+    assert results[0].status == "info"
+
+
+# ── _check_just ───────────────────────────────────────────────────────────────
+
+
+def test_check_just_present() -> None:
+    with patch("openral_cli.main.shutil.which", return_value="/usr/local/bin/just"):
+        assert _check_just().status == "ok"
+
+
+def test_check_just_missing_with_a_justfile_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `just` absence is non-fatal (`warn`, not `missing`) so `openral doctor`
+    # still exits 0 on hosts that only need to run skills.
+    (tmp_path / "Justfile").write_text("default:\n    @echo hi\n")
+    monkeypatch.chdir(tmp_path)
+    with patch("openral_cli.main.shutil.which", return_value=None):
+        assert _check_just().status == "warn"
+
+
+def test_check_just_missing_without_a_justfile_is_not_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A Tier-0 curl-bash install has no checkout, so there are no recipes for
+    # `just` to run. Warning there is noise, not a finding.
+    monkeypatch.chdir(tmp_path)
+    with patch("openral_cli.main.shutil.which", return_value=None):
+        result = _check_just()
+    assert result.status == "info"
+    assert "no Justfile" in result.details
+
+
+# ── _check_reasoner_llm ───────────────────────────────────────────────────────
+
+
+_REASONER_ENV = (
+    "OPENRAL_REASONER_MODEL",
+    "OPENRAL_REASONER_ENDPOINT",
+    "OPENRAL_REASONER_API_KEY",
+    "OPENRAL_REASONER_DIALECT",
+    "OPENRAL_REASONER_MAX_TOKENS",
+    "OPENRAL_REASONER_TIMEOUT_S",
+    "OPENRAL_REASONER_LLM_PROVIDER",
+    "OPENRAL_REASONER_LLM_MODEL",
+    "OPENRAL_REASONER_LLM_API_KEY",
+    "OPENRAL_REASONER_LLM_BASE_URL",
+    "OPENRAL_REASONER_LLM_MAX_TOKENS",
+    "OPENRAL_REASONER_LLM_TIMEOUT_S",
+    "OPENRAL_COSMOS3_AUTOSTART",
+)
+
+
+@pytest.fixture
+def _clear_reasoner_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in _REASONER_ENV:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_check_reasoner_llm_absent(_clear_reasoner_env: None) -> None:
+    rows = _check_reasoner_llm()
+    assert len(rows) == 1
+    assert rows[0].check == "Reasoner LLM"
+    assert rows[0].status == "absent"
+    assert "OPENRAL_REASONER_MODEL" in rows[0].details
+    assert "packages/openral_reasoner_ros/README.md" in rows[0].details
+
+
+def test_check_reasoner_legacy_provider_env_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """The retired provider-first env selects nothing (removed in 0.3.0).
+
+    doctor must report the same "no model configured" row it reports for an
+    empty environment, and point at the model-first replacement — not diagnose
+    a contract the factory no longer reads.
+    """
+    monkeypatch.setenv("OPENRAL_REASONER_LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("OPENRAL_REASONER_LLM_MODEL", "claude-haiku-4-5")
+    monkeypatch.setenv("OPENRAL_REASONER_LLM_API_KEY", "sk-ant-secret")
+    rows = _check_reasoner_llm()
+    assert len(rows) == 1
+    assert rows[0].status == "absent"
+    assert "OPENRAL_REASONER_MODEL" in rows[0].details
+
+
+def test_check_reasoner_curated_model_missing_key(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "gpt-5.5")
+    rows = _check_reasoner_llm()
+    summary = next(r for r in rows if r.check == "Reasoner LLM")
+    assert summary.status == "warn"
+    assert "model=gpt-5.5" in summary.details
+    assert "hosting=cloud" in summary.details
+    key_row = next(r for r in rows if r.check == "Reasoner API_KEY")
+    assert key_row.status == "missing"
+    assert "OPENRAL_REASONER_API_KEY" in key_row.details
+
+
+def test_check_reasoner_anthropic_override_still_needs_key(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "claude-opus-4-8")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", "https://anthropic-proxy.internal")
+    rows = _check_reasoner_llm()
+    assert next(r for r in rows if r.check == "Reasoner LLM").status == "warn"
+    assert next(r for r in rows if r.check == "Reasoner API_KEY").status == "missing"
+
+
+def test_check_reasoner_curated_cosmos_managed(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "cosmos3-edge")
+    rows = _check_reasoner_llm()
+    summary = next(r for r in rows if r.check == "Reasoner LLM")
+    assert summary.status == "ok"
+    assert "hosting=managed_local" in summary.details
+    assert "127.0.0.1:8901/v1" in summary.details
+    assert any(r.check == "Cosmos 3" for r in rows)
+
+
+def test_check_reasoner_uncurated_model_needs_escape_hatch(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "qwen3:8b")
+    rows = _check_reasoner_llm()
+    assert rows[0].status == "fail"
+    assert "OPENRAL_REASONER_ENDPOINT" in rows[0].details
+    assert "OPENRAL_REASONER_DIALECT" in rows[0].details
+
+
+def test_check_reasoner_named_endpoint_supplies_dialect(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """A named endpoint carries its own dialect, so DIALECT stays optional.
+
+    doctor must resolve `ENDPOINT=<name>` the way the factory does; reporting
+    `fail` for config that builds a client at runtime is worse than silence.
+    """
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "qwen3:8b")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", "ollama")
+    rows = _check_reasoner_llm()
+    summary = next(r for r in rows if r.check == "Reasoner LLM")
+    assert summary.status == "warn"
+    assert "dialect=openai" in summary.details
+    assert "endpoint=http://localhost:11434/v1" in summary.details
+    # Loopback daemons enforce no auth, so an unset key is not a gap here.
+    assert not any(r.status == "fail" for r in rows)
+    assert not any(r.check == "Reasoner API_KEY" for r in rows)
+
+
+def test_check_reasoner_named_endpoint_enforces_auth(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """An auth-required named endpoint still reports the missing key."""
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "qwen3:8b")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", "openrouter")
+    rows = _check_reasoner_llm()
+    assert next(r for r in rows if r.check == "Reasoner LLM").status == "warn"
+    key_row = next(r for r in rows if r.check == "Reasoner API_KEY")
+    assert key_row.status == "missing"
+
+
+def test_check_reasoner_curated_model_resolves_named_endpoint(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """A curated model pointed at a named endpoint resolves it to the URL too.
+
+    Left unresolved the literal name reaches the SDK as a base URL, and the
+    loopback probe never fires because "ollama" has no hostname.
+    """
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "gpt-5.5")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", "vllm")
+    summary = next(r for r in _check_reasoner_llm() if r.check == "Reasoner LLM")
+    assert "endpoint=http://localhost:8000/v1" in summary.details
+
+
+def test_check_reasoner_dialect_clash_fails(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """A named endpoint cannot re-dialect a curated model — doctor says so too.
+
+    The factory refuses this outright; reporting `ok` would tell the operator
+    their config is fine right up until the reasoner refuses to configure.
+    """
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "claude-opus-4-8")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", "ollama")
+    monkeypatch.setenv("OPENRAL_REASONER_API_KEY", "sk-ant-secret")
+    rows = _check_reasoner_llm()
+    assert len(rows) == 1
+    assert rows[0].status == "fail"
+    assert "dialect" in rows[0].details
+
+
+def test_check_reasoner_named_endpoint_auth_posture_wins(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """A no-auth named endpoint clears the key requirement for a curated model."""
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "gpt-5.5")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", "vllm")
+    rows = _check_reasoner_llm()
+    assert next(r for r in rows if r.check == "Reasoner LLM").status == "ok"
+    assert not any(r.check == "Reasoner API_KEY" for r in rows)
+
+
+def test_check_reasoner_curated_model_ok_redacts_key(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "claude-opus-4-8")
+    monkeypatch.setenv("OPENRAL_REASONER_API_KEY", "sk-ant-secret-12345")
+    rows = _check_reasoner_llm()
+    summary = next(r for r in rows if r.check == "Reasoner LLM")
+    assert summary.status == "ok"
+    assert "model=claude-opus-4-8" in summary.details
+    assert "dialect=anthropic" in summary.details
+    assert "api_key=set" in summary.details
+    # API key value must never appear in the rendered output.
+    assert "sk-ant-secret-12345" not in summary.details
+
+
+def test_check_reasoner_uncurated_model_ok_redacts_key(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """The escape-hatch row redacts the key too, not just the curated path."""
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "claude-haiku-4-5")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", "anthropic")
+    monkeypatch.setenv("OPENRAL_REASONER_API_KEY", "sk-ant-secret-12345")
+    summary = next(r for r in _check_reasoner_llm() if r.check == "Reasoner LLM")
+    assert summary.status == "warn"  # uncurated
+    assert "api_key=set" in summary.details
+    assert "sk-ant-secret-12345" not in summary.details
+
+
+def test_check_reasoner_cosmos_autostart_disabled_warns(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """With OPENRAL_COSMOS3_AUTOSTART disabled, a down endpoint is a real
+    problem: the probe row must keep `warn` severity and must NOT claim the
+    server auto-starts."""
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "cosmos3-edge")
+    monkeypatch.setenv("OPENRAL_COSMOS3_AUTOSTART", "0")
+    rows = _check_reasoner_llm()
+    probe = next(r for r in rows if r.check == "Cosmos 3")
+    if probe.status != "ok":  # nothing listening on 8901 in the test env
+        assert probe.status == "warn"
+        assert "auto-starts" not in probe.details
+        assert "AUTOSTART is disabled" in probe.details
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "base_url_fragment"),
+    [
+        ("openrouter", "openrouter.ai/api/v1"),
+        ("gemini", "generativelanguage.googleapis.com"),
+        ("xai", "api.x.ai/v1"),
+        ("deepseek", "api.deepseek.com"),
+        ("huggingface", "router.huggingface.co/v1"),
+    ],
+)
+def test_check_reasoner_named_cloud_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    _clear_reasoner_env: None,
+    endpoint: str,
+    base_url_fragment: str,
+) -> None:
+    """A named cloud endpoint resolves its vendor URL and probes nothing."""
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "some-model")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", endpoint)
+    monkeypatch.setenv("OPENRAL_REASONER_API_KEY", f"sk-{endpoint}-secret")
+    rows = _check_reasoner_llm()
+    summary = next(r for r in rows if r.check == "Reasoner LLM")
+    assert base_url_fragment in summary.details
+    assert not any(r.check == "Reasoner endpoint" for r in rows)
+    assert not any(r.status == "fail" for r in rows)
+
+
+def test_check_reasoner_named_cloud_endpoint_missing_key(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """A named cloud endpoint without an API key reports the missing key row."""
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "deepseek-chat")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", "deepseek")
+    rows = _check_reasoner_llm()
+    key_row = next(r for r in rows if r.check == "Reasoner API_KEY")
+    assert key_row.status == "missing"
+    assert "deepseek" in key_row.details
+
+
+def test_check_reasoner_named_local_endpoint_probes_loopback(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """`ENDPOINT=vllm` resolves the :8000 loopback default and probes it."""
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "qwen2.5-7b-instruct")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", "vllm")
+    rows = _check_reasoner_llm()
+    summary = next(r for r in rows if r.check == "Reasoner LLM")
+    assert "localhost:8000/v1" in summary.details
+    # Auth is not required for a loopback daemon, so no key row.
+    assert not any(r.check == "Reasoner API_KEY" for r in rows)
+    assert any(r.check == "Reasoner endpoint" for r in rows)
+
+
+def test_check_reasoner_local_endpoint_unreachable(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """A down BYO-local endpoint is a real `warn`, with a start-your-server hint."""
+    # Port 1 is guaranteed-closed (privileged, never bound by a dev tool).
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "qwen3:8b")
+    monkeypatch.setenv("OPENRAL_REASONER_ENDPOINT", "http://127.0.0.1:1/v1")
+    monkeypatch.setenv("OPENRAL_REASONER_DIALECT", "openai")
+    probe = next(r for r in _check_reasoner_llm() if r.check == "Reasoner endpoint")
+    assert probe.status == "warn"
+    assert "unreachable at 127.0.0.1:1" in probe.details
+
+
+def test_check_reasoner_cloud_endpoint_emits_no_probe(
+    monkeypatch: pytest.MonkeyPatch, _clear_reasoner_env: None
+) -> None:
+    """Cloud base URLs must emit no probe row — doctor never reaches out."""
+    monkeypatch.setenv("OPENRAL_REASONER_MODEL", "gpt-5.5")
+    monkeypatch.setenv("OPENRAL_REASONER_API_KEY", "sk-or-secret")
+    rows = _check_reasoner_llm()
+    assert not any(r.check == "Reasoner endpoint" for r in rows)
+
+
+# ── _gather_checks ────────────────────────────────────────────────────────────
+
+
+def test_gather_checks_returns_list() -> None:
+    checks = _gather_checks()
+    assert len(checks) >= 7
+    assert all(isinstance(c, CheckResult) for c in checks)
+    names = [c.check for c in checks]
+    assert "Python" in names
+    assert "Platform" in names
+    # ComputeSpec rows always present regardless of GPU availability (tier label varies)
+    assert any("ComputeSpec" in n and "runtimes" in n for n in names)
+    assert any("ComputeSpec" in n and "dtypes" in n for n in names)
+    assert any("ComputeSpec" in n and "cuMotion" in n for n in names)
+    assert any("ComputeSpec" in n and "NVMM" in n for n in names)
+
+
+# ── _check_compute_spec ───────────────────────────────────────────────────────
+
+
+def test_check_compute_spec_cpu_only() -> None:
+    probe = _gpu_probe_stub()
+    rows = _check_compute_spec(probe)
+    # CPU-only → "local" tier
+    checks = {r.check: r for r in rows}
+    assert "ComputeSpec (local) / runtimes" in checks
+    assert "ComputeSpec (local) / dtypes" in checks
+    cumotion = checks["ComputeSpec (local) / cuMotion"]
+    assert cumotion.status == "info"
+    assert "not supported" in cumotion.details
+
+
+def test_check_compute_spec_ampere_cuda13_qualifies_cumotion() -> None:
+    from openral_detect.report import NvidiaGpuInfo
+
+    nv = NvidiaGpuInfo(
+        index=0,
+        name="RTX 4090",
+        vram_total_mib=24576,
+        vram_free_mib=24000,
+        pci_bus_id="0000:01:00.0",
+        driver_version="550.78",
+        cuda_compute_capability=(8, 9),
+        cuda_toolkit_version="13.2",
+    )
+    probe = _gpu_probe_stub(nvidia=[nv], backend="nvml")
+    rows = _check_compute_spec(probe)
+    # Discrete NVIDIA → "local" tier
+    checks = {r.check: r for r in rows}
+    assert checks["ComputeSpec (local) / cuMotion"].status == "ok"
+    assert checks["ComputeSpec (local) / cuMotion"].details == "supported"
+
+
+def test_check_compute_spec_runtimes_include_tensorrt_for_nvidia() -> None:
+    from openral_detect.report import NvidiaGpuInfo
+
+    nv = NvidiaGpuInfo(
+        index=0,
+        name="RTX 3090",
+        vram_total_mib=24576,
+        vram_free_mib=24000,
+        pci_bus_id="0000:01:00.0",
+        driver_version="550",
+        cuda_compute_capability=(8, 6),
+    )
+    probe = _gpu_probe_stub(nvidia=[nv], backend="nvml")
+    rows = _check_compute_spec(probe)
+    # Discrete NVIDIA → "local" tier
+    runtimes_row = next(r for r in rows if "runtimes" in r.check)
+    assert "tensorrt" in runtimes_row.details
+
+
+def test_check_compute_spec_nvmm_row_present() -> None:
+    probe = _gpu_probe_stub()
+    rows = _check_compute_spec(probe)
+    nvmm = next(r for r in rows if "NVMM" in r.check)
+    assert nvmm.status in ("ok", "absent")
+
+
+# ── CLI integration (typer CliRunner) ─────────────────────────────────────────
+
+
+def test_doctor_table_output() -> None:
+    result = runner.invoke(app, ["doctor"])
+    assert "openral doctor" in result.output
+    assert "Python" in result.output
+
+
+def test_doctor_json_output() -> None:
+    result = runner.invoke(app, ["doctor", "--json"])
+    data: list[Any] = json.loads(result.output)
+    assert isinstance(data, list)
+    assert all({"check", "status", "details"} <= set(row.keys()) for row in data)
+    names = [row["check"] for row in data]
+    assert "Python" in names
+
+
+def test_doctor_exits_1_on_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "version_info", (3, 9, 0))
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 1
+
+
+def test_doctor_exits_0_on_all_ok() -> None:
+    """Patch all checks to return 'ok'/'info' statuses."""
+    happy: list[CheckResult] = [
+        CheckResult("Python", "ok", "3.12.0"),
+        CheckResult("Platform", "info", "Linux 6.0"),
+    ]
+    with patch("openral_cli.main._gather_checks", return_value=happy):
+        result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0
+
+
+def test_doctor_exits_0_on_tier0_host() -> None:
+    """A Tier-0 install (curl-bash: no sudo, no apt, so no ROS 2) is healthy.
+
+    Regression: `scripts/install.sh` advertises `openral doctor` as the first
+    quick-start command, so exiting non-zero here turned the documented
+    `curl … | bash && openral doctor` sequence red in CI. ROS 2/colcon are
+    opt-in escalations (`openral install ros`), not failures.
+    """
+    with patch("openral_cli.main.shutil.which", return_value=None):
+        ros_rows = _check_ros2()
+        colcon_row = _check_colcon()
+
+    tier0 = [
+        CheckResult("Python", "ok", "3.12.13"),
+        *ros_rows,
+        colcon_row,
+    ]
+    assert {r.status for r in tier0} <= {"ok", "absent", "info", "warn"}
+
+    with patch("openral_cli.main._gather_checks", return_value=tier0):
+        result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0
+
+
+def test_doctor_and_factory_share_one_preset_table() -> None:
+    """Doctor must consume the factory's endpoint presets, not a mirror.
+
+    A hand-mirrored copy in openral_cli.main drifted twice (2fe732a: rejected
+    valid named endpoints; 131a489: passed a dialect clash the factory refuses).
+    The table now lives in openral_core; both sides import the same object.
+    """
+    from openral_core import REASONER_ENDPOINT_PRESETS
+    from openral_reasoner.tool_use import _ENDPOINT_PRESETS
+
+    assert _ENDPOINT_PRESETS is REASONER_ENDPOINT_PRESETS
+    import openral_cli.main as doctor_module
+
+    assert not hasattr(doctor_module, "_REASONER_ENDPOINT_PRESETS"), (
+        "openral_cli.main regrew a local mirror of the endpoint presets"
+    )

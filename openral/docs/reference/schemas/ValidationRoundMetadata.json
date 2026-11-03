@@ -1,0 +1,185 @@
+{
+  "additionalProperties": true,
+  "description": "What was executed, on what, from what \u2014 the reproducibility half.\n\nEvery field answers a \"why couldn't we reproduce a past round\" question:\nwhich code ran, whether the overlay was built from it, which dependency\nset, which entry point.\n\nAttributes:\n    round_id: Directory name of the round, e.g. ``\"2026-08-22-master-1\"``.\n    started_at: ISO-8601 UTC timestamp the round began.\n    host: Hostname of the validation runner.\n    executed_sha: Full git SHA of the checkout that ran.\n    worktree_clean: Whether ``git status --porcelain`` was empty; ``None``\n        only for pre-harness imports (``run`` refuses a dirty worktree).\n    overlay_built_at_ns: Modification time of the built ROS overlay, to\n        prove it isn't older than the sources.\n    launcher_path: Absolute path of the ``openral`` entry point invoked.\n    repo_root: Absolute path exported as ``OPENRAL_REPO_ROOT``.\n    robot_manifest_path: Repo-relative path of the resolved robot manifest.\n    robot_id: The robot id the scenes resolved to.\n    sync_groups: Dependency groups the environment was synced with.\n    stack_argv: The launch argv shared by every scene, verbatim.\n    safety_overrides_absent: ``True`` only when the composed argv was\n        checked and carries no safety-knob override; a round is refused\n        rather than recorded ``False``.\n    collision_scale: The #188 graded-velocity band the kernel ran with,\n        when armed; empty = shipped default (disabled). Arrives via\n        ``OPENRAL_COLLISION_SCALE_*`` env vars, invisible to argv inspection.\n    gpu_name: GPU the round ran on, when ``nvidia-smi`` was available.\n    notes_path: Round-relative path of the human-readable notes.\n    scene_dirs: Scene key \u2192 round-relative artifact directory; empty =\n        same name as the scene key.\n    seed: The scene seed the round pinned; read with ``executed_sha`` for\n        a true reproducibility pair (a seed mismatch is a before/after).\n    artifact_stem: Filename stem of every per-scene artifact; pre-harness\n        rounds used ``\"seed1\"``.\n    imported_from: Absolute path of the pre-harness round this was\n        imported from, if any.\n    scene_pins: Scene ``runtime:`` keys the round pinned (no CLI flag\n        exists for them); read with ``stack_argv`` for the whole executed stack.\n\nExample:\n    >>> m = ValidationRoundMetadata(\n    ...     round_id=\"2026-08-22-master-1\",\n    ...     started_at=\"2026-08-22T10:02:00Z\",\n    ...     executed_sha=\"2edcf67\" + \"0\" * 33,\n    ...     worktree_clean=True,\n    ... )\n    >>> m.safety_overrides_absent\n    True",
+  "properties": {
+    "round_id": {
+      "title": "Round Id",
+      "type": "string"
+    },
+    "started_at": {
+      "title": "Started At",
+      "type": "string"
+    },
+    "host": {
+      "default": "",
+      "title": "Host",
+      "type": "string"
+    },
+    "executed_sha": {
+      "title": "Executed Sha",
+      "type": "string"
+    },
+    "worktree_clean": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Worktree Clean"
+    },
+    "overlay_built_at_ns": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Overlay Built At Ns"
+    },
+    "launcher_path": {
+      "default": "",
+      "title": "Launcher Path",
+      "type": "string"
+    },
+    "repo_root": {
+      "default": "",
+      "title": "Repo Root",
+      "type": "string"
+    },
+    "robot_manifest_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Robot Manifest Path"
+    },
+    "robot_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Robot Id"
+    },
+    "sync_groups": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Sync Groups",
+      "type": "array"
+    },
+    "stack_argv": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Stack Argv",
+      "type": "array"
+    },
+    "safety_overrides_absent": {
+      "default": true,
+      "title": "Safety Overrides Absent",
+      "type": "boolean"
+    },
+    "collision_scale": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "title": "Collision Scale",
+      "type": "object"
+    },
+    "gpu_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Gpu Name"
+    },
+    "ros_domain_id": {
+      "default": "",
+      "title": "Ros Domain Id",
+      "type": "string"
+    },
+    "ros_automatic_discovery_range": {
+      "default": "",
+      "title": "Ros Automatic Discovery Range",
+      "type": "string"
+    },
+    "notes_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Notes Path"
+    },
+    "scene_dirs": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Scene Dirs",
+      "type": "object"
+    },
+    "seed": {
+      "default": 1,
+      "title": "Seed",
+      "type": "integer"
+    },
+    "artifact_stem": {
+      "default": "run",
+      "title": "Artifact Stem",
+      "type": "string"
+    },
+    "imported_from": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Imported From"
+    },
+    "scene_pins": {
+      "additionalProperties": {
+        "type": "boolean"
+      },
+      "title": "Scene Pins",
+      "type": "object"
+    }
+  },
+  "required": [
+    "round_id",
+    "started_at",
+    "executed_sha",
+    "worktree_clean"
+  ],
+  "title": "ValidationRoundMetadata",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

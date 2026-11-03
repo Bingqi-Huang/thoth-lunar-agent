@@ -1,0 +1,270 @@
+"""Sim-only free-running idle stepper for deploy-sim.
+
+In ``openral deploy sim`` the MuJoCo env lives only in the HAL node via
+``SimAttachedHAL``, and ``env.step()`` runs only
+from ``send_action`` — reached only while a skill is executing. When idle the
+env froze, so camera frames went stale and the perception /
+object-detector bus saw a dead scene. ``SimAttachedHAL.idle_step`` advances
+the env one tick with a zero/HOLD action so cameras keep rendering.
+
+These tests exercise the real LIBERO (robosuite OSC_POSE) digital twin the way
+``test_sim_attached_action_dim.py`` does — no mocks (CLAUDE.md §1.11). The
+``should_idle_step`` predicate test is pure (no sim) and always runs.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+import numpy as np
+import pytest
+from _renderer_probe import requires_renderer
+from openral_hal.sim_sensor_bridge import should_idle_step
+
+
+def test_should_idle_step_yields_within_hold_engages_after() -> None:
+    """Pure predicate: yields within idle_hold of a recent action, engages after.
+
+    Independent of rclpy / sim — the single-threaded executor hand-off rests on
+    this timestamp comparison alone.
+    """
+    hold = 200_000_000  # 200 ms
+    now = 1_000_000_000
+
+    # A real action 50 ms ago — still inside the hold → yield (False).
+    assert should_idle_step(now, last_action_ns=now - 50_000_000, idle_hold_ns=hold) is False
+    # Bare MuJoCo arms keep integrating their held target while active.
+    assert (
+        should_idle_step(
+            now,
+            last_action_ns=now - 50_000_000,
+            idle_hold_ns=hold,
+            step_while_active=True,
+        )
+        is True
+    )
+    # Exactly at the boundary (200 ms ago) → engage (>= is True).
+    assert should_idle_step(now, last_action_ns=now - hold, idle_hold_ns=hold) is True
+    # 500 ms ago — well past the hold → engage.
+    assert should_idle_step(now, last_action_ns=now - 500_000_000, idle_hold_ns=hold) is True
+    # Never actuated (last_action_ns == 0) → engage so an idle scene starts.
+    assert should_idle_step(now, last_action_ns=0, idle_hold_ns=hold) is True
+
+
+def _build_libero_hal() -> object:
+    """Build a connected SimAttachedHAL over the real LIBERO digital twin.
+
+    Mirrors the fixture idiom in ``test_sim_attached_action_dim.py``.
+    """
+    from openral_core import RobotDescription
+    from openral_hal.sim_attached import SimAttachedHAL
+    from openral_hal.sim_bringup import build_sim_env_from_yaml
+
+    env, seed = build_sim_env_from_yaml(
+        "scenes/sim/libero_spatial.yaml", robot_id_fallback="franka_panda"
+    )
+    desc = RobotDescription.from_yaml("robots/franka_panda/robot.yaml")
+    hal = SimAttachedHAL(env, desc, env_reset_seed=seed)
+    hal.connect()
+    return hal
+
+
+def _first_frame(images: dict[str, object]) -> np.ndarray:
+    for arr in images.values():
+        a = np.asarray(arr)
+        if a.ndim == 3:
+            return a
+    raise AssertionError(f"no HWC frame in images keys={sorted(images)}")
+
+
+@requires_renderer
+def test_idle_step_advances_render_and_changes_frame() -> None:
+    """Idle → idle_step() returns True and the rendered frame advances (un-freeze)."""
+    pytest.importorskip("openral_sim")
+    pytest.importorskip("mujoco")
+    pytest.importorskip("robosuite")
+    pytest.importorskip("libero")
+    hal = _build_libero_hal()
+
+    before = _first_frame(hal.read_images()).copy()  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    # Step several idle ticks so settling dynamics produce a visible delta.
+    for _ in range(5):
+        assert hal.idle_step() is True  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    after = _first_frame(hal.read_images())  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+
+    assert before.shape == after.shape
+    # Physics + render advanced — the frozen-scene regression would leave these
+    # byte-identical.
+    assert not np.array_equal(before, after)
+
+
+@requires_renderer
+def test_idle_step_advances_render_native_so101(
+    _build_so101_hal: Callable[[], object],
+) -> None:
+    """Idle → idle_step() advances the frame on the native-MuJoCo so101 backend.
+
+    The same regression as the LIBERO test, against a backend that needs no
+    robosuite/libero so it runs in this env.
+    """
+    pytest.importorskip("openral_sim")
+    pytest.importorskip("mujoco")
+    hal = _build_so101_hal()
+
+    before = _first_frame(hal.read_images()).copy()  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    for _ in range(5):
+        assert hal.idle_step() is True  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    after = _first_frame(hal.read_images())  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    assert before.shape == after.shape
+    assert not np.array_equal(before, after)
+
+
+@requires_renderer
+def test_idle_step_suppressed_when_estop_latched_native_so101(
+    _build_so101_hal: Callable[[], object],
+) -> None:
+    """Estop latched → idle_step() returns False, frame unchanged (native so101)."""
+    pytest.importorskip("openral_sim")
+    pytest.importorskip("mujoco")
+    hal = _build_so101_hal()
+
+    before = _first_frame(hal.read_images()).copy()  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    hal.estop()  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    assert hal.idle_step() is False  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    after = _first_frame(hal.read_images())  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    assert np.array_equal(before, after)
+
+
+@requires_renderer
+def test_idle_step_suppressed_when_estop_latched() -> None:
+    """Estop latched → idle_step() returns False and _last_obs is unchanged (freeze)."""
+    pytest.importorskip("openral_sim")
+    pytest.importorskip("mujoco")
+    pytest.importorskip("robosuite")
+    pytest.importorskip("libero")
+    hal = _build_libero_hal()
+
+    before = _first_frame(hal.read_images()).copy()  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    hal.estop()  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    assert hal.idle_step() is False  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    after = _first_frame(hal.read_images())  # type: ignore[attr-defined]  # reason: SimAttachedHAL surface
+    # Estopped HAL freezes — the cached frame must not advance.
+    assert np.array_equal(before, after)
+
+
+def test_real_hal_has_no_idle_step_and_sim_yaml_on_real_raises() -> None:
+    """SAFETY: a real HAL must NOT define idle_step; sim_env_yaml + mode=real is rejected.
+
+    The idle-step timer is gated on ``getattr(hal, 'idle_step', None)`` so against
+    a real HAL it is never created — this is the primary real-hardware exclusion
+    (a zero vector is a HOLD in sim but "drive to 0 rad" on a real position arm).
+    The ``sim_env_yaml`` + ``mode='real'`` rejection locks the secondary gate.
+    """
+    from openral_core import RobotDescription
+    from openral_core.exceptions import ROSConfigError
+    from openral_hal.resolver import build_hal
+
+    desc = RobotDescription.from_yaml("robots/franka_panda/robot.yaml")
+    if desc.hal.real is None:
+        pytest.skip("franka_panda has no real HAL declared; cannot exercise the real path")
+
+    real_hal = build_hal(desc, mode="real")
+    # The method-only-on-SimAttachedHAL exclusion: a real HAL never defines it.
+    assert getattr(real_hal, "idle_step", None) is None
+
+    # Secondary backstop: a sim scene can never attach to a real-hardware HAL.
+    with pytest.raises(ROSConfigError):
+        build_hal(desc, mode="real", sim_env_yaml="scenes/sim/libero_spatial.yaml")
+
+
+class _RecordingTimer:
+    """Stand-in for an rclpy timer handle — records cancellation."""
+
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _RecordingLogger:
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
+    def warning(self, msg: str) -> None:
+        self.warnings.append(msg)
+
+    def info(self, msg: str) -> None:  # pragma: no cover - unused in this test
+        pass
+
+
+class _RecordingNode:
+    """Minimal stand-in for the rclpy LifecycleNode (the framework boundary).
+
+    The HAL under test is a *real* ``SimAttachedHAL``; only the rclpy node
+    (a process/framework boundary, CLAUDE.md §1.11) is stubbed, exposing just
+    the ``create_timer`` / ``get_logger`` surface ``SimSensorBridge`` touches.
+    """
+
+    def __init__(self) -> None:
+        self._logger = _RecordingLogger()
+
+    def create_timer(
+        self, period: float, callback: object, *, clock: object | None = None
+    ) -> _RecordingTimer:
+        # Mirror rclpy's ``Node.create_timer`` surface: passes a
+        # SYSTEM_TIME ``clock=`` so the idle stepper runs on wall time. The fake
+        # just has to accept (and ignore) it — the timer itself is recorded.
+        return _RecordingTimer()
+
+    def get_logger(self) -> _RecordingLogger:
+        return self._logger
+
+
+@requires_renderer
+def test_idle_tick_disables_timer_after_action_dim_mismatch_native_so101() -> None:
+    """CONTAINMENT: an idle_step raise → one WARNING, timer cancelled + disabled.
+
+    Force the documented probe gap by constructing the HAL with the wrong
+    ``env_action_dim`` (11 vs so101_box's true 6) so ``idle_step`` raises a
+    width mismatch on ``env.step``. ``_idle_step_tick`` must contain it: log a
+    single warning and disable the idle timer (so it cannot crash-loop the
+    graph every tick), not propagate or silently swallow.
+    """
+    pytest.importorskip("openral_sim")
+    pytest.importorskip("mujoco")
+    # This is the only idle test that drives `_setup_idle_stepper`, which imports
+    # rclpy for its wall-clock timer — skip (don't error) on a no-ROS CI host.
+    pytest.importorskip("rclpy")
+    from openral_core import RobotDescription
+    from openral_hal.sim_attached import SimAttachedHAL
+    from openral_hal.sim_bringup import build_sim_env_from_yaml
+    from openral_hal.sim_sensor_bridge import SimSensorBridge
+
+    env, seed = build_sim_env_from_yaml(
+        "scenes/sim/so101_tube_insertion.yaml", robot_id_fallback="so101_follower"
+    )
+    desc = RobotDescription.from_yaml("robots/so101_follower/robot.yaml")
+    hal = SimAttachedHAL(env, desc, env_reset_seed=seed, env_action_dim=11)  # WRONG on purpose
+    hal.connect()
+
+    node = _RecordingNode()
+    bridge = SimSensorBridge(node, hal, desc, viewer_enabled=False)
+    # Wire the idle timer directly (both gates hold: idle_step is callable +
+    # so101_box exposes live MuJoCo handles).
+    bridge._setup_idle_stepper()
+    timer = bridge._idle_timer
+    assert timer is not None, "idle timer should have been created (both gates hold)"
+
+    # last_action_ns == 0 → the predicate engages immediately; idle_step raises.
+    bridge._idle_step_tick()
+
+    assert timer.cancelled is True
+    assert bridge._idle_timer is None
+    assert len(node.get_logger().warnings) == 1
+    assert "idle stepper disabled" in node.get_logger().warnings[0]
+
+    # A second tick is a no-op (timer already disabled) — no second warning,
+    # no crash-loop.
+    bridge._idle_step_tick()
+    assert len(node.get_logger().warnings) == 1

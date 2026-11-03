@@ -1,0 +1,98 @@
+# RoboCasa kitchen — deterministic vegetable fridge-shelf→fridge-drawer PnP.
+# Generalization-matrix sibling of robocasa_baguette.yaml (same panda_mobile
+# twin + full stack): pick/place surfaces are both inside the enclosed fridge,
+# unlike baguette's open counter — checks the collision stack isn't overfit to
+# that scene. Task declares EXCLUDE_STYLES for side-by-side fridges with no
+# drawer, so not every seed yields a constructible layout.
+#
+# KNOWN DEFECT, FIXED by `layout_ids: [47]` — do not remove without reading the
+# measurements below. Unpinned, seed 1 draws a side-by-side fridge whose closed
+# freezer door sits at arm height; MuJoCo collision geoms are clear (2.5 mm gap,
+# 0 contacts) but that is inside the safety kernel's 25 mm occupancy voxel, so
+# the kernel reports -24.75 mm and E-stops at sim t=4.85 s with zero action
+# chunks applied (artifact key `sim.estop_initial_configuration`). Not a policy
+# or margin failure.
+#
+# Old pin `[30]` (#154, until 2026-08-25) was wrong: chosen against mesh
+# clearance (37.0 mm) rather than the kernel's OBB-vs-voxel criterion. Live
+# kernel measurement at layout 30 is -23.47 mm — still stops. Layouts 18/21
+# look clear on a mesh-only grid but stop live too (-2.26 / -10.96 mm) — do not
+# restore either.
+#
+# Layout 47 clears the live kernel by +19.34 mm, identical across two captures
+# whose maps differed 68% in density, has 48.40 mm mesh clearance, and every
+# kernel-checked link clears (worst: panda_link7 +77.46 mm).
+#
+# Pinning `layout_ids` reshuffles the whole draw (style/fixtures/rack_index/
+# door-open amounts/spawn deviation share one `env.rng`) — not a no-op even
+# when it names an already-drawn value. These are reset-pose measurements only,
+# not a full-rollout guarantee.
+#
+# Also pinned by tests/sim/safety/test_kernel_fridge_layout_pin_start_state.py
+# (#102): builds a 25 mm occupancy grid from real geometry, runs it through the
+# real safety_kernel_node, asserts 47 clears / 30 is tighter (20 mm standoff).
+# That grid uses true surfaces and reads more generous than the live octomap
+# (+19.09 mm at layout 30 vs the live -23.47 mm — the live map also holds
+# decoration and its octree->grid bridge dilates it), so it cannot reproduce
+# layout 30's live stop and a pass there is not grounds to restore 30.
+#
+# Effective layout appears in run artifacts as `robocasa_scene_composition`
+# (docs/reference/telemetry.md); a pin the env can't honour raises
+# `ROSConfigError` rather than silently substituting.
+#
+# Run: openral deploy sim --config scenes/deploy/robocasa_fridge_drawer.yaml
+# Setup: just sync --group robocasa  +  uv pip install -e _external/robocasa --no-deps
+
+scene:
+  id: robocasa/PickPlaceFridgeShelfToDrawer
+  backend: mujoco
+  observation_height: 512
+  observation_width: 512
+  backend_options:
+    mode: prebuilt
+    prebuilt_task: PickPlaceFridgeShelfToDrawer
+    robots: ["PandaMobile"]
+    controller: OSC_POSE
+    obj_groups: vegetable
+    # DO NOT REMOVE — fix for an initial-configuration defect. Unpinned, seed 1
+    # draws layout 29/style 20 (side-by-side fridge), parks robot0_link7 2.8 mm
+    # from the closed freezer door; kernel reports -24.75 mm, run E-stops before
+    # any action chunk. Pin is 47, NOT 30 — layout 30 (#154) was chosen against
+    # mesh clearance, still stops live at -23.47 mm. Layout 47 clears the live
+    # kernel by +19.34 mm (stable across two captures 68% apart in density).
+    # Layouts 18/21 look clear on an ideal grid but STOP live — don't restore.
+    # Full measurement table in the file header.
+    layout_ids: [47]
+
+# The seed alone does NOT pin the scene: RoboCasa draws layout/style, fixtures,
+# rack_index, door-open amounts and the robot spawn deviation from one shared
+# `env.rng`, so anything that changes a draw upstream reshuffles the kitchen.
+# `layout_ids` above pins the floor plan; `style_ids` is deliberately left open
+# (at the `[47]` pin the draw lands on style 32, outside the task's
+# EXCLUDE_STYLES — it was style 29 under the old `[30]` pin) so the round
+# keeps one axis of visual variation. Pin it too if a specific style matters.
+seed: 1
+
+# ADR-0097 place-phase declaration — field-by-field rationale (goal scoping,
+# clock domain, why no region) in scenes/deploy/robocasa_baguette.yaml. Both
+# surfaces here are inside the fridge, so this is where the approach allowance
+# matters most (voxel-quantised geometry on five sides).
+#
+# target_id is a function of the layout pin — re-resolve off the live MuJoCo
+# body table (filter token "fridge"; not `env.fixture_refs["fridge"]`, which is
+# a nameless tuple in this env) in the same commit as any `layout_ids` change,
+# or the HAL fails closed with an unarmed place phase (#142's guess
+# `sim:fridge_right_group_main` did exactly this — refused, nothing armed).
+# At the current [47] pin the fridge is `fridgesidebyside_main_group_1`; the
+# declared target is its `_fridge_drawer0` (body 176, the drawer the task
+# places into), NOT `_main` (body 173, the fixture root — its subtree includes
+# the fridge door, so declaring it would wrongly license door contact as a
+# witness). Rule: smallest body that still contains the resting surface. Not
+# yet verified end to end (no full rollout placed a vegetable here).
+# timeout_s — 300 s (raised from #142's 120 s, a benchmark horizon that doesn't
+# bound a `deploy sim` goal; live baguette run used 92 s of it before grasp).
+place_declaration:
+  target_id: "sim:fridgesidebyside_main_group_1_fridge_drawer0"
+  object_id: ""
+  timeout_s: 300.0
+  stamp_ns: 0

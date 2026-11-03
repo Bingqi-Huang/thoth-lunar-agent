@@ -1,0 +1,873 @@
+#!/usr/bin/env python3
+"""Day-1 safety_node pass-through (Python).
+
+Owns the chunk-rate safety boundary on the OpenRAL graph:
+
+* Subscribes ``/openral/candidate_action`` (``openral_msgs/ActionChunk``).
+* Publishes ``/openral/safe_action`` (same type) when envelope checks pass.
+* Publishes ``/openral/estop`` (``std_msgs/Empty``) when they fail.
+* Subscribes ``/openral/estop`` (defense in depth, CLAUDE.md §1.5) — an
+  external estop latches the node so subsequent candidates are dropped
+  until reset.
+* Exposes ``/openral/estop_reset`` (``std_srvs/Trigger``) — explicit recovery
+  only; ``ROSEStopRequested`` is never auto-cleared (CLAUDE.md §10).
+* Publishes 1 Hz ``/diagnostics`` via
+  ``openral_observability.DiagnosticsHeartbeat``.
+
+Topic-shape lock for the safety boundary's first increment: the topic
+contract is real and tested; envelope checks are deliberately minimal so the
+C++ kernel that lands later can replace internals **behind the same topic
+surface**. Per CLAUDE.md §1.5 ("Python proposes, C++ disposes") and §7.7
+(safety working-group review), any addition of enforcement beyond this file
+requires safety-WG sign-off.
+
+Day-1 envelope checks (stubbed but real): ``n_dof`` mismatch vs the
+``n_dof`` parameter (default ``-1`` = no enforcement), and first-row joint
+targets vs configured per-joint position limits.
+
+On violation: (1) drop the candidate (no republish on ``/openral/safe_action``);
+(2) publish ``std_msgs/Empty`` on ``/openral/estop``; (3) latch internal estop
+state until ``/openral/estop_reset`` is called AND
+``>=estop_reset_cooldown_s`` (default 500 ms) have passed since the last
+estop publish.
+
+Stub for velocity/force/workspace lands when the C++ kernel does.
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+import time
+from typing import Any
+
+import rclpy
+from openral_observability import safety_span, semconv
+from rclpy.executors import ExternalShutdownException
+from rclpy.lifecycle import LifecycleNode, LifecycleState, TransitionCallbackReturn
+
+# Identity label surfaced as ``safety.kernel`` on every safety.check span.
+# Matches the ``SAFETY_KERNEL_NULL`` semconv constant by spirit — the
+# Day-1 passthrough is functionally a null kernel that only enforces
+# n_dof + per-joint limits, leaving velocity/force/workspace to the C++
+# kernel that lands later.
+_KERNEL_LABEL_PASSTHROUGH = "passthrough"
+
+__all__ = [
+    "DEFAULT_ESTOP_RESET_COOLDOWN_S",
+    "SAFETY_STATUS_HEARTBEAT_S",
+    "SAFETY_STATUS_TOPIC",
+    "SafetyPassthroughNode",
+    "SafetySupervisorNode",
+    "main",
+]
+
+# ADR-0096 — the latched current-safety-state topic this node publishes
+# alongside (never instead of) ``/openral/estop``. The C++ kernel that
+# replaces this node behind the same topic surface publishes the identical
+# contract, so a consumer cannot tell which implementation is running.
+SAFETY_STATUS_TOPIC = "/openral/safety_status"
+
+# Liveness refresh cadence for the latched status. Hazard-log HZ-0096-1
+# mitigation 2: a durable value is only trustworthy alongside evidence that
+# it is current rather than a dead publisher's leftover, so ``header.stamp``
+# is re-stamped at this cadence even when nothing changed. Matches the C++
+# kernel's 1 Hz /diagnostics heartbeat.
+SAFETY_STATUS_HEARTBEAT_S = 1.0
+
+# Default cooldown between an estop publish and the first successful
+# ``/openral/estop_reset`` call. Configurable per-launch via the
+# ``estop_reset_cooldown_s`` parameter — tests use a larger value to
+# avoid races, production keeps the 500 ms default.
+DEFAULT_ESTOP_RESET_COOLDOWN_S = 0.5
+
+
+# ADR-0096 — map this node's free-text violation ``kind`` onto the numeric
+# ``SafetyStatus.drop_reason``, whose KIND_* values are FailureTrigger's. The
+# grouping mirrors how the C++ kernel's validator classifies the same
+# families: a bound on a *commanded position* is WORKSPACE, a bound on a
+# *rate* (speed / per-step delta) is FORCE — the kernel routes speed
+# violations through ViolationKind::kForce for the same reason — and every
+# shape / dof / configuration error is CONTROLLER. Anything unmapped falls to
+# CONTROLLER rather than guessing.
+_WORKSPACE_VIOLATION_KINDS = frozenset({"workspace", "gripper_range"})
+_RATE_VIOLATION_KINDS = frozenset(
+    {
+        "cartesian_step",
+        "cartesian_step_rot",
+        "ee_linear_speed",
+        "ee_angular_speed",
+        "base_linear_speed",
+        "base_angular_speed",
+    }
+)
+
+
+def _violation_kind_constant(kind: str, status_cls: Any) -> int:
+    """Return the ``SafetyStatus.drop_reason`` for a violation ``kind`` string.
+
+    Args:
+        kind: The violation kind returned by ``_envelope_violation``.
+        status_cls: The ``openral_msgs.msg.SafetyStatus`` class (imported
+            lazily at configure time, like every other message class here).
+
+    Returns:
+        The matching ``KIND_*`` constant.
+
+    Example:
+        >>> class _S:  # the constants SafetyStatus.msg declares
+        ...     KIND_FORCE, KIND_WORKSPACE, KIND_CONTROLLER = 1, 2, 5
+        >>> _violation_kind_constant("workspace", _S)
+        2
+        >>> _violation_kind_constant("ee_linear_speed", _S)
+        1
+        >>> _violation_kind_constant("n_dof", _S)
+        5
+    """
+    if kind in _WORKSPACE_VIOLATION_KINDS:
+        return int(status_cls.KIND_WORKSPACE)
+    if kind in _RATE_VIOLATION_KINDS:
+        return int(status_cls.KIND_FORCE)
+    return int(status_cls.KIND_CONTROLLER)
+
+
+class SafetyPassthroughNode(LifecycleNode):  # type: ignore[misc]  # reason: rclpy untyped
+    """Day-1 safety_node pass-through.
+
+    Owns ``/openral/candidate_action → /openral/safe_action`` plus the
+    ``/openral/estop`` / ``/openral/estop_reset`` pair. See module
+    docstring for the full contract.
+
+    Parameters (declared on ``__init__``):
+
+    * ``robot_name`` (str): Short robot label for the ``hardware_id``
+      diagnostic field. Default ``"robot"``.
+    * ``n_dof`` (int): Expected joints in the ``ActionChunk.flat`` row.
+      Default ``-1`` (no enforcement). Set this to the robot's DOF in
+      production launches.
+    * ``min_joint`` / ``max_joint`` (float[]): Per-joint position
+      limits. Same length as ``n_dof`` when ``n_dof > 0``; empty list
+      disables the limit check.
+    * ``estop_reset_cooldown_s`` (float): Cooldown between an estop
+      publish and a valid ``/openral/estop_reset``.
+    """
+
+    def __init__(self, node_name: str = "openral_safety") -> None:
+        """Declare parameters; opens no resources until ``on_configure``."""
+        from rcl_interfaces.msg import ParameterDescriptor
+
+        super().__init__(node_name)
+        self.declare_parameter("robot_name", "robot")
+        # n_dof default -1 keeps the node usable in tests that do not
+        # care about envelope enforcement (just verifying pass-through).
+        self.declare_parameter("n_dof", -1)
+        # ``declare_parameter(name, [])`` infers the parameter type as
+        # PARAMETER_NOT_SET, which prevents ``set_parameters`` from
+        # subsequently accepting a typed double array. Use dynamic_typing
+        # so launches / tests can override with a real DOUBLE_ARRAY value.
+        _dyn = ParameterDescriptor(dynamic_typing=True)
+        self.declare_parameter("min_joint", None, _dyn)
+        self.declare_parameter("max_joint", None, _dyn)
+        self.declare_parameter("estop_reset_cooldown_s", DEFAULT_ESTOP_RESET_COOLDOWN_S)
+        # Per-control-mode envelope bounds. Sentinel ``-1.0``
+        # means "no enforcement declared, skip the check" — same
+        # semantics as ``n_dof=-1`` above. Launches that route
+        # cartesian / twist / gripper chunks (panda_mobile + RoboCasa
+        # OSC rSkills) override these with the matching SafetyEnvelope
+        # values declared on the robot.yaml. Strictly additive: a
+        # legacy launch that sets none of these passes every non-joint
+        # chunk through verbatim, exactly as before this commit.
+        self.declare_parameter("max_cartesian_step_m", -1.0)
+        self.declare_parameter("max_cartesian_step_rad", -1.0)
+        self.declare_parameter("max_ee_speed_m_s", -1.0)
+        self.declare_parameter("max_ee_angular_speed_rad_s", -1.0)
+        self.declare_parameter("max_base_linear_speed_m_s", -1.0)
+        self.declare_parameter("max_base_angular_speed_rad_s", -1.0)
+        self.declare_parameter("gripper_min", -1.0)
+        self.declare_parameter("gripper_max", -1.0)
+
+        self._candidate_sub: Any = None
+        self._safe_pub: Any = None
+        self._estop_pub: Any = None
+        self._estop_sub: Any = None
+        self._reset_srv: Any = None
+        self._heartbeat: Any = None
+        # ADR-0096 — latched SafetyStatus publisher + its liveness timer.
+        self._status_pub: Any = None
+        self._status_timer: Any = None
+        self._status_msg_cls: Any = None
+
+        # State.
+        self._estopped: bool = False
+        self._last_estop_ns: int = 0
+        self._chunks_passed: int = 0
+        self._chunks_dropped: int = 0
+        self._last_drop_reason: str = ""
+        # Current /openral/safety_status value. ``_status_drop_reason`` starts
+        # at ``None`` rather than a constant so the first publication — the
+        # activation one — can never be swallowed by the transition gate
+        # (HZ-0096-1 mitigation 1).
+        self._status_latched: bool = False
+        self._status_drop_reason: int | None = None
+        self._status_detail: str = ""
+        self._status_rskill_id: str = ""
+        self._status_trace_id: str = ""
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────
+
+    def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """Open publishers, subscribers, service, and diagnostics heartbeat."""
+        del state
+        from diagnostic_msgs.msg import DiagnosticArray  # noqa: F401  # ensure available
+        from openral_msgs.msg import ActionChunk, SafetyStatus
+        from openral_observability import DiagnosticsHeartbeat, Level
+        from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+        from std_msgs.msg import Empty
+        from std_srvs.srv import Trigger
+
+        self._status_msg_cls = SafetyStatus
+        chunk_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            depth=1,
+        )
+        estop_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            depth=10,
+        )
+
+        # ADR-0096 — the LATCHED status topic. RELIABLE + TRANSIENT_LOCAL +
+        # KEEP_LAST=1 is CLAUDE.md §2's "description/static" QoS class,
+        # deliberately not the "safety/e-stop" class ``estop_qos`` above uses:
+        # this topic answers "what is true right now", which a late-joining
+        # dashboard or a reconnecting runner has to read without having
+        # witnessed the transition. Purely additive — it gates nothing, and
+        # ``/openral/estop`` keeps every duty it had.
+        status_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
+
+        self._safe_pub = self.create_publisher(ActionChunk, "/openral/safe_action", chunk_qos)
+        self._estop_pub = self.create_publisher(Empty, "/openral/estop", estop_qos)
+        self._status_pub = self.create_publisher(SafetyStatus, SAFETY_STATUS_TOPIC, status_qos)
+        self._candidate_sub = self.create_subscription(
+            ActionChunk,
+            "/openral/candidate_action",
+            self._on_candidate_action,
+            chunk_qos,
+        )
+        # Defense-in-depth: external estop publishers (deadman watchdog,
+        # hardware estop pendant, human estop forwarder, the C++ kernel
+        # itself) also latch us so we stop forwarding candidates without
+        # waiting for the operator to reset (CLAUDE.md §1.5).
+        self._estop_sub = self.create_subscription(
+            Empty, "/openral/estop", self._on_external_estop, estop_qos
+        )
+        self._reset_srv = self.create_service(Trigger, "/openral/estop_reset", self._on_estop_reset)
+
+        robot_name: str = self.get_parameter("robot_name").get_parameter_value().string_value
+
+        def _status() -> tuple[int, str, dict[str, str]]:
+            if self._estopped:
+                return (
+                    Level.ERROR,
+                    "estop latched",
+                    {
+                        "robot": robot_name,
+                        "passed": str(self._chunks_passed),
+                        "dropped": str(self._chunks_dropped),
+                        "last_drop_reason": self._last_drop_reason or "—",
+                    },
+                )
+            return (
+                Level.OK,
+                "passthrough active",
+                {
+                    "robot": robot_name,
+                    "passed": str(self._chunks_passed),
+                    "dropped": str(self._chunks_dropped),
+                },
+            )
+
+        self._heartbeat = DiagnosticsHeartbeat(
+            self,
+            hardware_id=f"openral_safety:{robot_name}",
+            component_name="openral_safety",
+            status_fn=_status,
+        )
+        self._heartbeat.create_publisher()
+        self.get_logger().info(
+            f"openral_safety configured (robot={robot_name}); "
+            "candidate_action → safe_action passthrough armed."
+        )
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_activate(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """Start the diagnostics heartbeat and publish the current SafetyStatus.
+
+        The activation publish is hazard-log HZ-0096-1 mitigation 1: because
+        ``/openral/safety_status`` is TRANSIENT_LOCAL, a consumer that was
+        already connected before this node restarted keeps trusting the value
+        the *previous* process left behind. Publishing on every activation
+        overwrites that stale sample within one activation cycle instead of
+        waiting for the next real fault. A latch that survived a
+        deactivate→activate cycle is reported as it stands — activation never
+        implies recovery.
+        """
+        del state
+        if self._heartbeat is not None:
+            self._heartbeat.start()
+        if not self._estopped:
+            self._status_latched = False
+            self._status_drop_reason = self._status_msg_cls.DROP_NONE
+            self._status_detail = "supervisor activated"
+            self._status_rskill_id = ""
+            self._status_trace_id = ""
+        self._publish_safety_status_now()
+        # Liveness refresh (HZ-0096-1 mitigation 2) — re-stamp the durable
+        # value at 1 Hz so a consumer can distinguish a live latch from a dead
+        # publisher's leftover sample. Started here, not at configure, so an
+        # inactive node publishes nothing.
+        self._status_timer = self.create_timer(
+            SAFETY_STATUS_HEARTBEAT_S, self._publish_safety_status_now
+        )
+        self.get_logger().info("openral_safety activated.")
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_deactivate(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """Stop the heartbeat. Topic surface stays open for clean teardown."""
+        del state
+        if self._heartbeat is not None:
+            self._heartbeat.stop()
+        if self._status_timer is not None:
+            self.destroy_timer(self._status_timer)
+            self._status_timer = None
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_cleanup(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """Release topics, service, subscriptions, and heartbeat publisher."""
+        del state
+        if self._heartbeat is not None:
+            self._heartbeat.destroy()
+            self._heartbeat = None
+        if self._reset_srv is not None:
+            self.destroy_service(self._reset_srv)
+            self._reset_srv = None
+        if self._candidate_sub is not None:
+            self.destroy_subscription(self._candidate_sub)
+            self._candidate_sub = None
+        if self._estop_sub is not None:
+            self.destroy_subscription(self._estop_sub)
+            self._estop_sub = None
+        if self._safe_pub is not None:
+            self.destroy_publisher(self._safe_pub)
+            self._safe_pub = None
+        if self._estop_pub is not None:
+            self.destroy_publisher(self._estop_pub)
+            self._estop_pub = None
+        if self._status_timer is not None:
+            self.destroy_timer(self._status_timer)
+            self._status_timer = None
+        if self._status_pub is not None:
+            self.destroy_publisher(self._status_pub)
+            self._status_pub = None
+        # Forget the published status so the next activation's publish can
+        # never be suppressed by the transition gate (HZ-0096-1 mitigation 1).
+        self._status_drop_reason = None
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_shutdown(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """Force cleanup."""
+        return self.on_cleanup(state)
+
+    # ── Envelope check + publication ─────────────────────────────────────────
+
+    def _on_candidate_action(self, msg: object) -> None:
+        """Validate one ``ActionChunk`` and forward it on ``/openral/safe_action``.
+
+        Per the safety envelope contract:
+
+        * Drop and estop on envelope violation.
+        * Drop (no estop) when an estop is already latched — recovery must
+          go through ``/openral/estop_reset``.
+
+        Emits a ``safety.check`` OTel span per candidate so the dashboard's
+        Safety card + Safety Check Ledger populate. ``safety.severity``
+        rides ``"info"`` on pass-through, ``"warn"`` on a drop due to a
+        latched estop (no fresh estop fired), and ``"violation"`` on an
+        envelope failure (which also re-fires ``/openral/estop``).
+        """
+        with safety_span(
+            check_name="envelope",
+            kernel=_KERNEL_LABEL_PASSTHROUGH,
+        ) as span:
+            # If currently estopped, drop without republishing — the latch
+            # only clears via /openral/estop_reset.
+            if self._estopped:
+                self._chunks_dropped += 1
+                self._last_drop_reason = "estop_latched"
+                span.set_attribute(semconv.SAFETY_SEVERITY, "warn")
+                span.set_attribute("safety.drop_reason", "estop_latched")
+                self.get_logger().debug(
+                    "dropping candidate_action while estop latched: "
+                    f"skill={msg.rskill_id!r} trace={msg.trace_id!r}"
+                )
+                return
+
+            kind, reason = self._envelope_violation(msg)
+            if kind is not None:
+                span.set_attribute(semconv.SAFETY_SEVERITY, "violation")
+                span.set_attribute("safety.drop_reason", kind)
+                span.set_attribute("safety.violation_reason", reason)
+                self._handle_violation(msg, kind=kind, reason=reason)
+                return
+
+            # Pass through — publish the same payload on /openral/safe_action.
+            # We forward the exact message (no field rewrites) so trace_id /
+            # rskill_id stay attached for the F7 correlator and `openral replay`.
+            assert self._safe_pub is not None  # invariant on active state
+            self._safe_pub.publish(msg)
+            self._chunks_passed += 1
+            # ADR-0096 recovery transition. No-op unless a drop reason was
+            # actually in effect, so the pass-through path stays two
+            # comparisons and no publication.
+            self._set_safety_status(
+                latched=False,
+                drop_reason=self._status_msg_cls.DROP_NONE,
+                detail="chunk accepted",
+                rskill_id=msg.rskill_id,
+                trace_id=msg.trace_id,
+            )
+
+    def _envelope_violation(  # noqa: PLR0911  # reason: dispatches over control-mode families; each mode is a single early return
+        self, msg: object
+    ) -> tuple[str | None, str]:
+        """Return ``(violation_kind, reason)`` or ``(None, '')`` if OK.
+
+        Dispatches on the chunk's ``control_mode``. Joint
+        chunks keep their Day-1 ``n_dof`` + per-joint position bounds
+        verbatim; cartesian / twist / gripper chunks get their own
+        per-mode bound checks. All new bounds default to ``-1.0``
+        ("no enforcement declared, skip") so a legacy launch that
+        doesn't override them keeps passing every non-joint chunk
+        through, exactly as before this commit.
+        """
+        from openral_core import UINT8_TO_CONTROL_MODE
+        from openral_core.schemas import ControlMode
+
+        mode_uint8 = int(getattr(msg, "control_mode", 0) or 0)
+        mode = UINT8_TO_CONTROL_MODE.get(mode_uint8)
+        if mode is None:
+            return (
+                "control_mode",
+                f"unknown control_mode uint8 {mode_uint8}; refusing to validate",
+            )
+
+        flat = list(getattr(msg, "flat", []) or [])
+        n_dof = int(getattr(msg, "n_dof", 0) or 0)
+
+        # ── Joint modes — Day-1 path (unchanged) ─────────────────────
+        if mode in (
+            ControlMode.JOINT_POSITION,
+            ControlMode.JOINT_VELOCITY,
+            ControlMode.JOINT_TORQUE,
+            ControlMode.JOINT_TRAJECTORY,
+        ):
+            return self._envelope_violation_joint(flat=flat, n_dof=n_dof)
+
+        # ── Cartesian / twist / gripper — per-mode checks ──
+        if mode is ControlMode.CARTESIAN_DELTA:
+            scale = list(getattr(msg, "cartesian_delta_scale", []) or [])
+            return self._envelope_violation_cartesian_delta(
+                flat=flat,
+                n_dof=n_dof,
+                cartesian_delta_scale=scale,
+            )
+        if mode is ControlMode.CARTESIAN_TWIST:
+            return self._envelope_violation_cartesian_twist(flat=flat, n_dof=n_dof)
+        if mode is ControlMode.BODY_TWIST:
+            return self._envelope_violation_body_twist(flat=flat, n_dof=n_dof)
+        if mode in (ControlMode.GRIPPER_BINARY, ControlMode.GRIPPER_POSITION):
+            return self._envelope_violation_gripper(flat=flat)
+
+        # ── Modes the supervisor doesn't enforce yet (cartesian pose,
+        # foot placement, dex hand joints) pass through. The HAL
+        # whitelist downstream rejects what it can't consume.
+        return (None, "")
+
+    def _envelope_violation_joint(self, *, flat: list[float], n_dof: int) -> tuple[str | None, str]:
+        """Day-1 joint envelope: n_dof + per-joint position bounds.
+
+        Behaviour is byte-identical to the ``_envelope_violation`` body
+        before the per-mode dispatch was added, for any chunk whose
+        control_mode is a JOINT_* mode. Tests in ``test_supervisor_node.py`` pin
+        this — adding the per-mode dispatch must not regress the
+        joint-only path.
+        """
+        # n_dof check (skipped when configured -1).
+        expected_dof: int = self.get_parameter("n_dof").get_parameter_value().integer_value
+        if expected_dof > 0 and n_dof != expected_dof:
+            return ("n_dof", f"expected n_dof={expected_dof}, got {n_dof}")
+
+        # Joint limit check (skipped when either array unset).
+        min_param = self.get_parameter("min_joint").get_parameter_value()
+        max_param = self.get_parameter("max_joint").get_parameter_value()
+        min_joint = list(min_param.double_array_value)
+        max_joint = list(max_param.double_array_value)
+        if min_joint and max_joint:
+            dof = n_dof if n_dof > 0 else len(min_joint)
+            if len(min_joint) != dof or len(max_joint) != dof:
+                return (
+                    "envelope_config",
+                    "min_joint / max_joint length mismatch with n_dof",
+                )
+            if len(flat) < dof:
+                return ("flat", f"flat shorter than n_dof ({len(flat)} < {dof})")
+            row0 = flat[:dof]
+            for i, v in enumerate(row0):
+                if v < min_joint[i] or v > max_joint[i]:
+                    return (
+                        "workspace",
+                        f"joint[{i}]={v:.4f} out of [{min_joint[i]:.4f}, {max_joint[i]:.4f}]",
+                    )
+        return (None, "")
+
+    def _envelope_violation_cartesian_delta(
+        self,
+        *,
+        flat: list[float],
+        n_dof: int,
+        cartesian_delta_scale: list[float],
+    ) -> tuple[str | None, str]:
+        """CARTESIAN_DELTA: bound the Euclidean step over (xyz) and (rotvec).
+
+        Chunk layout (per ROSPublishingHAL._flatten_action_payload):
+        each row is ``[dx, dy, dz, rx, ry, rz]`` (n_dof=6). Bound the
+        xyz triplet against ``max_cartesian_step_m`` and the rotvec
+        triplet against ``max_cartesian_step_rad``. Each parameter
+        ``-1.0`` skips its check.
+        """
+        cart_step_m = float(
+            self.get_parameter("max_cartesian_step_m").get_parameter_value().double_value
+        )
+        cart_step_rad = float(
+            self.get_parameter("max_cartesian_step_rad").get_parameter_value().double_value
+        )
+        if cart_step_m < 0.0 and cart_step_rad < 0.0:
+            return (None, "")
+        if n_dof != 6 or len(flat) < 6:
+            return (
+                "cartesian_shape",
+                "cartesian_delta chunk must carry 6-vec row; "
+                f"got n_dof={n_dof} flat_len={len(flat)}",
+            )
+        row0 = flat[:6]
+        if cartesian_delta_scale:
+            if len(cartesian_delta_scale) != 6 or any(
+                not math.isfinite(value) or value <= 0.0 for value in cartesian_delta_scale
+            ):
+                return (
+                    "cartesian_scale",
+                    "cartesian_delta_scale must contain 6 finite positive values",
+                )
+            row0 = [
+                max(-1.0, min(1.0, value)) * scale
+                for value, scale in zip(row0, cartesian_delta_scale, strict=True)
+            ]
+        if cart_step_m >= 0.0:
+            mag_xyz = (row0[0] ** 2 + row0[1] ** 2 + row0[2] ** 2) ** 0.5
+            if mag_xyz > cart_step_m:
+                return (
+                    "cartesian_step",
+                    f"|dxyz|={mag_xyz:.4f} > max_cartesian_step_m={cart_step_m:.4f}",
+                )
+        if cart_step_rad >= 0.0:
+            mag_rot = (row0[3] ** 2 + row0[4] ** 2 + row0[5] ** 2) ** 0.5
+            if mag_rot > cart_step_rad:
+                return (
+                    "cartesian_step_rot",
+                    f"|drotvec|={mag_rot:.4f} > max_cartesian_step_rad={cart_step_rad:.4f}",
+                )
+        return (None, "")
+
+    def _envelope_violation_cartesian_twist(
+        self, *, flat: list[float], n_dof: int
+    ) -> tuple[str | None, str]:
+        """Bound a CARTESIAN_TWIST chunk by the EE speed limits.
+
+        Linear bound from ``max_ee_speed_m_s``, angular from
+        ``max_ee_angular_speed_rad_s``.
+
+        Chunk layout: ``[vx, vy, vz, wx, wy, wz]`` (n_dof=6).
+        """
+        ee_lin = float(self.get_parameter("max_ee_speed_m_s").get_parameter_value().double_value)
+        ee_ang = float(
+            self.get_parameter("max_ee_angular_speed_rad_s").get_parameter_value().double_value
+        )
+        if ee_lin < 0.0 and ee_ang < 0.0:
+            return (None, "")
+        if n_dof != 6 or len(flat) < 6:
+            return (
+                "twist_shape",
+                "cartesian_twist chunk must carry 6-vec row; "
+                f"got n_dof={n_dof} flat_len={len(flat)}",
+            )
+        row0 = flat[:6]
+        if ee_lin >= 0.0:
+            v = (row0[0] ** 2 + row0[1] ** 2 + row0[2] ** 2) ** 0.5
+            if v > ee_lin:
+                return (
+                    "ee_linear_speed",
+                    f"|v_ee|={v:.4f} > max_ee_speed_m_s={ee_lin:.4f}",
+                )
+        if ee_ang >= 0.0:
+            w = (row0[3] ** 2 + row0[4] ** 2 + row0[5] ** 2) ** 0.5
+            if w > ee_ang:
+                return (
+                    "ee_angular_speed",
+                    f"|w_ee|={w:.4f} > max_ee_angular_speed_rad_s={ee_ang:.4f}",
+                )
+        return (None, "")
+
+    def _envelope_violation_body_twist(
+        self, *, flat: list[float], n_dof: int
+    ) -> tuple[str | None, str]:
+        """Bound a BODY_TWIST chunk by the base speed limits.
+
+        Linear from ``max_base_linear_speed_m_s``, angular from
+        ``max_base_angular_speed_rad_s``.
+
+        Chunk layout: ``[vx, vy, vz, wx, wy, wz]`` (n_dof=6). On planar
+        bases only ``vx``, ``vy``, ``wz`` are typically non-zero — the
+        bound is Euclidean over each triplet so it works on both
+        planar and 6-DoF bases.
+        """
+        base_lin = float(
+            self.get_parameter("max_base_linear_speed_m_s").get_parameter_value().double_value
+        )
+        base_ang = float(
+            self.get_parameter("max_base_angular_speed_rad_s").get_parameter_value().double_value
+        )
+        if base_lin < 0.0 and base_ang < 0.0:
+            return (None, "")
+        if n_dof != 6 or len(flat) < 6:
+            return (
+                "body_twist_shape",
+                f"body_twist chunk must carry 6-vec row; got n_dof={n_dof} flat_len={len(flat)}",
+            )
+        row0 = flat[:6]
+        if base_lin >= 0.0:
+            v = (row0[0] ** 2 + row0[1] ** 2 + row0[2] ** 2) ** 0.5
+            if v > base_lin:
+                return (
+                    "base_linear_speed",
+                    f"|v_base|={v:.4f} > max_base_linear_speed_m_s={base_lin:.4f}",
+                )
+        if base_ang >= 0.0:
+            w = (row0[3] ** 2 + row0[4] ** 2 + row0[5] ** 2) ** 0.5
+            if w > base_ang:
+                return (
+                    "base_angular_speed",
+                    f"|w_base|={w:.4f} > max_base_angular_speed_rad_s={base_ang:.4f}",
+                )
+        return (None, "")
+
+    def _envelope_violation_gripper(self, *, flat: list[float]) -> tuple[str | None, str]:
+        """GRIPPER_*: reject a width outside ``[gripper_min, gripper_max]``.
+
+        Despite the historical wording, this does **not** clamp: it returns a
+        ``gripper_range`` violation, which the caller routes to
+        ``_handle_violation`` — drop the chunk and fire the e-stop. That
+        is the deny-by-default contract (CLAUDE.md §3); nothing in OpenRAL
+        silently corrects an out-of-range command into range, which is also
+        why ``safety.clamped`` is a literal ``False`` at every site and
+        ``openral.safety.clamps`` has nothing to count.
+
+        The launch sources these parameters from the robot.yaml's
+        gripper joint's ``position_limits`` (when present); ``-1.0``
+        on either end skips that side of the bound.
+        """
+        gmin = float(self.get_parameter("gripper_min").get_parameter_value().double_value)
+        gmax = float(self.get_parameter("gripper_max").get_parameter_value().double_value)
+        if gmin < 0.0 and gmax < 0.0:
+            return (None, "")
+        if not flat:
+            return ("gripper_shape", "gripper chunk has empty flat array")
+        w = float(flat[0])
+        if gmin >= 0.0 and w < gmin:
+            return ("gripper_range", f"width={w:.4f} < gripper_min={gmin:.4f}")
+        if gmax >= 0.0 and w > gmax:
+            return ("gripper_range", f"width={w:.4f} > gripper_max={gmax:.4f}")
+        return (None, "")
+
+    def _handle_violation(self, msg: object, *, kind: str, reason: str) -> None:
+        """Drop the candidate, fire estop, log structured."""
+        from std_msgs.msg import Empty
+
+        self._chunks_dropped += 1
+        self._last_drop_reason = kind
+        self._estopped = True
+        self._last_estop_ns = time.time_ns()
+        assert self._estop_pub is not None  # invariant on active state
+        self._estop_pub.publish(Empty())
+        # ADR-0096 — the same latch, now also as durable typed current state.
+        # This node never had a FailureTrigger producer at all, so before this
+        # every drop and e-stop it made was untyped: a bare std_msgs/Empty.
+        self._set_safety_status(
+            latched=True,
+            drop_reason=_violation_kind_constant(kind, self._status_msg_cls),
+            detail=f"{kind}: {reason}",
+            rskill_id=str(getattr(msg, "rskill_id", "") or ""),
+            trace_id=str(getattr(msg, "trace_id", "") or ""),
+        )
+        # Log structured for the query-time correlator.
+        self.get_logger().error(
+            "safety.envelope_violation "
+            f"kind={kind!r} reason={reason!r} "
+            f"rskill_id={msg.rskill_id!r} trace_id={msg.trace_id!r}"
+        )
+
+    # ── External estop subscription (defense in depth) ───────────────────────
+
+    def _on_external_estop(self, _msg: object) -> None:
+        """Latch on any external ``/openral/estop`` publication.
+
+        Note that the node publishes ``/openral/estop`` itself on internal
+        envelope violation, so it will see its own message — but
+        ``self._estopped`` is already True by the time this callback
+        fires, so the latch is idempotent.
+        """
+        if not self._estopped:
+            self._estopped = True
+            self._last_estop_ns = time.time_ns()
+            self._last_drop_reason = "external_estop"
+            # ADR-0096 — ``/openral/estop`` is a bare std_msgs/Empty, so the
+            # publisher is unknowable from the wire. DROP_EXTERNAL_ESTOP names
+            # the topic that latched us rather than claiming a violation kind
+            # nobody reported (CLAUDE.md §1.2).
+            self._set_safety_status(
+                latched=True,
+                drop_reason=self._status_msg_cls.DROP_EXTERNAL_ESTOP,
+                detail="external /openral/estop publication latched the node",
+                rskill_id="",
+                trace_id="",
+            )
+            self.get_logger().warning("safety.external_estop_received: latching node")
+
+    # ── /openral/estop_reset ─────────────────────────────────────────────────
+
+    def _on_estop_reset(self, request: object, response: object) -> object:
+        """Service callback: clear the estop latch after the cooldown."""
+        del request
+        if not self._estopped:
+            response.success = True
+            response.message = "no estop to reset"
+            return response
+
+        cooldown_s: float = (
+            self.get_parameter("estop_reset_cooldown_s").get_parameter_value().double_value
+        )
+        elapsed_ns = time.time_ns() - self._last_estop_ns
+        if elapsed_ns < int(cooldown_s * 1e9):
+            response.success = False
+            response.message = f"cooldown not elapsed ({elapsed_ns / 1e9:.3f}s < {cooldown_s}s)"
+            return response
+
+        self._estopped = False
+        self._last_drop_reason = ""
+        # ADR-0096 clear transition — the durable value must follow recovery,
+        # or a late-joining consumer reads a cleared node as latched forever.
+        self._set_safety_status(
+            latched=False,
+            drop_reason=self._status_msg_cls.DROP_NONE,
+            detail="estop cleared via /openral/estop_reset",
+            rskill_id="",
+            trace_id="",
+        )
+        self.get_logger().info("safety.estop_reset succeeded")
+        response.success = True
+        response.message = "estop cleared"
+        return response
+
+    # ── ADR-0096: latched SafetyStatus ───────────────────────────────────────
+
+    def _set_safety_status(
+        self,
+        *,
+        latched: bool,
+        drop_reason: int,
+        detail: str,
+        rskill_id: str,
+        trace_id: str,
+    ) -> None:
+        """Record the current safety state and publish it if it changed.
+
+        Transition-gated on the ``(latched, drop_reason)`` pair: this is
+        called from the chunk callback, and republishing per chunk would put a
+        publication on the chunk-rate path for no new information. The 1 Hz
+        liveness refresh keeps ``header.stamp`` current instead
+        (hazard-log HZ-0096-1).
+        """
+        if self._status_latched == latched and self._status_drop_reason == drop_reason:
+            return
+        self._status_latched = latched
+        self._status_drop_reason = drop_reason
+        self._status_detail = detail
+        self._status_rskill_id = rskill_id
+        self._status_trace_id = trace_id
+        self._publish_safety_status_now()
+
+    def _publish_safety_status_now(self) -> None:
+        """Stamp and publish the current status, transition or not.
+
+        Used for the activation publish and the 1 Hz liveness refresh. No-op
+        before ``on_configure`` opens the publisher.
+        """
+        if self._status_pub is None or self._status_msg_cls is None:
+            return
+        msg = self._status_msg_cls()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.latched = self._status_latched
+        msg.drop_reason = (
+            self._status_msg_cls.DROP_NONE
+            if self._status_drop_reason is None
+            else self._status_drop_reason
+        )
+        msg.detail = self._status_detail
+        msg.rskill_id = self._status_rskill_id
+        msg.trace_id = self._status_trace_id
+        self._status_pub.publish(msg)
+
+
+# Back-compat alias — the original skeleton class name still imports.
+SafetySupervisorNode = SafetyPassthroughNode
+
+
+def main(args: list[str] | None = None) -> int:
+    """Entry point for ``ros2 run openral_safety supervisor_node``."""
+    from openral_observability import configure_observability
+
+    # Idempotent + no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset.
+    # Drives the safety.check spans onto the same OTLP collector the
+    # rest of the graph is publishing to.
+    configure_observability(service_name="openral.safety")
+
+    rclpy.init(args=args)
+    try:
+        node = SafetyPassthroughNode()
+        try:
+            rclpy.spin(node)
+        except (KeyboardInterrupt, ExternalShutdownException):
+            pass  # context already shut down by the SIGINT handler
+        finally:
+            node.destroy_node()
+    finally:
+        rclpy.try_shutdown()  # idempotent — no-op if already shut down
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,176 @@
+# rSkill manifest — OpenRAL packaging format V1 (CLAUDE.md §6.4)
+# Wraps: lerobot/pi05_libero_finetuned_v044 with int8 runtime packing.
+# Base:  lerobot/pi05_base (Physical Intelligence π0.5)
+#
+# Why int8, not NF4: bf16 π0.5 peaks at 8.06 GB device memory, doesn't fit an
+# 8 GB card after driver overhead. NF4 4-bit fits but is too lossy (0/5 on
+# libero_spatial). LLM.int8 (bitsandbytes Linear8bitLt on Linear >=4M elements)
+# restores competence and fits at 6.35 GB; adapter loads bf16, rewraps, packs
+# to int8 on device move.
+#
+# int8 is a memory fit, not a free one. GB10, LIBERO-Spatial tasks 0/1/2, seed
+# 42, max_steps 220, n=50/task/arm (300 episodes), quantization.dtype the only
+# variable:
+#            task 0    task 1    task 2    total            step time
+#     bf16     98%       94%       94%     143/150 = 95%    9.6 ms
+#     int8     76%       22%       82%      93/150 = 62%   24.8 ms
+# ~33-point cost overall (Fisher exact p=4e-13), ~2.6x slower/step, and
+# TASK-DEPENDENT (22-82% swing) — a single-task spot-check can look fine while
+# task 1 nearly fails; the variance is the real hazard.
+#
+# int8 exists only to buy the 1.7 GB an 8 GB card needs; 62% beats not running.
+# On >=9 GB prefer bf16 (`--vla-extra dtype=bf16`, no manifest edit). TensorRT
+# FP8 (openral-pro, OPENRAL_PI05_TRT=1, OPENRAL_PI05_TRT_PRECISION=fp8_bf16_attn)
+# is better again: 78.9 ms/call vs bf16 eager's 190 ms, bf16-identical success.
+# Older "0.5-0.7 at n=10" figure (still in eval/scene_libero_spatial.json) is
+# unusable, not wrong: binomial SD ~0.16 at that n covers most of the spread above.
+#
+# LICENSE (CLAUDE.md §7.4): code Apache-2.0; weights Physical Intelligence
+# "permissive research" — commercial deployment needs a separate PI agreement.
+# Loader derives is_commercial_use_allowed=False from license=permissive_research;
+# activating commercially needs OPENRAL_ALLOW_NONCOMMERCIAL=1 + vendor agreement.
+
+# ── Identity ───────────────────────────────────────────────────────────────
+schema_version: "0.1"
+name: "OpenRAL/rskill-pi05-franka_panda-libero_spatial-int8"
+evaluated_tasks: ["libero_spatial", "libero_object", "libero_goal", "libero_10"]  # trained on the full LIBERO set (all 4 suites, 40 tasks)
+version: "0.1.0"
+license: "permissive_research"   # non-standard; weights are NOT apache-2.0
+role: "s1"
+kind: "vla"  # rSkill kind discriminator. "vla" = learnable Vision-Language-Action policy.
+
+# ── Policy identity ────────────────────────────────────────────────────────
+model_family: "pi05"
+
+# ── Compatibility contract ─────────────────────────────────────────────────
+# LIBERO benchmark targets table-top manipulation with a Franka Panda arm.
+embodiment_tags:
+  - "franka_panda"
+
+# π0.5 LIBERO consumes the same two-RGB-camera + 8-D state contract as
+# smolvla_libero (LiberoEnv ``image`` and ``image2`` streams renamed to
+# ``camera1`` / ``camera2`` by the stored preprocessor).
+sensors_required:
+  - modality: "rgb"
+    vla_feature_key: "observation.images.camera1"
+    min_width: 224
+    min_height: 224
+  - modality: "rgb"
+    vla_feature_key: "observation.images.camera2"
+    min_width: 224
+    min_height: 224
+
+# Output side. For the canonical franka_panda embodiment the
+# loader auto-fills n_dof + vla_action_key from robots/franka_panda/robot.yaml.
+actuators_required:
+  - kind: "joint_position"
+    control_mode_semantics:
+      mode: "absolute"
+
+# ── Runtime / weights ──────────────────────────────────────────────────────
+runtime: "pytorch"
+quantization:
+  # ``int8`` selects the OpenRAL pi05 adapter's LLM.int8 path: load the bf16
+  # source, rewrap every Linear ≥4M weight elements to bitsandbytes
+  # ``Linear8bitLt`` (accelerate-free meta-init), then pack to int8 on the
+  # ``.to(cuda)`` move. Unlike NF4 there is no prequantized pack —
+  # quantization runs at startup from the bf16 checkpoint below.
+  dtype: "int8"
+  backend: "pytorch"
+# Informational VRAM ceilings (`ral skill check` / `openral doctor`); actual
+# dtype stays pinned by quantization.dtype (CLAUDE.md §11 forbids silent
+# downcast). Peak device memory for a full rollout, GB10, torch
+# max_memory_reserved (allocated in parens): int8 6.35 GB (5.90), bf16 8.06 GB
+# (7.91), fp32 16.10 GB (15.76) — matches the header's "bf16 OOMs on 8 GB".
+# Not to be confused with host RSS during load (~13 GiB, same order for every
+# dtype — the source of an earlier mistaken "bf16 VRAM" reading).
+min_vram_gb:
+  fp32: 16.1
+  bf16: 8.1
+  int8: 6.4
+weights_uri: "hf://lerobot/pi05_libero_finetuned_v044"
+
+# ── Preprocessing (all knobs needed to interpret IO) ───────────────────────
+# Processors are self-hosted in the OpenRAL rSkill repo (published copies of the
+# source checkpoint's processors), so the rSkill does not depend on the upstream
+# lerobot/pi05_libero_finetuned_v044 repo to resolve them.
+processors:
+  preprocessor_uri: "hf://OpenRAL/rskill-pi05-franka_panda-libero_spatial-int8/policy_preprocessor.json"
+  postprocessor_uri: "hf://OpenRAL/rskill-pi05-franka_panda-libero_spatial-int8/policy_postprocessor.json"
+# The pi05 LIBERO finetune wants the default LIBERO image preprocessing
+# (180° rotation + camera1/2 alias remap to image/image2) and the canonical
+# LIBERO 8-D proprio state.
+image_preprocessing:
+  flip_180: true
+  aliases:
+    top: "image"
+    wrist: "image2"
+state_contract:
+  # LIBERO checkpoints train on 8-D TASK-SPACE proprio
+  # (eef_pos ‖ eef_axisangle ‖ gripper). `openral sim run` supplies it directly;
+  # `openral deploy sim` assembles it from live TF + JointState via the
+  # `libero_eef8d` state-adapter. Without the layout the runner falls back to raw
+  # joint-space state and the policy never reaches the target. Shared verbatim
+  # with smolvla-libero — same franka_panda LIBERO 8-D contract.
+  layout: "libero_eef8d"
+  dim: 8
+  bindings:
+    eef_frame: "panda_hand_tcp"       # robosuite grip site within ~6 mm
+    world_frame: "world"              # HAL-published static world->base root
+    gripper_qpos_joints:
+      - "panda_gripper"               # single deploy gripper joint, mirrored to [v,-v]
+
+# ── Execution semantics ────────────────────────────────────────────────────
+chunk_size: 50
+# Half-chunk replan — closed-loop replanning every 25 env steps.
+n_action_steps: 25
+latency_budget:
+  per_chunk_ms: 200.0   # π0.5 (3B PaliGemma backbone) is heavier than SmolVLA
+
+# ── Provenance ─────────────────────────────────────────────────────────────
+# Headline benchmark dict is populated by `openral benchmark scene
+# --write-eval --update-manifest` (see eval/scene_libero_spatial.json for the
+# locally-reproduced result).
+
+paper_url: "https://arxiv.org/abs/2410.24164"
+source_repo: "hf://lerobot/pi05_libero_finetuned_v044"
+
+description: >
+  π0.5 (PaliGemma 3B + flow-matching) fine-tuned on LIBERO v0.44,
+  LLM.int8-packed at load so 8 GB GPUs can run it at all — bf16 peaks at
+  8.1 GB and will not load there. int8 is a memory fit, not a free one: over
+  300 LIBERO-Spatial episodes it scores 62% vs bf16's 95%, task-dependent
+  (22-82%), and is ~2.6x slower per step. With >9 GB prefer
+  `--vla-extra dtype=bf16`, or openral-pro's TensorRT FP8; see the README. PI
+  permissive-research weights: commercial use needs a vendor agreement.
+
+# Action vocabulary surfaced to the reasoner LLM tool
+# palette so it can pick this skill by what it does (action verb +
+# object + scene), not just by its slug.
+actions:
+  - "pick"
+  - "place"
+  - "open"
+  - "close"
+objects:
+  - "bowl"
+  - "cup"
+  - "drawer"
+  - "object"
+scenes:
+  - "tabletop"
+  - "kitchen"
+
+# Per-checkpoint action contract (consumed by the dataset bridge
+# to bind the LeRobot v3 `action` feature shape).
+action_contract:
+  cartesian_delta_scale: [0.05, 0.05, 0.05, 0.5, 0.5, 0.5]
+  dim: 7
+  # LIBERO action space is 6-D OSC end-effector delta + gripper.
+  # Declaring the representation makes deploy-sim dispatch cartesian_delta +
+  # gripper (via canonical_slots_for_representation) instead of defaulting the
+  # whole vector to JOINT_POSITION, which the joint-space envelope rejects.
+  representation: "delta_ee_6d_plus_gripper"
+
+benchmarks:
+  libero_spatial: 0.5

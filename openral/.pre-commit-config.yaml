@@ -1,0 +1,75 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      # Recorded artefacts are evidence, not source: a validation round's
+      # deploy log is checked in byte-for-byte (see
+      # tests/unit/fixtures/validation_matrix/SOURCE.txt) and `ros2 launch`
+      # really does end its `Caught exception in launch` line with a trailing
+      # space. Trimming it would make the fixture a paraphrase of the run.
+      - id: trailing-whitespace
+        exclude: ^tests/unit/fixtures/validation_matrix/
+      - id: end-of-file-fixer
+        exclude: ^tests/unit/fixtures/validation_matrix/
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: [--maxkb=2000]
+      - id: check-merge-conflict
+      - id: detect-private-key
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  # mypy runs as a local hook against the project venv so it can resolve
+  # workspace packages (openral_*) and third-party stubs. The mirror
+  # mypy hook used an isolated env that could not see the workspace.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (project venv)
+        entry: uv run mypy --strict -p openral_core -p openral_cli -p openral_sim
+        language: system
+        pass_filenames: false
+        files: ^python/(core|cli|sim)/
+      - id: schema-export
+        name: check JSON Schema drift
+        entry: uv run python tools/schema_export.py --check
+        language: system
+        pass_filenames: false
+        files: ^(python/core/src/openral_core/|tools/schema_export\.py)
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+      - id: clang-format
+        files: \.(cpp|hpp|h|c|cc)$
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.3.0
+    hooks:
+      - id: codespell
+        # Vendored third-party bundles are generated artefacts: their minified
+        # identifiers (`ot`, `Ue`, `ue`, `Ot`) trip every short-word rule and
+        # must never be "corrected" — that would corrupt the bundle.
+        exclude: ^python/observability/src/openral_observability/dashboard/static/vendor/
+        args:
+          # Additions beyond the original list, all verified false positives:
+          #   ot / mis / ans  — local variable names (odom translation,
+          #     identity mismatch, model answer), not prose.
+          #   childrens       — VERBATIM in a BEHAVIOR-1K task instruction
+          #     ("collecting childrens toys"); the benchmark matches on the
+          #     exact string, so fixing the grammar would break task lookup.
+          #   froms           — plural of Docker's `FROM` keyword.
+          #   sroll           — the SENSOR-prefixed unpacking of a static
+          #     transform (`sx, sy, sz, sroll, spitch, syaw`) in
+          #     deploy_e2e.launch.py. An identifier, not prose; "scroll" would
+          #     break the tuple it destructures.
+          #   unparseable / overrideable / re-use / re-declaring — accepted
+          #     variant spellings already used consistently in the tree.
+          - "--ignore-words-list=som,deques,nd,socio-economic,implementors,te,theses,empy,alph,crashers,ot,mis,ans,childrens,froms,unparseable,overrideable,re-use,re-declaring,sroll"
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]

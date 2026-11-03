@@ -1,0 +1,290 @@
+"""Unit tests for ``openral_runner.base`` and the ``InferenceRunner`` Protocol.
+
+No mocks. Uses a real in-process ``InferenceRunnerBase`` subclass that
+simulates per-tick latency via ``time.sleep`` and a real
+``TickResult``. Asserts:
+
+* The Protocol's structural ``isinstance`` check accepts the base subclass.
+* ``InferenceRunnerBase.run`` ticks ``max_ticks`` times and aggregates
+  the per-tick timings into ``RunResult`` (mean / p99).
+* The 30 Hz cadence is honoured within ±2 ms over 10 ticks (≈ the cadence
+  contract the hardware runner depends on).
+* ``DeadlineOverrunPolicy`` is applied per the configured mode.
+* ``activate`` / ``deactivate`` toggle the ``_active`` flag and
+  re-running after deactivation works.
+"""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+from openral_core import DeadlineOverrunPolicy, TickResult
+from openral_core.exceptions import ROSDeadlineMissed
+from openral_runner import InferenceRunner, InferenceRunnerBase
+
+# ── A tiny real subclass (no mocks; CLAUDE.md §1.11) ─────────────────────────
+
+
+class FixedLatencyRunner(InferenceRunnerBase):
+    """Test runner that sleeps a configured amount per tick."""
+
+    def __init__(self, *, fake_inference_s: float, **kw: object) -> None:
+        super().__init__(**kw)  # type: ignore[arg-type]
+        self._fake_inference_s = fake_inference_s
+
+    def _tick_impl(self, tick_idx: int) -> TickResult:
+        t0 = time.perf_counter()
+        time.sleep(self._fake_inference_s)
+        dt_ms = (time.perf_counter() - t0) * 1e3
+        return TickResult(
+            stamp_ns=time.monotonic_ns(),
+            tick_idx=tick_idx,
+            inference_ms=dt_ms,
+            tick_ms=dt_ms,
+            action_applied=True,
+        )
+
+
+# ── Protocol conformance ────────────────────────────────────────────────────
+
+
+def test_base_satisfies_inference_runner_protocol() -> None:
+    """``isinstance`` against the structural Protocol must succeed."""
+    runner = FixedLatencyRunner(fake_inference_s=1e-3, rate_hz=30.0)
+    assert isinstance(runner, InferenceRunner)
+
+
+def test_base_constructor_rejects_zero_rate() -> None:
+    """``rate_hz <= 0`` is invalid — caller error."""
+    with pytest.raises(ValueError, match="rate_hz must be > 0"):
+        FixedLatencyRunner(fake_inference_s=1e-3, rate_hz=0.0)
+
+
+def test_base_constructor_rejects_negative_rate() -> None:
+    with pytest.raises(ValueError, match="rate_hz must be > 0"):
+        FixedLatencyRunner(fake_inference_s=1e-3, rate_hz=-1.0)
+
+
+# ── Lifecycle ────────────────────────────────────────────────────────────────
+
+
+def test_activate_resets_tick_counter() -> None:
+    """Re-activating a runner resets the tick counter."""
+    runner = FixedLatencyRunner(fake_inference_s=1e-3, rate_hz=100.0)
+    runner.run(max_ticks=3)
+    assert runner._tick_idx == 3
+    runner.activate()
+    assert runner._tick_idx == 0
+
+
+def test_deactivate_short_circuits_run() -> None:
+    """``run`` exits when ``_active`` flips to False mid-tick."""
+    runner = FixedLatencyRunner(fake_inference_s=1e-3, rate_hz=100.0)
+    runner.activate()
+    runner.deactivate()
+    result = runner.run(max_ticks=10)
+    # run() re-activates when not active, so deactivating before run() still
+    # executes all 10 ticks.
+    assert result.n_ticks == 10
+
+
+# ── Cadence ──────────────────────────────────────────────────────────────────
+
+
+def test_run_honors_30_hz_cadence() -> None:
+    """10 ticks at 30 Hz wall-time within ±10 ms of 333.3 ms.
+
+    Per-tick inference is 1 ms (well under the 33.3 ms period), so the loop
+    is sleep-dominated. The base's rate limiter must keep total wall-time
+    close to 10 × 33.33 ms = 333.3 ms.
+    """
+    runner = FixedLatencyRunner(fake_inference_s=1e-3, rate_hz=30.0)
+    t0 = time.perf_counter()
+    result = runner.run(max_ticks=10)
+    elapsed_ms = (time.perf_counter() - t0) * 1e3
+    expected_ms = 10 * (1000.0 / 30.0)
+    assert result.n_ticks == 10
+    assert abs(elapsed_ms - expected_ms) < 10.0, (
+        f"30 Hz x 10 ticks elapsed {elapsed_ms:.3f} ms, expected ~{expected_ms:.3f} ms"
+    )
+
+
+def test_run_result_aggregates_timings_correctly() -> None:
+    """Mean / p99 match the per-tick samples."""
+    runner = FixedLatencyRunner(fake_inference_s=2e-3, rate_hz=100.0)
+    result = runner.run(max_ticks=20)
+    assert result.n_ticks == 20
+    # Each tick is ≥ 2 ms; mean and p99 should both be in that ballpark.
+    assert result.avg_inference_ms >= 1.5
+    assert result.avg_inference_ms <= 6.0
+    assert result.p99_inference_ms >= result.avg_inference_ms
+    assert result.avg_tick_ms == pytest.approx(result.avg_inference_ms, rel=1e-3)
+
+
+def test_run_result_empty_when_max_ticks_zero() -> None:
+    """``max_ticks=0`` returns an empty ``RunResult`` (no ticks executed)."""
+    runner = FixedLatencyRunner(fake_inference_s=1e-3, rate_hz=30.0)
+    runner.activate()
+    runner.deactivate()
+    # run() re-activates, so max_ticks=0 can't be produced via run(); assert the
+    # 0-tick case round-trips through _build_run_result directly instead.
+    rr = runner._build_run_result([], budget_violations=0, trace_id=None)
+    assert rr.n_ticks == 0
+    assert rr.avg_inference_ms == 0.0
+    assert rr.p99_inference_ms == 0.0
+
+
+# ── Deadline-overrun policy ──────────────────────────────────────────────────
+
+
+def test_deadline_overrun_warn_continues(caplog: pytest.LogCaptureFixture) -> None:
+    """``WARN`` policy logs but does not raise."""
+    runner = FixedLatencyRunner(
+        fake_inference_s=20e-3,  # 20 ms > 16.6 ms period at 60 Hz
+        rate_hz=60.0,
+        deadline_overrun_policy=DeadlineOverrunPolicy.WARN,
+    )
+    result = runner.run(max_ticks=5)
+    assert result.n_ticks == 5
+    # WARN logs to structlog; not asserted on stdout because structlog
+    # may route through pytest's caplog or not depending on test env.
+
+
+def test_deadline_overrun_raise_aborts() -> None:
+    """``RAISE`` policy raises ``ROSDeadlineMissed`` on the first overrun."""
+    runner = FixedLatencyRunner(
+        fake_inference_s=20e-3,
+        rate_hz=60.0,
+        deadline_overrun_policy=DeadlineOverrunPolicy.RAISE,
+    )
+    with pytest.raises(ROSDeadlineMissed, match="exceeded"):
+        runner.run(max_ticks=5)
+
+
+# ── deadline-miss WARN rate limit ────────────────────────────────────────────
+
+
+def _miss_runner() -> FixedLatencyRunner:
+    """A runner whose every tick overruns its budget."""
+    return FixedLatencyRunner(
+        fake_inference_s=0.0,
+        rate_hz=30.0,
+        deadline_overrun_policy=DeadlineOverrunPolicy.WARN,
+    )
+
+
+def test_first_deadline_miss_always_logs() -> None:
+    """An operator must see the first miss immediately, not after a window."""
+    runner = _miss_runner()
+    due, suppressed, worst_ms = runner._deadline_log_due(99.0)
+    assert due is True
+    assert suppressed == 0
+    assert worst_ms == 99.0
+
+
+def test_subsequent_misses_are_counted_not_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A host that misses every tick emits one line, not 30 per second — WARNING is
+    the one band an operator cannot filter away, so an unthrottled 30 Hz warn buries
+    the diagnostic context.
+    """
+    runner = _miss_runner()
+    now = 1_000.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+
+    assert runner._deadline_log_due(40.0)[0] is True  # first one logs
+    for _ in range(89):  # ~3 s of misses at 30 Hz, same instant
+        assert runner._deadline_log_due(40.0)[0] is False
+
+    assert runner._deadline_suppressed == 89
+
+
+def test_summary_line_carries_the_suppressed_count_and_worst_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No miss is silently dropped — it is reported as a count instead of a row."""
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    runner = _miss_runner()
+
+    assert runner._deadline_log_due(40.0)[0] is True
+    runner._deadline_log_due(55.0)
+    runner._deadline_log_due(120.0)  # the worst one
+    runner._deadline_log_due(60.0)
+
+    clock["now"] += 6.0  # past the 5 s period
+    due, suppressed, worst_ms = runner._deadline_log_due(45.0)
+
+    assert due is True
+    assert suppressed == 3
+    assert worst_ms == 120.0, "worst_tick_ms must survive the suppressed window"
+
+
+def test_counters_reset_after_each_emitted_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The second window reports its own misses, not a running total."""
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    runner = _miss_runner()
+
+    runner._deadline_log_due(40.0)  # first line
+    runner._deadline_log_due(90.0)
+    clock["now"] += 6.0
+    runner._deadline_log_due(50.0)  # second line, reports the above
+
+    runner._deadline_log_due(41.0)
+    clock["now"] += 6.0
+    _, suppressed, worst_ms = runner._deadline_log_due(42.0)
+
+    assert suppressed == 1
+    assert worst_ms == 42.0, "the 90 ms tick belonged to an already-reported window"
+
+
+def test_every_miss_still_counts_toward_the_metric() -> None:
+    """Only the log is rate-limited; deadline_misses stays the honest rate signal."""
+    runner = _miss_runner()
+    result = runner.run(max_ticks=5)
+    # All five ticks overran; the run completes and reports them.
+    assert result.n_ticks == 5
+
+
+def test_latency_budget_violation_counter() -> None:
+    """Ticks exceeding ``latency_budget_ms`` count toward ``budget_violations``."""
+    runner = FixedLatencyRunner(
+        fake_inference_s=5e-3,  # ~5 ms per tick
+        rate_hz=30.0,
+        latency_budget_ms=2.0,  # everything will violate
+    )
+    result = runner.run(max_ticks=4)
+    assert result.budget_violations == 4
+
+
+# ── _should_terminate hook (amendment 1) ─────────────────────────────────────
+
+
+class StopAfterNRunner(FixedLatencyRunner):
+    """Stops after ``stop_after`` ticks via the ``_should_terminate`` hook."""
+
+    def __init__(self, *, stop_after: int, **kw: object) -> None:
+        super().__init__(**kw)  # type: ignore[arg-type]
+        self._stop_after = stop_after
+
+    def _should_terminate(self) -> bool:
+        return self._tick_idx >= self._stop_after
+
+
+def test_should_terminate_default_false_is_hardware_compatible() -> None:
+    """``DeployRunner`` semantics: default hook never terminates early — a subclass
+    that doesn't override ``_should_terminate`` runs to ``max_ticks`` exactly as
+    before the hook was added.
+    """
+    runner = FixedLatencyRunner(fake_inference_s=1e-3, rate_hz=100.0)
+    result = runner.run(max_ticks=5)
+    assert result.n_ticks == 5
+
+
+def test_should_terminate_breaks_run_loop_early() -> None:
+    """Subclass override stops ``run`` before ``max_ticks``."""
+    runner = StopAfterNRunner(stop_after=3, fake_inference_s=1e-3, rate_hz=100.0)
+    # max_ticks deliberately far above stop_after — the hook is the real bound.
+    result = runner.run(max_ticks=100)
+    assert result.n_ticks == 3

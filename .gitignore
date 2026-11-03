@@ -1,0 +1,48 @@
+# Experiment outputs
+/artifacts/*
+!/artifacts/.gitkeep
+*.rosbag
+*.mcap
+rosbag2_*/
+
+# Isaac Sim / Omniverse
+*.usd.log
+kit_*.log
+/logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.uv/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Claude Code harness-internal state (not project content)
+.claude/
+
+
+# §19 run artifacts (openral_ext/run_manifest) -- reproducible on demand,
+# not meant to bloat git history (large logs/traces per run).
+experiments/manifests/
+/ros/build/
+/ros/install/
+/ros/log/
+
+# NAIF generic kernels (space_context/fetch in earth_visibility.py docstring), large and public
+space_context/kernels/
+
+# local data
+/artifacts/
+.worktree/
+
+# simulation assets, installed by scripts/fetch_assets.sh
+/space_robotics_bench/assets/lunar_base/usd/
+/space_robotics_bench/assets/srb_assets/
+/space_robotics_bench/assets/ASSETS_INSTALL.md

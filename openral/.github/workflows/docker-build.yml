@@ -1,0 +1,263 @@
+name: docker-build
+# Builds the open GStreamer-free deploy image (`openral:x86`) from
+# docker/inference/Dockerfile.x86.
+#
+# The only auto-trigger is `push` to master → build + push openral:x86 to GHCR.
+# It ran on pull_request too until 2026-08-08; at ~15-20 min of runner time per
+# commit it was the most expensive thing in CI, and it re-ran on every push to a
+# branch. Master-only means a broken image (or a live-ROS regression) is caught
+# on merge rather than in review — run the workflow by hand on the branch when a
+# PR actually touches the image or those tests.
+#
+# The `paths:` filter means even master only builds when the image's build
+# inputs change (or the live-ROS tests it hosts). workflow_dispatch is the
+# manual escape hatch: it never pushes an image, but it DOES write a scratch
+# layer cache ref (`:buildcache-dispatch`) so the registry cache export path can
+# be exercised on demand without touching the cache master reads.
+#
+# The paths deliberately include python/**, packages/**, cpp/** and the lock
+# files: the image BAKES the code in (COPY + uv sync + colcon build), it does
+# not mount it, so code changes are real build inputs. Rebuild cost is kept
+# down by a registry-backed BuildKit layer cache on GHCR ($IMAGE:buildcache):
+# master pushes write it, every run reads it, so a typical build reuses the
+# CUDA/apt/venv layers and only re-runs the layers its diff invalidates.
+#
+# ── Where the time actually goes ─────────────────────────────────────
+# Forensics on run 31244132105 (a PR build, 1058.9s in `docker buildx build`)
+# found the cost was mostly NOT cache misses — apt, the uv installer and the
+# whole runtime-base stage all hit cache:
+#   474.5s (45%)  `--load` exporting the image to a tarball (7.9 GB of
+#                 compressed layers; the image itself is 25.2 GB) and replaying
+#                 it into dockerd, under the docker-container driver
+#   211.7s (20%)  colcon, of which 210s was opentelemetry_cpp_vendor and the
+#                 safety kernel it serially gates
+#   154.4s (15%)  pulling 4.59 GB of GHCR cache layers on steps that HIT cache
+#   115.3s (11%)  uv sync, re-downloading 4.42 GiB of wheels
+#    69.4s  (7%)  COPY --from=builder /workspace
+# The first, second and fourth are addressed by the containerd image store
+# below and by the layer split in docker/inference/Dockerfile.x86.
+#
+# Note what is NOT on that list: pushing to GHCR. The push step is gated on
+# `github.event_name == 'push'`, so a workflow_dispatch run skips it.
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - docker/inference/**
+      # ...but README.md is NOT a build input: it is never copied into the
+      # image and cannot change a layer. Without this negation a docs-only edit
+      # in this directory triggers a full image build (~7 min even on a total
+      # cache hit, because the image still has to be materialized). Negations
+      # must come AFTER the pattern they narrow — later patterns win.
+      - '!docker/inference/README.md'
+      # The build context definition: excluding a path here changes what every
+      # COPY sees, so it is a real build input.
+      - .dockerignore
+      - pyproject.toml
+      - uv.lock
+      - packages/**
+      - cpp/**
+      - python/**
+      - .github/workflows/docker-build.yml
+      # The live-ROS suite runs in this job and nowhere else (issue #46), so a
+      # diff that only touches those tests must still rebuild + run them.
+      - scripts/ros_live_tests.sh
+      - tests/integration/test_reasoner_*.py
+      - tests/integration/test_critic_producer_node.py
+      - tests/integration/test_sim_sensor_bridge_tf_guard.py
+      - tests/integration/test_safety_status_latched_topic.py
+      - tests/integration/test_safety_kernel_place_allowance_band.py
+      - tests/integration/test_segment_in_view_service.py
+      - tests/integration/test_nav2_scan_filter_live.py
+      # An IDL-constant contract: it reads the colcon-generated openral_msgs,
+      # so this image is its only CI surface even though it lives in tests/unit.
+      - tests/unit/test_safety_status_msg.py
+      - tests/unit/test_failure_bus_idl_mirror.py
+      # It spawns the real kernel through the tests/sim/safety helpers, so a
+      # change to those must rebuild + re-run it too.
+      - tests/sim/safety/_kernel_subprocess.py
+
+permissions:
+  contents: read
+  packages: write  # GHCR push on merge to master
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE: ghcr.io/openral/openral
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # The image is ~25 GB (CUDA 13 + ROS Jazzy + colcon build). GitHub-hosted
+      # runners ship ~14 GB free on /, so reclaim the big preinstalled toolchains
+      # we don't need before building.
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          docker image prune -af || true
+          df -h /
+
+      # Switch dockerd to the containerd image store. This is what lets us drop
+      # the `docker-container` buildx driver, and it is the single biggest win
+      # in this workflow.
+      #
+      # With `docker-container`, buildkit runs in its own container with its own
+      # store, so `--load` has to serialize the finished image to a tarball and
+      # replay it into dockerd. On run 31244132105 that cost 474.5s of a 1058.9s
+      # build — 45% of the total — split as `exporting layers 278.1s` +
+      # `sending tarball 196.3s`, to move 7.9 GB of compressed layers that
+      # buildkit had *just* finished assembling. It is paid in full on every
+      # run, including a hypothetical 100% cache hit, which is why cache tuning
+      # alone could never get this workflow under ~11 minutes.
+      #
+      # With the containerd store, the built image lands directly in the store
+      # the daemon already reads from, so there is no export and no import. The
+      # historical reason for `docker-container` — "the default docker driver
+      # cannot export a registry cache" — is exactly what the containerd store
+      # lifts, so the registry layer cache below keeps working.
+      #
+      # Restarting dockerd discards any previously pulled images; nothing has
+      # been pulled at this point, and `Free runner disk` above already pruned.
+      - name: Enable the containerd image store
+        run: |
+          sudo mkdir -p /etc/docker
+          printf '%s\n' '{ "features": { "containerd-snapshotter": true } }' \
+            | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # Fail loudly rather than silently falling back to the overlay2 store
+          # and the tarball round-trip this step exists to remove.
+          docker info -f '{{ .DriverStatus }}'
+          docker info -f '{{ .DriverStatus }}' | grep -q 'io.containerd.snapshotter' || {
+            echo "::error::containerd image store did not come up; refusing to build"
+            exit 1
+          }
+
+      # Registry-backed layer cache: runners are ephemeral, so without this
+      # every run re-pulls the CUDA base, re-apt-installs ROS Jazzy, and
+      # re-resolves the full torch venv from zero (~30+ min).
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+        with:
+          # The daemon's own buildkit, writing straight to the containerd store.
+          driver: docker
+
+      # Needed to read the layer cache and to push the image; GITHUB_TOKEN
+      # carries both packages:read and packages:write here.
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `mode=max` on every export: it includes the builder stage's layers, not
+      # just the final stage's, and the builder is where the expensive apt +
+      # uv-sync work lives in this multi-stage Dockerfile.
+      - name: Build openral:x86 (GStreamer-free)
+        run: |
+          cache_from="--cache-from type=registry,ref=$IMAGE:buildcache"
+          cache_to=""
+          case "${{ github.event_name }}" in
+            push)
+              cache_to="--cache-to type=registry,ref=$IMAGE:buildcache,mode=max"
+              ;;
+            workflow_dispatch)
+              # Exercise the registry cache EXPORT path on demand, against a
+              # scratch ref that master never reads. This is how you validate a
+              # change to the build driver or the image store before it reaches
+              # master, where a broken exporter would fail the publish build.
+              cache_to="--cache-to type=registry,ref=$IMAGE:buildcache-dispatch,mode=max"
+              ;;
+          esac
+          # `--load` is a no-op under the docker driver (the build already
+          # writes into the daemon's containerd store); it is kept so the
+          # command still means the same thing if the driver is ever changed
+          # back.
+          # shellcheck disable=SC2086 -- intentional word-splitting of the
+          # $cache_from / $cache_to flag strings.
+          docker buildx build --progress=plain \
+            -f docker/inference/Dockerfile.x86 \
+            $cache_from \
+            $cache_to \
+            -t openral:x86 --load .
+
+      # Under the docker driver there is no second copy of the image to reclaim
+      # — that was the `docker-container` tarball round-trip. What is left is
+      # buildkit's own build cache (intermediate layers, the uv cache mount),
+      # which is dead weight once the image exists and is worth dropping on a
+      # runner whose disk is this tight. The image itself lives in the
+      # containerd store and is unaffected.
+      - name: Reclaim build cache
+        run: |
+          docker buildx prune -af || true
+          docker image ls
+          df -h /
+
+      # GStreamer-free deploy smoke: gi absent; cv2 / feetech / onnxruntime /
+      # omdet present; `deploy run --dry-run` resolves the real launch.
+      - name: Smoke test (gstreamer-free deploy)
+        run: |
+          docker run --rm --entrypoint /entrypoint.sh openral:x86 bash -lc '
+            set -e
+            python -c "import cv2, scservo_sdk, onnxruntime; \
+              from transformers import AutoModelForZeroShotObjectDetection; \
+              import importlib.util as u; \
+              assert u.find_spec(\"gi\") is None, \"gi present — expected gstreamer-free\"; \
+              print(\"OK: cv2\", cv2.__version__, \"| feetech + onnxruntime + omdet present | gi absent\")"
+            openral deploy run --config scenes/deploy/so101_bench.yaml --dry-run | grep -q "hal_mode:=real"
+            echo "OK: deploy run --dry-run resolves"
+          '
+
+      # Live-ROS suite (issue #46). These tests are gated on
+      # OPENRAL_TEST_ROS_LIVE=1 because they need a real rclpy, a real DDS
+      # graph, and the colcon-built openral_msgs / openral_reasoner_ros /
+      # openral_prompt_router overlay. This image is the ONLY CI surface that
+      # has any of that — the ubuntu-hosted test-selective runner has no ROS 2
+      # at all, so every one of them importorskips there. Without this step
+      # they run nowhere, and safety-adjacent gates like the reasoner's
+      # pre-dispatch VRAM refusal rot unnoticed (PR #44).
+      #
+      # tests/ + conftest.py + scripts/ are NOT baked into the deploy image
+      # (it ships a runtime, not a test tree), so bind-mount them from the
+      # checkout — that also guarantees the commit's version of the tests runs
+      # against the commit's image. No GPU on the runner and none needed: the
+      # free-VRAM readings are pinned at the nvidia-smi process boundary.
+      - name: Live ROS tests (OPENRAL_TEST_ROS_LIVE)
+        run: |
+          # --entrypoint /entrypoint.sh drops the image's hardcoded `openral`
+          # argument while keeping the ROS + colcon-overlay sourcing the tests
+          # depend on.
+          docker run --rm --entrypoint /entrypoint.sh \
+            -v "$PWD/tests:/workspace/tests:ro" \
+            -v "$PWD/conftest.py:/workspace/conftest.py:ro" \
+            -v "$PWD/scripts:/workspace/scripts:ro" \
+            openral:x86 bash scripts/ros_live_tests.sh -q
+
+      # Default-entrypoint smoke: the steps above override --entrypoint, so
+      # they never exercise what `docker run openral:x86 …` actually does.
+      # The entrypoint is the bare `openral` CLI — `doctor` must exit 0 on a
+      # GPU-less runner (GPU/USB report `absent`/`info`, both non-fatal), and
+      # a bare run lands on the deploy help.
+      - name: Smoke test (default entrypoint)
+        run: |
+          docker run --rm openral:x86 doctor
+          docker run --rm openral:x86 | grep -qi "deploy"
+          echo "OK: bare-openral entrypoint (doctor + default CMD)"
+
+      # Push only on merge to master (a workflow_dispatch run never pushes).
+      # GHCR login already
+      # happened above (it is needed unconditionally for the layer cache).
+      - name: Tag + push to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          docker tag openral:x86 "$IMAGE:x86"
+          docker tag openral:x86 "$IMAGE:x86-${GITHUB_SHA::12}"
+          docker push "$IMAGE:x86"
+          docker push "$IMAGE:x86-${GITHUB_SHA::12}"

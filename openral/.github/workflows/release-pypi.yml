@@ -1,0 +1,172 @@
+name: release-pypi
+# Multi-package PyPI publishing. CANONICAL release workflow.
+#
+# release.yml was dropped (2026-06-17): its root `uv build` was broken — the
+# workspace root has no [build-system], so it fell back to legacy setuptools
+# and errored on multi-package discovery — and its PyPI half duplicated this
+# matrix while building the wrong artifact (the meta-package). The ghcr
+# runtime-image + cosign path it also carried was non-functional — it built
+# the root `Dockerfile.runtime`, which COPYd the gitignored colcon `install/`
+# space and was broken in several other ways besides; that file was deleted
+# rather than repaired, since `docker/inference/Dockerfile.x86` is the real
+# deploy image. The release-image path is deferred until ROS-in-CI infra
+# exists and returns as a purpose-built release-image.yml then. This file is
+# the single source of truth for releases.
+#
+# Two ways to publish — both via Trusted Publishing (OIDC, no API token):
+#   • workflow_dispatch → choose `target`:
+#       - testpypi (default): trial release, no confirmation needed.
+#       - pypi:               requires confirm=YES (irreversible).
+#   • tag push `v*.*.*` → production release to real PyPI (the tag IS the
+#     deliberate confirmation).
+#
+# One-time PyPI-side setup per index — register a trusted publisher for this
+# repo + this workflow file. Pending publishers cover names that don't exist
+# yet and need no org approval (https://docs.pypi.org/trusted-publishers/):
+#   owner: OpenRAL · repo: openral · workflow: release-pypi.yml · env: (none)
+#   - PyPI (https://pypi.org): WORKING. 0.1.0 and 0.2.0 are published for all
+#     14 packages; the v0.2.0 tag push (run 30795961650) exchanged its OIDC
+#     token successfully.
+#   - TestPyPI (https://test.pypi.org): WORKING since 2026-08-08. 0.1.0 and
+#     0.2.0 are published for all 14 packages. It was broken up to that point
+#     — the publisher was still bound to the pre-org-move owner, so every
+#     `target=testpypi` dispatch died at the token exchange with
+#     `invalid-publisher: valid token, but no corresponding publisher`
+#     (run 31258658584, plus three on 2026-07-09). Re-registering the 14
+#     projects against the claims above fixed it. If that symptom returns,
+#     this is the first thing to check.
+#
+# Trusted publishing matches on the *ref*, so a claim set is not portable
+# between triggers: a tag push presents `ref: refs/tags/vX.Y.Z` while a
+# workflow_dispatch off master presents `ref: refs/heads/master`. A publisher
+# registered without a ref restriction accepts both; one restricted to tags
+# rejects the dispatch. That difference is why the tag path can be green while
+# a dispatch is not.
+#
+# Every workspace package shares one lockstep version, and every `openral-*`
+# dependency pins it exactly — nothing here bumps it. `release-please.yml`
+# derives the SemVer segment from the Conventional Commits merged since the
+# last tag (fix → patch, feat → minor, breaking → minor while <1.0) and
+# rewrites all 15 pyprojects in its release PR. Merging that PR creates the
+# `v*.*.*` tag this workflow publishes from.
+#
+# Do not hand-edit a version to cut a release; see docs/contributing/releasing.md.
+# tests/unit/test_lockstep_versions.py fails the build if the versions, the
+# `openral-*==` pins, or the matrix below drift apart.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Index to publish to.'
+        required: true
+        type: choice
+        options:
+          - testpypi
+          - pypi
+        default: testpypi
+      confirm:
+        description: 'Type YES to publish to REAL PyPI (ignored for testpypi).'
+        required: false
+        default: 'NO'
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve the upload index and enforce the real-PyPI confirmation guard.
+  # Tag pushes always target real PyPI; a workflow_dispatch defaults to
+  # TestPyPI and must pass confirm=YES to reach real PyPI.
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      repository-url: ${{ steps.target.outputs.repository-url }}
+      index: ${{ steps.target.outputs.index }}
+    steps:
+      - name: resolve target + guard
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          TARGET: ${{ inputs.target }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ] || [ "$TARGET" = "pypi" ]; then
+            if [ "$EVENT" != "push" ] && [ "$CONFIRM" != "YES" ]; then
+              echo "::error::Publishing to real PyPI requires confirm=YES."
+              exit 1
+            fi
+            echo "index=pypi" >> "$GITHUB_OUTPUT"
+            echo "repository-url=https://upload.pypi.org/legacy/" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release target = real PyPI."
+          else
+            echo "index=testpypi" >> "$GITHUB_OUTPUT"
+            echo "repository-url=https://test.pypi.org/legacy/" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release target = TestPyPI."
+          fi
+
+  # Same fast, high-signal gate as the PR `quality` workflow. A release must
+  # not publish a broken tree — and a `v*.*.*` tag can be pushed off a commit
+  # that never went through a PR.
+  precheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --frozen --all-packages || uv sync --all-packages
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy --strict -p openral_core -p openral_cli -p openral_hal
+      - run: uv run mypy --strict tools/
+      - name: Check schema drift
+        run: uv run python tools/schema_export.py --check
+      - name: Build docs (mkdocs --strict)
+        run: uv run mkdocs build --strict
+
+  build-and-publish:
+    needs: [resolve, precheck]
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write   # PyPI trusted publishing — OIDC only, no API token.
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every distributable workspace member. Add a row when a new
+        # `python/<name>/pyproject.toml` ships a non-internal package.
+        package:
+          - python/core
+          - python/cli
+          - python/observability
+          - python/detect
+          - python/sensors
+          - python/hal
+          - python/world_state
+          - python/runner
+          - python/sim
+          - python/rskill
+          - python/reasoner
+          - python/wam
+          - python/dataset
+          - python/state_adapter
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          python-version: "3.12"
+      - name: build sdist + wheel
+        working-directory: ${{ matrix.package }}
+        run: uv build --out-dir dist
+      - name: publish (${{ needs.resolve.outputs.index }}, Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # release/v1
+        with:
+          packages-dir: ${{ matrix.package }}/dist
+          repository-url: ${{ needs.resolve.outputs.repository-url }}
+          # Skip-existing lets a re-run of the matrix after a partial failure
+          # skip the already-published packages instead of erroring out.
+          skip-existing: true

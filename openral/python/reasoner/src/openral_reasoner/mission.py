@@ -1,0 +1,602 @@
+"""Typed mission state for sequential multi-task deploy goals.
+
+An operator goal may carry several ordered subtasks (``--initial-task``, or a
+live ``/openral/prompt``), parsed into an ordered list of ``TaskState``
+with at most one ``active``/``verifying`` at a time; the reasoner advances
+the queue only when the active task verifies complete. Splitting is simple
+and deterministic; richer decomposition (the ``decompose-mission`` playbook)
+layers on top via ``MissionState.subdivide_active``.
+
+**Hierarchical subdivision on replan** (#123): when the active task is
+blocked (reward gate ``abandon``, ladder exhausted), the reasoner may
+decompose it into finer subtasks instead of only handing off. The data model
+stays **flat**: ``MissionState.subdivide_active`` splices the blocked
+task in place with its children (``t2 → t2.1, t2.2``), so the ``## MISSION``
+ledger and dashboard need no change. ``TaskState.depth`` bounds
+re-decomposition (``DEFAULT_MAX_SUBDIVIDE_DEPTH``), so a
+perpetually-blocked task terminates in human-handoff rather than
+subdividing forever.
+
+Reasoner-internal (no rclpy, no Pydantic): plain dataclasses, fully
+unit-testable. The ROS node drives transitions;
+``ContextRenderer`` renders the ledger.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from typing import Literal
+
+__all__ = [
+    "DEFAULT_MAX_ATTEMPTS",
+    "DEFAULT_MAX_SUBDIVIDE_DEPTH",
+    "DEFAULT_MAX_TASK_LOCATE_ATTEMPTS",
+    "MissionState",
+    "TaskLocateBudget",
+    "TaskState",
+    "TaskStatus",
+    "VerdictAction",
+    "evaluate_task_verdict",
+]
+
+VerdictAction = Literal["complete", "abandon", "retry", "vlm_check"]
+"""What the reward gate decides for the active task after a skill returns:
+``complete`` (auto-pass, score ≥
+success_threshold), ``vlm_check`` (ambiguous band — caller must adjudicate via
+``describe_image``), ``abandon`` (ladder exhausted), or ``retry`` (try again —
+keep the task active)."""
+
+DEFAULT_MAX_ATTEMPTS: int = 3
+"""Default per-task attempt cap before the reward gate abandons + hands off."""
+
+DEFAULT_MAX_SUBDIVIDE_DEPTH: int = 2
+"""Max re-decomposition depth (#123).
+
+A task at the queue root has ``depth == 0``; its children from one
+``MissionState.subdivide_active`` are ``depth == 1``; their children
+``depth == 2``. Once a blocked task is already at this depth, subdivision is
+refused (``subdivide_active`` returns ``None``) and the caller falls back to
+``human-handoff`` — bounding the ladder so a perpetually-blocked task cannot
+subdivide forever."""
+
+
+DEFAULT_MAX_TASK_LOCATE_ATTEMPTS: int = 3
+"""Default per-task ``locate_in_view`` cycle budget.
+
+Max locate cycles the reasoner may spend on a single active mission (sub)task
+*without* reaching an ``execute_rskill`` dispatch before the subtask is
+abandoned. Distinct from the ``SearchProgress``
+miss budget: that resets on a locate HIT, so a live locate-loop where
+``locate_in_view`` keeps hitting (``found=True``) but never dispatches a skill
+never terminates. This budget counts every locate cycle regardless of hit/miss."""
+
+
+@dataclasses.dataclass(slots=True)
+class TaskLocateBudget:
+    """Per-task ``locate_in_view`` cycle budget.
+
+    Unlike ``SearchProgress`` (misses only, resets on a hit), this counts
+    every locate cycle — hit or miss — spent on the *active mission task*
+    without an ``execute_rskill`` dispatch, so a task whose object stays
+    visible but never gets actioned still terminates instead of re-locating
+    forever.
+
+    ``charge`` is called once per locate dispatch with the active task
+    id; it auto-resets when the task changes and returns ``True`` once
+    exhausted. ``reset`` is called on real progress (an
+    ``execute_rskill`` dispatch).
+
+    Example:
+        >>> b = TaskLocateBudget(max_attempts=3)
+        >>> [b.charge("t1") for _ in range(4)]
+        [False, False, False, True]
+        >>> b.reason("teapot")
+        "could not confirm 'teapot' in view after 3 locate attempts without a skill dispatch"
+        >>> b.charge("t2")  # a new task starts a fresh budget
+        False
+    """
+
+    max_attempts: int = DEFAULT_MAX_TASK_LOCATE_ATTEMPTS
+    _task_id: str | None = None
+    _count: int = 0
+
+    @property
+    def count(self) -> int:
+        """Locate cycles charged against the current task so far."""
+        return self._count
+
+    def reset(self) -> None:
+        """Clear the budget (new task / real progress)."""
+        self._task_id = None
+        self._count = 0
+
+    def restore(self, task_id: str | None, count: int) -> None:
+        """Restore a persisted counter (reasoner restart resume).
+
+        Example:
+            >>> b = TaskLocateBudget(max_attempts=3)
+            >>> b.restore("t1", 2)
+            >>> b.charge("t1")  # third cycle — still within budget
+            False
+            >>> b.charge("t1")  # fourth — exhausted
+            True
+        """
+        self._task_id = task_id
+        self._count = max(0, int(count))
+
+    @property
+    def task_id(self) -> str | None:
+        """The task the budget is currently tracking (for persistence)."""
+        return self._task_id
+
+    def charge(self, task_id: str) -> bool:
+        """Charge one locate cycle for ``task_id``; return ``True`` once exhausted.
+
+        Resets the counter when ``task_id`` differs from the task the budget is
+        currently tracking, so each active task gets its own fresh budget.
+        """
+        if self._task_id != task_id:
+            self._task_id = task_id
+            self._count = 0
+        self._count += 1
+        return self._count > self.max_attempts
+
+    def reason(self, query: str) -> str:
+        """Human/LLM-readable abandonment reason for the exhausted budget.
+
+        Surfaced as the abandoned task's ledger verdict so the next reasoner pick
+        knows *why* the object was dropped.
+        """
+        return (
+            f"could not confirm {query!r} in view after {self._count - 1} "
+            "locate attempts without a skill dispatch"
+        )
+
+
+def evaluate_task_verdict(
+    *,
+    ok: bool,
+    progress_now: float,
+    success_threshold: float,
+    check_floor: float,
+    attempts: int,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    success_now: float | None = None,
+) -> tuple[VerdictAction, str]:
+    """Pure reward-gate decision for the active task.
+
+    Gates on the PROGRESS head, not the success head: Robometer-4B's
+    ``progress`` (task closeness) reaches ~0.80-0.86 on a genuine physical
+    success and separates success from failure cleanly, while ``success``
+    (done-probability) is empirically compressed to ~0.56-0.79 even on a
+    real success. ``success_threshold``/``check_floor`` (0.8/0.5) are
+    calibrated against ``progress_now`` (internal notes cite progress≈0.78
+    on a physical success); ``success_now`` is a secondary corroborating
+    signal surfaced in the verdict text, never overriding the progress
+    band.
+
+    Three-tier verdict when the reward is available (``ok=True``):
+
+    1. ``progress_now >= success_threshold`` → ``"complete"`` (auto-pass).
+    2. ``check_floor <= progress_now < success_threshold`` →
+       ``"vlm_check"`` — caller must adjudicate via ``describe_image``.
+    3. ``progress_now < check_floor`` → attempts ladder: ``"abandon"``
+       once ``attempts >= max_attempts``, else ``"retry"``.
+
+    ``ok=False`` skips tier evaluation, going straight to the attempts
+    ladder. Caller must pass ``check_floor <= success_threshold``
+    (enforced upstream by ``RewardContract``, not re-validated here).
+
+    Returns:
+        ``(action, verdict_text)`` — progress is primary; success appended
+        as corroboration when supplied.
+
+    Example:
+        >>> evaluate_task_verdict(
+        ...     ok=True,
+        ...     progress_now=0.91,
+        ...     success_now=0.62,
+        ...     success_threshold=0.8,
+        ...     check_floor=0.5,
+        ...     attempts=1,
+        ... )
+        ('complete', 'progress=0.91 (success=0.62)')
+        >>> evaluate_task_verdict(
+        ...     ok=True, progress_now=0.65, success_threshold=0.8, check_floor=0.5, attempts=1
+        ... )[0]
+        'vlm_check'
+        >>> evaluate_task_verdict(
+        ...     ok=True, progress_now=0.40, success_threshold=0.8, check_floor=0.5, attempts=1
+        ... )[0]
+        'retry'
+        >>> evaluate_task_verdict(
+        ...     ok=True, progress_now=0.40, success_threshold=0.8, check_floor=0.5, attempts=3
+        ... )[0]
+        'abandon'
+    """
+    corro = f" (success={success_now:.2f})" if success_now is not None else ""
+    if ok:
+        if progress_now >= success_threshold:
+            return "complete", f"progress={progress_now:.2f}{corro}"
+        if progress_now >= check_floor:
+            return "vlm_check", f"ambiguous progress={progress_now:.2f}{corro}; VLM adjudicates"
+    # ok=False or progress_now < check_floor: attempts ladder
+    if attempts >= max_attempts:
+        return (
+            "abandon",
+            f"unverified after {attempts} attempt(s) (progress={progress_now:.2f}{corro})",
+        )
+    return (
+        "retry",
+        f"not verified (progress={progress_now:.2f}{corro}), attempt {attempts}/{max_attempts}",
+    )
+
+
+TaskStatus = Literal["pending", "active", "verifying", "done", "abandoned"]
+"""Lifecycle of a single subtask. ``pending → active → verifying → done |
+abandoned``. ``abandoned`` and ``done`` are terminal — a task is never silently
+re-queued."""
+
+_ACTIVE_STATES: frozenset[TaskStatus] = frozenset({"active", "verifying"})
+_TERMINAL_STATES: frozenset[TaskStatus] = frozenset({"done", "abandoned"})
+
+
+@dataclasses.dataclass(slots=True)
+class TaskState:
+    """One ordered subtask and its lifecycle.
+
+    Attributes:
+        task_id: Stable id within the mission (``"t1"``, ``"t2"``, …).
+        text: The subtask instruction handed to the reasoner as the active goal.
+        status: Lifecycle position (``TaskStatus``).
+        attempts: Number of ``execute_rskill`` dispatches made for this task —
+            the loop guard for the replanning ladder.
+        last_rskill_id: rSkill id of the most recent attempt, or ``None``.
+        last_trace_id: Trace id of the most recent attempt, or ``None``.
+        last_verdict: Short human-readable verdict of the last verification
+            (e.g. ``"success=0.91"``, ``"stalled@0.73"``, ``"unverified"``).
+        depth: Re-decomposition depth (see #123). A task split
+            from the operator goal is ``0``; a child spliced in by
+            ``MissionState.subdivide_active`` is ``parent.depth + 1``. Bounds
+            the subdivision ladder against ``DEFAULT_MAX_SUBDIVIDE_DEPTH``.
+    """
+
+    task_id: str
+    text: str
+    status: TaskStatus = "pending"
+    attempts: int = 0
+    last_rskill_id: str | None = None
+    last_trace_id: str | None = None
+    last_verdict: str | None = None
+    depth: int = 0
+
+
+class MissionState:
+    """Ordered task queue with at most one active task.
+
+    Owns the deterministic sequencing the LLM is no longer trusted to do: the
+    active task is the only goal injected each tick; the queue advances only when
+    the node verifies the active task complete (or abandons it after the ladder is
+    exhausted). All mutators return the newly-active ``TaskState`` (or
+    ``None`` when the mission is finished) so the caller can re-inject the next
+    goal and wake the reasoner.
+
+    Example:
+        >>> m = MissionState(["pick the bowl", "place the butter"])
+        >>> m.active().text
+        'pick the bowl'
+        >>> nxt = m.complete_active("success=0.9")
+        >>> nxt.text
+        'place the butter'
+        >>> m.complete_active("success=0.9") is None
+        True
+        >>> m.is_complete()
+        True
+    """
+
+    def __init__(self, tasks: list[str]) -> None:
+        """Build the queue from ordered subtask strings; activate the first."""
+        self._tasks: list[TaskState] = [
+            TaskState(task_id=f"t{i + 1}", text=text) for i, text in enumerate(tasks)
+        ]
+        if self._tasks:
+            self._tasks[0].status = "active"
+
+    @classmethod
+    def from_prompt(cls, text: str) -> MissionState:
+        """Seed a mission from an operator goal as a single task.
+
+        The LLM owns decomposition via ``decompose_mission``. A blank goal
+        yields an empty mission.
+        """
+        goal = text.strip()
+        return cls([goal] if goal else [])
+
+    # ── readers ──────────────────────────────────────────────────────────────
+
+    @property
+    def tasks(self) -> tuple[TaskState, ...]:
+        """Snapshot of every task, in order."""
+        return tuple(self._tasks)
+
+    def __len__(self) -> int:
+        """Number of tasks in the queue (terminal, active, and pending)."""
+        return len(self._tasks)
+
+    def active(self) -> TaskState | None:
+        """The currently ``active`` or ``verifying`` task, or ``None``."""
+        return next((t for t in self._tasks if t.status in _ACTIVE_STATES), None)
+
+    def is_empty(self) -> bool:
+        """True when the mission carries no tasks (empty/whitespace prompt)."""
+        return not self._tasks
+
+    def is_complete(self) -> bool:
+        """True when every task is terminal (``done``/``abandoned``).
+
+        An empty mission is never "complete" — there was nothing to do, which is
+        a different condition the caller handles explicitly.
+        """
+        return bool(self._tasks) and all(t.status in _TERMINAL_STATES for t in self._tasks)
+
+    def has_started(self) -> bool:
+        """True once any task has terminated or the active task has been attempted.
+
+        Used to keep a ``decompose_mission`` *populate* (whole-queue replace, #123)
+        safe: the LLM may refine the single-task seed on the first tick (nothing
+        started yet), but a wholesale replace mid-mission would
+        discard `done`/`abandoned` progress — so the node only honours populate
+        before the mission has started.
+
+        Example:
+            >>> m = MissionState.from_prompt("put the bowl on the plate")
+            >>> m.has_started()
+            False
+            >>> m.record_attempt(rskill_id="x")
+            >>> m.has_started()
+            True
+        """
+        return any(
+            t.status in _TERMINAL_STATES or (t.status in _ACTIVE_STATES and t.attempts > 0)
+            for t in self._tasks
+        )
+
+    # ── mutators (each returns the new active task, or None when finished) ────
+
+    def record_attempt(self, *, rskill_id: str | None, trace_id: str | None = None) -> None:
+        """Note a dispatch against the active task (increments ``attempts``)."""
+        task = self.active()
+        if task is None:
+            return
+        task.attempts += 1
+        task.last_rskill_id = rskill_id
+        if trace_id is not None:
+            task.last_trace_id = trace_id
+
+    def mark_verifying(self) -> None:
+        """Move the active task ``active → verifying`` (a skill returned; gating)."""
+        task = self.active()
+        if task is not None and task.status == "active":
+            task.status = "verifying"
+
+    def complete_active(self, verdict: str) -> TaskState | None:
+        """Mark the active task ``done`` and activate the next pending task.
+
+        Returns the newly-active task, or ``None`` when the mission is finished.
+        """
+        return self._terminate_active("done", verdict)
+
+    def abandon_active(self, reason: str) -> TaskState | None:
+        """Mark the active task ``abandoned`` (ladder exhausted / unverifiable).
+
+        Returns the newly-active task, or ``None`` when the mission is finished.
+        """
+        return self._terminate_active("abandoned", reason)
+
+    def rearm_active(self) -> TaskState | None:
+        """Move the active task ``verifying → active`` to re-offer a fresh decision.
+
+        The reward gate moves the active task to ``verifying`` while it queries the
+        monitor (``mark_verifying``). When the node offers subdivision on a
+        blocked task (#123) instead of abandoning it, it calls this so the normal
+        dispatch / ``subdivide_active`` cycle resumes from ``active``. No-op
+        (returns the current active task or ``None``) when nothing is ``verifying``.
+
+        Example:
+            >>> m = MissionState.from_prompt("pick the milk")
+            >>> m.mark_verifying()
+            >>> m.active().status
+            'verifying'
+            >>> m.rearm_active().status
+            'active'
+        """
+        task = self.active()
+        if task is not None and task.status == "verifying":
+            task.status = "active"
+        return task
+
+    def subdivide_active(
+        self,
+        subtasks: list[str],
+        *,
+        max_depth: int = DEFAULT_MAX_SUBDIVIDE_DEPTH,
+    ) -> TaskState | None:
+        """Splice the active task in place with finer child subtasks (#123).
+
+        Replaces the blocked active task in the queue with ``subtasks`` —
+        flat children ``t<n>.1, t<n>.2, …`` at ``depth + 1`` — and activates
+        the first. The parent is removed, children take its slot, and any
+        pending tail keeps its order, so the ledger and dashboard need no
+        change.
+
+        Refused (returns ``None``) when the active task is already at
+        ``max_depth`` (``DEFAULT_MAX_SUBDIVIDE_DEPTH``), when there is no
+        active task, or when ``subtasks`` is empty after trimming — the
+        caller falls back to ``abandon_active``.
+
+        Returns:
+            The newly-active first child, or ``None`` when subdivision was
+            refused / impossible.
+
+        Example:
+            >>> m = MissionState(["tidy the kitchen", "wipe the table"])
+            >>> child = m.subdivide_active(["clear the counter", "load the dishwasher"])
+            >>> child.task_id, child.text, child.depth
+            ('t1.1', 'clear the counter', 1)
+            >>> [t.task_id for t in m.tasks]
+            ['t1.1', 't1.2', 't2']
+            >>> m.subdivide_active(["rinse", "stack"]).task_id  # depth 1 → 2: allowed
+            't1.1.1'
+            >>> m.subdivide_active(["x"]) is None  # depth 2 >= DEFAULT_MAX_SUBDIVIDE_DEPTH
+            True
+        """
+        task = self.active()
+        if task is None or task.depth >= max_depth:
+            return None
+        children = [t for raw in subtasks if (t := raw.strip())]
+        if not children:
+            return None
+        index = self._tasks.index(task)
+        spliced = [
+            TaskState(
+                task_id=f"{task.task_id}.{i + 1}",
+                text=text,
+                status="active" if i == 0 else "pending",
+                depth=task.depth + 1,
+            )
+            for i, text in enumerate(children)
+        ]
+        self._tasks[index : index + 1] = spliced
+        return spliced[0]
+
+    def _terminate_active(self, status: TaskStatus, verdict: str) -> TaskState | None:
+        task = self.active()
+        if task is None:
+            return None
+        task.status = status
+        task.last_verdict = verdict
+        nxt = next((t for t in self._tasks if t.status == "pending"), None)
+        if nxt is not None:
+            nxt.status = "active"
+        return nxt
+
+    # ── serialization / rendering ──────────────────────────────────────────────
+
+    def to_state_dict(self) -> dict[str, object]:
+        """Full round-trippable snapshot of the queue (statuses, attempts, depth).
+
+        Unlike ``to_summary`` (a lossy telemetry view), this carries every
+        ``TaskState`` field so a crashed/restarted reasoner can resume the
+        mission exactly where it stopped instead of resetting every ladder
+        bound (see ``openral_reasoner.persistence``).
+
+        Example:
+            >>> m = MissionState(["pick the bowl", "place the butter"])
+            >>> m.record_attempt(rskill_id="x")
+            >>> m2 = MissionState.from_state_dict(m.to_state_dict())
+            >>> [(t.task_id, t.status, t.attempts) for t in m2.tasks]
+            [('t1', 'active', 1), ('t2', 'pending', 0)]
+        """
+        return {
+            "tasks": [
+                {
+                    "task_id": t.task_id,
+                    "text": t.text,
+                    "status": t.status,
+                    "attempts": t.attempts,
+                    "last_rskill_id": t.last_rskill_id,
+                    "last_trace_id": t.last_trace_id,
+                    "last_verdict": t.last_verdict,
+                    "depth": t.depth,
+                }
+                for t in self._tasks
+            ],
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: dict[str, object]) -> MissionState:
+        """Rebuild a mission from ``to_state_dict`` output (exact resume)."""
+        mission = cls([])
+        raw_tasks = state.get("tasks")
+        if not isinstance(raw_tasks, list):
+            raise ValueError(f"MissionState.from_state_dict: 'tasks' must be a list, got {state!r}")
+        for raw in raw_tasks:
+            if not isinstance(raw, dict):
+                raise ValueError(f"MissionState.from_state_dict: task entry not a dict: {raw!r}")
+            mission._tasks.append(
+                TaskState(
+                    task_id=str(raw["task_id"]),
+                    text=str(raw["text"]),
+                    status=raw["status"],  # validated against the Literal set below
+                    attempts=int(raw.get("attempts", 0)),
+                    last_rskill_id=raw.get("last_rskill_id"),
+                    last_trace_id=raw.get("last_trace_id"),
+                    last_verdict=raw.get("last_verdict"),
+                    depth=int(raw.get("depth", 0)),
+                )
+            )
+        valid_statuses = {"pending", "active", "verifying", "done", "abandoned"}
+        for t in mission._tasks:
+            if t.status not in valid_statuses:
+                raise ValueError(f"MissionState.from_state_dict: bad status {t.status!r}")
+        return mission
+
+    def to_summary(self) -> dict[str, object]:
+        """JSON-able snapshot of the queue for telemetry / the dashboard card.
+
+        Stamped on the ``reasoner.tick`` span as ``reasoner.mission_json`` so the
+        live dashboard can render the mission checklist (status, attempts, last
+        verdict) instead of only the single ``## MISSION`` text ledger. Pure data;
+        no rclpy, no Pydantic.
+
+        Example:
+            >>> m = MissionState(["pick the bowl", "place the butter"])
+            >>> s = m.to_summary()
+            >>> s["max_attempts"], len(s["tasks"]), s["tasks"][0]["status"]
+            (3, 2, 'active')
+        """
+        return {
+            "max_attempts": DEFAULT_MAX_ATTEMPTS,
+            "tasks": [
+                {
+                    "id": t.task_id,
+                    "text": t.text,
+                    "status": t.status,
+                    "attempts": t.attempts,
+                    "verdict": t.last_verdict,
+                    "rskill_id": t.last_rskill_id,
+                }
+                for t in self._tasks
+            ],
+        }
+
+    def render(self) -> str:
+        """Compact ``## MISSION`` ledger: done tasks, the active task, pending count.
+
+        Deterministic, one line per terminal/active task plus a pending tail, so a
+        multi-task goal stays visible every tick even after the operator prompt is
+        drained pull-once.
+        """
+        if not self._tasks:
+            return "(no mission)"
+        lines: list[str] = []
+        pending = 0
+        for task in self._tasks:
+            if task.status == "pending":
+                pending += 1
+                continue
+            marker = {
+                "active": "▶",
+                "verifying": "?",
+                "done": "✓",
+                "abandoned": "✗",
+            }[task.status]
+            verdict = f" [{task.last_verdict}]" if task.last_verdict else ""
+            attempts = f" attempts={task.attempts}" if task.attempts else ""
+            # Indent subdivided children (depth>0, #123) so the flat ledger still
+            # reads as a hierarchy for the LLM; the dashboard ignores leading space.
+            indent = "  " * task.depth
+            lines.append(f"{indent}{marker} {task.task_id}: {task.text}{attempts}{verdict}")
+        if pending:
+            lines.append(f"… {pending} pending task(s)")
+        return "\n".join(lines)

@@ -1,0 +1,67 @@
+# RoboCasa DeliverStraw — the deterministic CARRY-WHILE-NAVIGATING scene (#108).
+#
+# `openral_nav2_bringup` publishes a payload-grown Nav2 footprint and filters
+# payload/chassis lidar returns (PR #143), but neither had run against a base
+# that actually TRANSLATES while carrying, so a working footprint and a
+# decorative one looked identical and `CostCritic.consider_footprint` had
+# nothing to measure against. README specifies four criteria; this scene
+# supplies 1 (base displacement while carrying) and 4 (determinism).
+#
+# WHY THIS TASK: `DeliverStraw` is upstream RoboCasa, in `composite_seen` /
+# `target50` (the 50-task set XR-1 RoboCasa365 reports against) — in
+# distribution, no custom code. `_check_success` is
+# `check_obj_in_receptacle(straw, glass_cup)`, and the straw is within arm's
+# reach of the base pose while the cup is metres away, so the straw MUST be
+# carried the whole way. Measured at reset (RTX 5070 Laptop):
+#   seed | layout/style | straw->drawer | cup->dining counter
+#      1 | 29/15        | 0.46 m        | 3.159 m
+#      2 | 53/22        | 0.49 m        | 3.608 m
+#      3 | 51/9         | 0.50 m        | 3.795 m
+#
+# WHY THIS ONE, NOT A LONGER CARRY: `tools/robocasa_carry_survey.py` measured
+# every target50 task (docs/reference/robocasa-carry-survey.md) — DeliverStraw
+# isn't the longest (GatherTableware 6.80 m, GarnishPancake 4.01 m) but is the
+# SIMPLEST: one carried object, one destination, one `check_obj_in_receptacle`.
+# The longer two are multi-object chains with several failure explanations
+# unrelated to the Nav2 footprint — fewest confounds between carry and verdict
+# wins, since the verdict is what #108 reads.
+#
+# Run: openral deploy sim --config scenes/deploy/robocasa_deliver_straw.yaml
+# Setup: RoboCasa is provisioned at runtime by the HAL (not by `just sync`).
+
+scene:
+  id: robocasa/DeliverStraw
+  backend: mujoco
+  # 512² for the same reason as robocasa_baguette.yaml: at 128² the open-vocab
+  # detector cannot ground a counter-top object (a straw is smaller than the
+  # baguette that already needed this). VLA policies downsample their own
+  # input, so the higher source res costs only EGL render time.
+  observation_height: 512
+  observation_width: 512
+  backend_options:
+    mode: prebuilt
+    prebuilt_task: DeliverStraw
+    robots: ["PandaMobile"]
+    controller: OSC_POSE
+    horizon: 600
+
+# THE PIN (criterion 4 — determinism). `DeliverStraw` caches its stool /
+# dining-counter / drawer choice in `fixture_refs`, so the seed pins the layout,
+# the style, both fixtures, both objects and the base start pose.
+#
+# Seed 3 is chosen on the measurement above: it is the longest carry of the
+# three (3.795 m), and criterion 1 — base displacement while holding something —
+# is the whole reason this scene exists.
+seed: 3
+
+# KNOWN PRECONDITION: drawer is CLOSED at reset (measured, `get_door_state`
+# ~2.9e-08 at this seed), so the episode is open-drawer -> grasp -> carry ->
+# place; only the carry phase exercises the footprint. A run that never opens
+# the drawer is no evidence about Nav2 and must not be recorded as a footprint
+# failure — every target50 carry task has a precondition like this
+# (`GetToastedBread`, runner-up at 3.48 m, must start a toaster and wait).
+#
+# No `place_declaration`, deliberately: ADR-0097's place path is orthogonal to
+# what this scene measures, and arming it adds the place witness + approach
+# allowance + cup geometry as failure modes between carry and verdict. Add one
+# only for a place-phase question instead.

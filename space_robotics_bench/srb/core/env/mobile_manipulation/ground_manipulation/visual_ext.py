@@ -1,0 +1,66 @@
+from srb.core.asset import WheeledManipulator
+from srb.core.env.common.extension.visual import VisualExtCfg
+from srb.core.sensor import CameraCfg, PinholeCameraCfg
+from srb.utils.cfg import configclass
+from srb.utils.math import rpy_to_quat
+
+from .env import GroundManipulationEnvCfg
+
+
+@configclass
+class GroundManipulationEnvVisualExtCfg(VisualExtCfg):
+    def wrap(self, env_cfg: GroundManipulationEnvCfg):
+        ## The wrist camera frame lives on the robot itself for a monolithic
+        ## WheeledManipulator, or on the separate manipulator sub-asset otherwise
+        if isinstance(env_cfg._robot, WheeledManipulator):
+            _wrist_prim_path = env_cfg._robot.asset_cfg.prim_path
+            _wrist_frame = env_cfg._robot.frame_wrist_camera
+        else:
+            _wrist_prim_path = env_cfg._robot.manipulator.asset_cfg.prim_path
+            _wrist_frame = env_cfg._robot.manipulator.frame_wrist_camera
+
+        self.cameras_cfg = {
+            "cam_scene": CameraCfg(
+                prim_path=f"{env_cfg._robot.asset_cfg.prim_path}{('/' + env_cfg._robot.frame_base.prim_relpath) if env_cfg._robot.frame_base.prim_relpath else ''}/camera_scene",
+                offset=CameraCfg.OffsetCfg(
+                    convention="world",
+                    pos=(2.0, 0.0, 1.0),
+                    rot=rpy_to_quat(0.0, 45.0, 180.0),
+                ),
+                spawn=PinholeCameraCfg(
+                    clipping_range=(0.01, 5.0 - 0.01),
+                ),
+            ),
+            "cam_front": CameraCfg(
+                prim_path=f"{env_cfg._robot.asset_cfg.prim_path}/{env_cfg._robot.frame_front_camera.prim_relpath}",
+                offset=CameraCfg.OffsetCfg(
+                    convention="world",
+                    pos=env_cfg._robot.frame_front_camera.offset.pos,
+                    rot=env_cfg._robot.frame_front_camera.offset.rot,
+                ),
+                spawn=PinholeCameraCfg(
+                    focal_length=5.0,
+                    horizontal_aperture=12.0,
+                    clipping_range=(0.05, 25.0 + 0.05),
+                ),
+            ),
+            "cam_wrist": CameraCfg(
+                prim_path=f"{_wrist_prim_path}/{_wrist_frame.prim_relpath}",
+                offset=CameraCfg.OffsetCfg(
+                    convention="world",
+                    pos=_wrist_frame.offset.pos,
+                    rot=_wrist_frame.offset.rot,
+                ),
+                spawn=PinholeCameraCfg(
+                    # the RealSense D435i's own colour intrinsics at 640x480 (fx = fy = 616 px,
+                    # 55 deg x 42 deg): 640 * 15.4 / 16.0. The previous 10 mm / 16 mm gave a
+                    # 77 deg field, which is the D435's *depth* field, not the colour stream the
+                    # wrist skills work in (research repo F57).
+                    focal_length=15.4,
+                    horizontal_aperture=16.0,
+                    clipping_range=(0.001, 2.0 - 0.001),
+                ),
+            ),
+        }
+
+        super().wrap(env_cfg)
