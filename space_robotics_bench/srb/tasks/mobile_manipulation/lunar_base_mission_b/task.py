@@ -65,7 +65,8 @@ class TaskCfg(SiteTaskCfg):
     destination: Literal["pdu_1", "pdu_2", "pdu_3", "bess", "habitat"] = "pdu_1"
     name_serial: bool = False
     placement: str = ""
-    records: str = ""
+    ## the destination is a handover point: the consignee takes in whatever comes to rest on it (irreversible delivery)
+    handover_latch: bool = True
 
     episode_length_s: float = 1200.0
     is_finite_horizon: bool = True
@@ -94,6 +95,9 @@ class Task(SiteTask):
     def destination_support(self) -> str:
         return _DESTINATION[self.cfg.destination][0]
 
+    def handover_supports(self) -> List[str]:
+        return super().handover_supports() + ([self.destination_support()] if self.cfg.handover_latch else [])
+
     def occupier(self) -> str:
         """What stands on the destination in heldout_destination_occupied: an outbound return container at the habitat,
         a returned cargo crate elsewhere."""
@@ -111,9 +115,7 @@ class Task(SiteTask):
             r = next(r for r in record if r["serial"] == self._ix["objects"][self.occupier()]["serial"])
             r["recorded_location"] = self.destination_support()
             r["status"] = "outbound return, awaiting stowage" if self.cfg.destination == "habitat" else "returned cargo, awaiting stowage"
-        for name, location in _pairs(self.cfg.records).items():
-            next(r for r in record if r["serial"] == self._ix["objects"][name]["serial"])["recorded_location"] = location
-        return record
+        return self.with_record_faults(record)
 
     def mission_success(self) -> torch.Tensor:
         dest = self.destination_support()

@@ -17,8 +17,9 @@ The protocol (scripted, published before the runs, identical for every method; t
     baselines' plans and domain send). The ground reads the kind and the held calls, never the text:
       authorization   -- carrying calls held for approval (Ours' guard, `pending_approvals`): decided by the
                          flight-rule table (14 CFR 1214.403: decisions planned in advance): GRANT removal of a module
-                         from a unit whose load is non-critical while a crew-critical unit is down, per the units'
-                         downlinked telemetry; otherwise DENY with a reason code. ALFUS level: assign tactical goals.
+                         from a unit that is itself down (its own bay: the repair), or from a running unit whose load
+                         is non-critical while a crew-critical unit is down, per the units' downlinked telemetry;
+                         otherwise DENY with a reason code. ALFUS level: assign tactical goals.
                          Carrying no held call: answered that an authorization covers one held call (no level).
       authority_check -- "is this within my authority?": the published rule restated -- everything the flight rules
                          do not reserve is the vehicle's; what they reserve, and how an authorization is had (no level).
@@ -29,8 +30,13 @@ The protocol (scripted, published before the runs, identical for every method; t
   - a report is acknowledged; it is not an intervention (no ALFUS level).
 `--manual` replaces the scripted decisions with a person at the console (demonstration runs only, never statistics):
 an answer starting "GRANT:" grants the held calls.
+`--ground-decision grant|refuse` (env AKR_GROUND_DECISION; default `rule`, the table above) fixes the answer to an
+authorization request for the whole run, whatever the telemetry says: every held call is granted, or denied
+(DENY-DECIDED-BEFORE-MISSION). Same timing, reply format and log as the rule path; neither the executor nor the planner
+is told which (fault injection of the AKR experiments, space_runtime/akr/injection.py).
 
     python3 experiments/operator_console/console.py --run-dir <run_dir> [--decision-time-s 300] [--manual]
+        [--ground-decision rule|grant|refuse]
 """
 from __future__ import annotations
 
@@ -43,7 +49,7 @@ import time
 import uuid
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve.parents[2]))  #: space_context
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # space_context
 from space_context import link  # noqa: E402
 
 ALFUS_AUTHORITY_LEVELS = ("mission", "strategic_goal", "tactical_goal", "mission_task", "route", "autopilot", "servo")
@@ -61,7 +67,7 @@ AUTHORITY = ("Flight rules: every operation the rules do not reserve is within t
              "request. Reserved for mission control's authorization: removing a module from an energized unit's bay "
              "(14 CFR 1214.403). An authorization covers one held call, sent with the request.")
 INFORMATION = "Mission control holds no data beyond the telemetry, manifest and site survey the vehicle's own queries return."
-if os.environ.get("OURS_ABLATION") == "no_guard":  #: no guard holds a call, the request names it
+if os.environ.get("OURS_ABLATION") == "no_guard":  # no guard holds a call, the request names it
     NOTHING_HELD = ("The request names no call, so there is nothing to authorize. An authorization covers one call on one "
                     "target, named in the request.")
     AUTHORITY = AUTHORITY.replace("An authorization covers one held call, sent with the request.",
@@ -87,7 +93,7 @@ class OperatorEventLog:
         return ev
 
 
-def decide(kind: str, pending: list[dict], telemetry: dict) -> tuple[str, list[dict], str | None, str]:
+def decide(kind: str, pending: list[dict], telemetry: dict, ground_decision: str = "rule") -> tuple[str, list[dict], str | None, str]:
     """The scripted answer: (text, grants, ALFUS level, outcome code) for a request of this kind."""
     if kind == "new_procedure":
         return HOLD, [], "mission_task", "hold_reauthoring_required"
@@ -97,12 +103,25 @@ def decide(kind: str, pending: list[dict], telemetry: dict) -> tuple[str, list[d
         return INFORMATION, [], None, "information"
     if not pending:
         return NOTHING_HELD, [], None, "nothing_held"
+    if ground_decision != "rule":  # fixed per run, regardless of the units' state
+        grant = ground_decision == "grant"
+        grants = [{"capability": p["capability"], "target": p["target"]} for p in pending] if grant else []
+        lines = [f"GRANTED: {p['capability']} on {p['target']} -- decided before the mission." if grant else
+                 f"DENIED (DENY-DECIDED-BEFORE-MISSION): {p['capability']} on {p['target']} -- decided before the mission."
+                 for p in pending]
+        return " ".join(lines), grants, "tactical_goal", "grant" if grant else "deny"
     units = telemetry["units"]
     crew_critical_down = [u for u, t in units.items() if t["criticality"] == "crew-critical" and t["breaker"] == "tripped"]
     grants, lines = [], []
     for p in pending:
         unit = IX["points"][p["target"]]["unit"]
-        if units[unit]["criticality"] == "non-critical" and crew_critical_down:
+        if units[unit]["breaker"] == "tripped":
+            # the unit being serviced is itself down: taking its own failed module out is the repair, not a donation --
+            # the donor rule below is for a part taken from a running unit to repair another (2026-11-10)
+            grants.append({"capability": p["capability"], "target": p["target"]})
+            lines.append(f"GRANTED: {p['capability']} on {p['target']} -- {unit} is itself down (breaker tripped): "
+                         f"servicing its own bay.")
+        elif units[unit]["criticality"] == "non-critical" and crew_critical_down:
             grants.append({"capability": p["capability"], "target": p["target"]})
             lines.append(f"GRANTED: {p['capability']} on {p['target']} -- {unit} feeds a non-critical load "
                          f"({units[unit]['load']}) and crew-critical {', '.join(crew_critical_down)} is down.")
@@ -113,7 +132,7 @@ def decide(kind: str, pending: list[dict], telemetry: dict) -> tuple[str, list[d
     return " ".join(lines), grants, "tactical_goal", "grant" if grants else "deny"
 
 
-def run_cli(run_dir: Path, *, decision_time_s: float, manual: bool) -> None:
+def run_cli(run_dir: Path, *, decision_time_s: float, manual: bool, ground_decision: str = "rule") -> None:
     import rclpy
     from openral_msgs.msg import PromptStamped
     from rclpy.node import Node
@@ -166,7 +185,7 @@ def run_cli(run_dir: Path, *, decision_time_s: float, manual: bool) -> None:
             level, outcome = ("tactical_goal", "grant" if grants else "deny") if pending else ("mission_task", "manual")
         else:
             wait_until(clock["t"] + decision_time_s)
-            text, grants, level, outcome = decide(request_kind, pending, telemetry)
+            text, grants, level, outcome = decide(request_kind, pending, telemetry, ground_decision)
         log.append("interaction_end", interaction_id=iid, authority_level=level, outcome=outcome, text=text, grants=grants,
                    ground_reauthoring_required=outcome == "hold_reauthoring_required")
         if not link.state(clock["t"])["earth_visible"]:
@@ -183,7 +202,8 @@ def run_cli(run_dir: Path, *, decision_time_s: float, manual: bool) -> None:
     node.create_subscription(PromptStamped, REQUEST_TOPIC, on_message(REQUEST_TOPIC, "request_operator"), 10)
     node.create_subscription(PromptStamped, REPORT_TOPIC, on_message(REPORT_TOPIC, "report_to_operator"), 10)
     print(f"space_operator_console: logging to {log.path}; "
-          + ("manual (demonstration)" if manual else f"scripted protocol, decision time {decision_time_s:.0f} s"), flush=True)
+          + ("manual (demonstration)" if manual else f"scripted protocol, decision time {decision_time_s:.0f} s"
+             + ("" if ground_decision == "rule" else f", ground decision fixed: {ground_decision}")), flush=True)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -197,15 +217,17 @@ def main() -> None:
     ap.add_argument("--run-dir", type=Path, required=True)
     ap.add_argument("--decision-time-s", type=float, default=DECISION_TIME_S)
     ap.add_argument("--manual", action="store_true", help="a person answers at the console (demonstration runs only)")
+    ap.add_argument("--ground-decision", choices=("rule", "grant", "refuse"), default=os.environ.get("AKR_GROUND_DECISION", "rule"),
+                    help="answer every authorization request the same way for the run (default: the flight-rule table)")
     args = ap.parse_args()
 
     import rclpy
 
     rclpy.init(args=None)
     try:
-        run_cli(args.run_dir, decision_time_s=args.decision_time_s, manual=args.manual)
+        run_cli(args.run_dir, decision_time_s=args.decision_time_s, manual=args.manual, ground_decision=args.ground_decision)
     finally:
-        rclpy.try_shutdown  # a SIGINT has usually shut the context down already
+        rclpy.try_shutdown()  # a SIGINT has usually shut the context down already
 
 
 if __name__ == "__main__":

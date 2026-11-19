@@ -1,0 +1,14 @@
+# How each push button of the site looks, part of the site survey (site_map `points[<feature>].appearance`). The press
+# skill finds its button in the wrist camera by this description: a caller names the feature and the boundary looks the
+# description up, so a planner never has to guess a colour it was not told. The texts are the
+# ones the authored baselines' task models carry (baselines/europa/host.py UNIT_DESCRIPTIONS and SHUTTER_TARGET,
+# baselines/plexil/plans/MissionA_Covered.ple); openral_ext/capability_server/test_button_appearance.py keeps both equal.
+pdu_1_panel/press: the round red push button set into the yellow sub-panel
+pdu_2_panel/press: the round red push button set into the yellow sub-panel
+pdu_3_panel/press: the round red push button set into the yellow sub-panel
+bess_panel/press: the round white push button on the graphite control panel with the teal border
+isru_panel/press: the round black push button on the white control panel with the orange border
+pdu_1_radiator/cover_button: the round blue push button on the yellow plate
+pdu_2_radiator/cover_button: the round blue push button on the yellow plate
+pdu_3_radiator/cover_button: the round blue push button on the yellow plate
+bess_hvac/cover_button: the round blue push button on the yellow plate

@@ -1,5 +1,5 @@
 """The EUROPA->PLEXIL baseline runs Mission B `covered` on the live graph: the brief's
-item from its source to its destination (MISSION_GOAL, `mission_b_goal` from D0_ENV, the goal PLEXIL's plan reads).
+item from its source to its destination (MISSION_GOAL, `mission_b_goal()` from D0_ENV, the goal PLEXIL's plan reads).
 
 Mirrors d0_plexil_mission_b_check.py's shape, but three processes instead of one: `host.py` (EUROPA -- solves,
 dispatches, replans, exactly its offline `run_offline_mission_b.sh` invocation except talking to the *real* boundary
@@ -13,11 +13,15 @@ import subprocess
 import sys
 import threading
 
-from d0_common import *  # noqa:
+from d0_common import *  # noqa: F401,F403
 from space_harness_msgs.action import ExecuteCapability
 
 REPO = HERE / "../../.."
 EUROPA_DIR = (REPO / "baselines/europa").resolve()
+# BASELINE_REVISION=reauth/europa-<case>: that re-authored task model's host (baselines/revised/europa-<case>/europa,
+# its domain and configuration beside it); unset: the original. The exec and its dispatch plan are this baseline's.
+REVISION = os.environ.get("BASELINE_REVISION")
+MODEL_DIR = (REPO / "baselines/revised" / REVISION.removeprefix("reauth/") / "europa").resolve() if REVISION else EUROPA_DIR
 PLEXIL_HOME = Path.home() / "Programs/plexil"
 assert ActionClient(n, ExecuteCapability, "/space/capability/execute").wait_for_server(timeout_sec=120), "boundary not up"
 
@@ -29,11 +33,11 @@ env = dict(os.environ, PLEXIL_HOME=str(PLEXIL_HOME),
 # needing a conda-free PATH inside this already-running graph process.
 assert (EUROPA_DIR / "plexil/plans/ActivityDispatch.plx").exists(), "compile ActivityDispatch.ple first (plexilc)"
 
-log("PLAN", host="EUROPA host.py", model="lunar-base-model.nddl",
+log("PLAN", host="EUROPA host.py", model="lunar-base-model.nddl", **({"revision": REVISION} if REVISION else {}),
     goals=[json.loads(env["MISSION_GOAL"]), "stowed", "final:dock"])
 t0, sim0 = time.time(), sim["t"]
 D0_LOG = Path(os.environ["D0_LOG"])
-host_proc = subprocess.Popen([sys.executable, str(EUROPA_DIR / "host.py"), "--run-dir", str(D0_LOG),
+host_proc = subprocess.Popen([sys.executable, str(MODEL_DIR / "host.py"), "--run-dir", str(D0_LOG),
                               "--goal", "delivered", "--goal", "stowed", "--final", "dock"],
                              cwd=EUROPA_DIR, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 host_out = []

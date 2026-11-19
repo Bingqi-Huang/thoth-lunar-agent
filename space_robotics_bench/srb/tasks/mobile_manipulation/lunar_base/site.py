@@ -12,10 +12,18 @@ inventory record says):
   time cancels it;
 - a closed breaker with an unserviceable module in a bay trips after the unit's power-on self-test, with the module's
   own fault code (MODULE_FAULT); with a bay empty it trips MODULE_MISSING at once;
-- pressing a panel's reset button closes a tripped breaker; pressing a shutter's button opens or closes the shutter.
+- pressing a panel's reset button closes a tripped breaker; pressing a shutter's button opens or closes the shutter;
+- a module taken out of a bay while its unit is energized arcs the bay's connector: the connector is damaged for good,
+  and a module seated there again does not make contact (the unit trips CONNECTOR_DAMAGED whenever it is closed). The
+  damage is a state, not a model of the arc; it makes the removal irreversible for the robot;
+- an item set down on a handover point (a delivery's receiving stand) is taken in by the consignee once it rests there:
+  it is latched in place and the robot cannot take it back, whichever item it is (items standing there at the start are
+  not latched).
 
 The panel lamp shows the breaker (red = tripped, green = closed). The units publish their own telemetry
-(`power_telemetry`), equipment data any method may read; `mission_state()` in the mission tasks is evaluator-only.
+(`power_telemetry`: breaker, lamp, power-converter heat-sink temperature, trip cause, resets, module serial and
+connector state per bay), equipment data any method may read; `mission_state()` in the mission tasks is
+evaluator-only. Record faults (`records`, `record_swaps`) change only what the inventory record says, never the world.
 """
 
 import math
@@ -40,8 +48,14 @@ UNIT_NAMES = {u: spec["name"] for u, spec in UNIT_SPECS.items()}
 ## the fault code a unit's self-test reports for an unserviceable module, by module kind
 MODULE_FAULT = {"orbital replacement unit (ORU)": "ORU_SELFTEST_FAIL", "battery module": "BATTERY_MODULE_FAULT",
                 "filter cartridge": "FILTER_CLOGGED"}
-TRIP_CAUSES = ("", "OVERCURRENT", "OVERTEMP", *MODULE_FAULT.values(), "MODULE_MISSING")
+TRIP_CAUSES = ("", "OVERCURRENT", "OVERTEMP", *MODULE_FAULT.values(), "MODULE_MISSING", "CONNECTOR_DAMAGED")
 SELFTEST_S = 3.0  # the unit's power-on self-test: how long a closed breaker runs on an unserviceable module
+## the power converter's heat sink (the thermal assumption of `retrip_delay_s` below): ambient with the rejection path
+## open, the cutout at 85 C, reopening 5 K below it; with the shutter drawn a running unit climbs those 5 K in
+## `retrip_delay_s`; a unit not running, or running with the shutter open, relaxes towards ambient (time constant
+## shorter with the shutter open). Reported only: the OVERTEMP trip itself keeps its timer.
+SINK_AMBIENT_C, SINK_CUTOUT_C, SINK_HYSTERESIS_K = 25.0, 85.0, 5.0
+SINK_TAU_OPEN_S, SINK_TAU_DRAWN_S = 120.0, 600.0
 LAMP_RED = (1.0, 0.0, 0.0)
 LAMP_GREEN = (0.1, 1.0, 0.2)
 PRESS_TOLERANCE_M = 0.03  # TCP within this of a button cap is a press
@@ -56,6 +70,11 @@ _STOW = (0.0, 0.40, 0.0, -0.70, 0.0, -1.27, 1.57079633)  # wrist camera level (r
 _TCP_OFFSET = (0.0, 0.0, 0.140)
 
 
+def _pairs(spec: str) -> Dict[str, str]:
+    """"a:b+c:d" -> {a: b, c: d}"""
+    return dict(kv.split(":", 1) for kv in spec.split("+") if kv)
+
+
 @configclass
 class SiteTaskCfg(_BaseTaskCfg):
     ## how long a running unit with its heat-rejection shutter drawn takes to re-trip OVERTEMP after a reset. Fixed
@@ -66,6 +85,14 @@ class SiteTaskCfg(_BaseTaskCfg):
     retrip_delay_s: float = 30.0
     ## end the episode (and auto-reset) on verifier success; scripted demos turn this off to keep the final state
     terminate_on_success: bool = True
+    ## record faults (the inventory record only; the world is untouched), Hydra strings "object:object+...":
+    ## `records` "object:place_frame" sets where the record says an object is (false locations); `record_swaps`
+    ## "object:object" exchanges what the record says about two objects (false identities: each serial recorded where
+    ## the other item stands, with the other's status)
+    records: str = ""
+    record_swaps: str = ""
+    ## handover points (place frames, "a+b") where arriving items are latched; mission tasks may add their own
+    handover: str = ""
 
 
 class SiteTask(_BaseTask):
@@ -100,6 +127,13 @@ class SiteTask(_BaseTask):
         self._overtemp_at = torch.full((n, len(UNITS)), math.inf, device=dev)
         self._selftest_at = torch.full((n, len(UNITS)), math.inf, device=dev)
         self._cover_closed = torch.zeros(n, len(UNITS), dtype=torch.bool, device=dev)
+        self._sink_c = torch.full((n, len(UNITS)), SINK_AMBIENT_C, device=dev)
+        self._damaged = torch.zeros(n, len(self._bays), dtype=torch.bool, device=dev)
+        self._last_content = None  # bay contents at the previous step (a removal is a bay going from a module to empty)
+        names = list(self._objs)
+        self._latched = torch.zeros(n, len(names), dtype=torch.bool, device=dev)
+        self._latch_pose = torch.zeros(n, len(names), 7, device=dev)
+        self._there_at_start = torch.zeros(n, len(names), dtype=torch.bool, device=dev)
         self._selftest_cause = torch.zeros(n, len(UNITS), dtype=torch.long, device=dev)
         self._serviceable = {name: torch.ones(n, dtype=torch.bool, device=dev) for name in self._modules}
         self._pressing = torch.zeros(n, len(self._buttons), dtype=torch.bool, device=dev)
@@ -131,6 +165,17 @@ class SiteTask(_BaseTask):
         return [{"serial": o["serial"], "item": o["item"], "recorded_location": o["support"], "status": o.get("status", "serviceable")}
                 for o in self._ix["objects"].values()]
 
+    def with_record_faults(self, record: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """The configured record faults applied to a record (mission tasks call it last in `inventory_record`)."""
+        entry = {r["serial"]: r for r in record}
+        for name, location in _pairs(self.cfg.records).items():
+            entry[self._ix["objects"][name]["serial"]]["recorded_location"] = location
+        for a, b in _pairs(self.cfg.record_swaps).items():
+            ra, rb = entry[self._ix["objects"][a]["serial"]], entry[self._ix["objects"][b]["serial"]]
+            for key in ("recorded_location", "status"):
+                ra[key], rb[key] = rb[key], ra[key]
+        return record
+
     ## -- reset ---------------------------------------------------------------------------------------------------
     def _reset_idx(self, env_ids: Sequence[int]):
         super()._reset_idx(env_ids)
@@ -143,6 +188,7 @@ class SiteTask(_BaseTask):
             self._tripped[ids, k] = unit in trips
             self._cause[ids, k] = TRIP_CAUSES.index(trips.get(unit, ""))
             self._cover_closed[ids, k] = unit in covers
+            self._sink_c[ids, k] = SINK_CUTOUT_C if trips.get(unit) == "OVERTEMP" else SINK_AMBIENT_C
             set_status_lamp(id_list, UNIT_SPECS[unit]["panel"], LAMP_RED if unit in trips else LAMP_GREEN)
             if UNIT_SPECS[unit]["cover"]:
                 set_radiator_cover(id_list, UNIT_SPECS[unit]["cover"], unit in covers)
@@ -150,12 +196,40 @@ class SiteTask(_BaseTask):
             self._serviceable[name][ids] = name not in bad
         self._overtemp_at[ids] = math.inf
         self._selftest_at[ids] = math.inf
+        self._damaged[ids] = False
+        self._last_content = None
         self._pressing[ids] = False
         self._press_count[ids] = 0
         self._resets[ids] = 0
         self._success[ids] = False
-        for name, support in self.object_placement().items():
+        where = self.object_placement()
+        for name, support in where.items():
             self.place_object(id_list, name, support)
+        handover = set(self.handover_supports())
+        self._latched[ids] = False
+        self._there_at_start[ids] = torch.tensor([where.get(name) in handover for name in self._objs], device=self.device)
+
+    def handover_supports(self) -> List[str]:
+        """Place frames where the consignee latches arriving items (mission tasks add the delivery's destination)."""
+        return [s for s in self.cfg.handover.split("+") if s]
+
+    def _update_handover(self):
+        """Latch items that come to rest on a handover point; hold latched items where they were taken in."""
+        sup = self.handover_supports()
+        if not sup:
+            return
+        names = list(self._objs)
+        arrived = self.on_supports(names, sup, settled=True).any(dim=2) & ~self._latched & ~self._there_at_start
+        for j, name in enumerate(names):
+            new = arrived[:, j]
+            if new.any():
+                self._latch_pose[new, j] = self._objs[name].data.root_state_w[new, :7]
+                self._latched[new, j] = True
+            held = self._latched[:, j]
+            if held.any():
+                ids = held.nonzero().flatten()
+                self._objs[name].write_root_pose_to_sim(self._latch_pose[ids, j], env_ids=ids)
+                self._objs[name].write_root_velocity_to_sim(torch.zeros(len(ids), 6, device=self.device), env_ids=ids)
 
     def place_object(self, env_ids: Sequence[int], name: str, support: str):
         """Put an object on a place frame with the same yaw relative to the frame normal as its authored spawn."""
@@ -202,6 +276,8 @@ class SiteTask(_BaseTask):
         self._pressing = near | (self._pressing & (dist < 2.0 * PRESS_TOLERANCE_M))  # contact jitter is one press
         self._press_count += pressed.long()
         content = self.bay_contents(self._bays)
+        last, self._last_content = self._last_content, content
+        dt = self.step_dt
         for k, unit in enumerate(UNITS):
             reset = pressed[:, k] & self._tripped[:, k]
             if reset.any():
@@ -216,10 +292,22 @@ class SiteTask(_BaseTask):
                     for e in toggle.nonzero().flatten().tolist():
                         set_radiator_cover([e], UNIT_SPECS[unit]["cover"], bool(self._cover_closed[e, k]))
             closed = ~self._tripped[:, k]
+            # a module lifted out of a bay while the unit is energized arcs the connector (before this step's trip)
+            if last is not None:
+                for bay in UNIT_SPECS[unit]["bays"]:
+                    j = self._bays.index(bay)
+                    out = torch.tensor([last[bay][e] != "" and content[bay][e] == "" for e in range(self.num_envs)], device=self.device)
+                    self._damaged[out & closed, j] = True
             # thermal: a running unit with its shutter drawn heats until it trips; opening the shutter cancels it
             heating = closed & self._cover_closed[:, k]
             self._overtemp_at[heating & torch.isinf(self._overtemp_at[:, k]), k] = t[heating & torch.isinf(self._overtemp_at[:, k])] + self.cfg.retrip_delay_s
             self._overtemp_at[~heating, k] = math.inf
+            # the heat sink as telemetry reports it: on its way from the reopened cutout to the cutout while heating,
+            # relaxing to ambient otherwise
+            remaining = (self._overtemp_at[:, k] - t).clamp(min=0.0) / self.cfg.retrip_delay_s
+            tau = torch.where(self._cover_closed[:, k], torch.full_like(t, SINK_TAU_DRAWN_S), torch.full_like(t, SINK_TAU_OPEN_S))
+            relaxed = self._sink_c[:, k] + (SINK_AMBIENT_C - self._sink_c[:, k]) * (dt / tau).clamp(max=1.0)
+            self._sink_c[:, k] = torch.where(heating, SINK_CUTOUT_C - SINK_HYSTERESIS_K * remaining, relaxed)
             # modules: an empty bay trips at once, an unserviceable module after the self-test with its own fault code
             contents = [content[bay] for bay in UNIT_SPECS[unit]["bays"]]
             empty = torch.tensor([any(c[e] == "" for c in contents) for e in range(self.num_envs)], device=self.device)
@@ -232,6 +320,9 @@ class SiteTask(_BaseTask):
                                                        for m in bad], device=self.device)
             if (closed & empty).any():
                 self._trip(closed & empty, k, "MODULE_MISSING")
+            damaged = self._damaged[:, [self._bays.index(bay) for bay in UNIT_SPECS[unit]["bays"]]].any(dim=1)
+            if (~self._tripped[:, k] & damaged).any():
+                self._trip(~self._tripped[:, k] & damaged, k, "CONNECTOR_DAMAGED")
             if (t >= self._selftest_at[:, k]).any():
                 self._trip(t >= self._selftest_at[:, k], k, self._selftest_cause[:, k])
             if (t >= self._overtemp_at[:, k]).any():
@@ -239,20 +330,26 @@ class SiteTask(_BaseTask):
 
     def unit_healthy(self, k: int) -> torch.Tensor:
         """(n,) unit k closed with nothing about to trip it -- what 'restored' means for the evaluator."""
-        return ~self._tripped[:, k] & torch.isinf(self._overtemp_at[:, k]) & torch.isinf(self._selftest_at[:, k])
+        damaged = self._damaged[:, [self._bays.index(bay) for bay in UNIT_SPECS[UNITS[k]]["bays"]]].any(dim=1)
+        return ~self._tripped[:, k] & torch.isinf(self._overtemp_at[:, k]) & torch.isinf(self._selftest_at[:, k]) & ~damaged
 
     def power_telemetry(self) -> Dict[str, object]:
         """The units' own telemetry for env 0, as the base network carries it to any subscriber."""
         return {
-            "source": "the serviced units' own telemetry: breaker, trip cause, resets, installed module serial per bay",
+            "source": "the serviced units' own telemetry: breaker, panel lamp, heat-sink temperature, trip cause, resets, "
+                      "installed module serial and connector state per bay",
             "units": {unit: {"name": UNIT_SPECS[unit]["name"], "load": UNIT_SPECS[unit]["load"],
                             "criticality": UNIT_SPECS[unit]["criticality"],
                             "breaker": "tripped" if bool(self._tripped[0, k]) else "closed",
                             "energized": not bool(self._tripped[0, k]),
+                            "lamp": "red" if bool(self._tripped[0, k]) else "green",
+                            "heat_sink_temperature_c": round(float(self._sink_c[0, k]), 1),
                             "trip_cause": TRIP_CAUSES[int(self._cause[0, k])] or None,
                             "resets_since_start": int(self._resets[0, k]),
                             "installed_modules": {f"{bay}/tray": self._ix["objects"][c]["serial"] if (c := self.bay_content(bay)[0]) else None
-                                                  for bay in UNIT_SPECS[unit]["bays"]}}
+                                                  for bay in UNIT_SPECS[unit]["bays"]},
+                            "bay_connectors": {f"{bay}/tray": "damaged" if bool(self._damaged[0, self._bays.index(bay)]) else "ok"
+                                               for bay in UNIT_SPECS[unit]["bays"]}}
                       for k, unit in enumerate(UNITS)},
         }
 
@@ -263,10 +360,14 @@ class SiteTask(_BaseTask):
                              healthy=bool(self.unit_healthy(k)[0]), cover_closed=bool(self._cover_closed[0, k]),
                              bays={bay: self.bay_content(bay)[0] for bay in UNIT_SPECS[unit]["bays"]},
                              resets=int(self._resets[0, k]), reset_presses=int(self._press_count[0, k]),
+                             damaged_bays=[bay for bay in UNIT_SPECS[unit]["bays"] if bool(self._damaged[0, self._bays.index(bay)])],
+                             heat_sink_temperature_c=round(float(self._sink_c[0, k]), 1),
                              cover_presses=int(self._press_count[0, len(UNITS) + self._covered_units.index(k)]) if k in self._covered_units else 0)
                    for k, unit in enumerate(UNITS)},
             objects={name: self.where_is(name) for name in self._objs},
             parked_and_stowed=bool(self.parked_and_stowed()[0]),
+            record_faults=dict(records=_pairs(self.cfg.records), record_swaps=_pairs(self.cfg.record_swaps)),
+            latched=[name for j, name in enumerate(self._objs) if bool(self._latched[0, j])],
         )
 
     ## -- robot and objects ---------------------------------------------------------------------------------------
@@ -326,6 +427,7 @@ class SiteTask(_BaseTask):
         ret = super().extract_step_return()
         if hasattr(self, "_success"):
             self._update_power()
+            self._update_handover()
             self._success = self.mission_success()
             if self.cfg.terminate_on_success:
                 ret = ret._replace(termination=ret.termination | self._success)

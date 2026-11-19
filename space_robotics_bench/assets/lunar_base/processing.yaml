@@ -148,6 +148,11 @@ outputs:
   bat_0101: {category: power, source: power/scifi_power_battery, target: {longest: 0.42}, physics: dynamic, mass_kg: 1.0,
              top_handle: {axis: Y}, serial_label: BAT-0101, no_collision: [serial_label]}
   bat_0102: {like: bat_0101, serial_label: BAT-0102}
+  # the same modules with one data plate on the crown in front of the column, where the scan view reads it (the plates
+  # above sat low on the body's far ends and never decoded, 2026-11-09); geometry, mass, handle and serials unchanged.
+  # New paths so simulations running with the originals are untouched; a run picks them with SRB_LB_USD_OVERRIDE.
+  bat_0101_v2: {like: bat_0101, serial_label: BAT-0101, serial_label_seat: front}
+  bat_0102_v2: {like: bat_0101, serial_label: BAT-0102, serial_label_seat: front}
   flt_0201: {category: isru, source_root: authored, source: filter_cartridge, scale: 1.0, physics: dynamic, mass_kg: 1.0,
              top_handle: {axis: X}, serial_label: FLT-0201, no_collision: [serial_label]}
   flt_0202: {like: flt_0201, serial_label: FLT-0202}

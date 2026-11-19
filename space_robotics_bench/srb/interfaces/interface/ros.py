@@ -18,6 +18,7 @@ import rclpy
 import torch
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import Quaternion, Transform, TransformStamped, Twist, Vector3
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.publisher import Publisher
@@ -39,6 +40,7 @@ from std_msgs.msg import (
 )
 from std_msgs.msg import String as StringMsg
 from std_srvs.srv import Empty as EmptySrv
+from std_srvs.srv import SetBool as SetBoolSrv
 from tf2_ros import TransformBroadcaster
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
@@ -67,6 +69,9 @@ if TYPE_CHECKING:
     from srb._typing import AnyEnv
 
 _MISSION_STATE_EVERY = 10  # control steps between env0/mission_state publications (~5 Hz at 50 Hz control)
+_PAUSE_POLL_S = 0.02  # wall seconds between two looks at the pause flag while the simulator is paused
+_PAUSE_CLOCK_EVERY_S = 0.5  # wall seconds between two re-publications of the (standing) /clock while paused
+_PAUSE_ACK_TIMEOUT_S = 60.0  # wall seconds the pause service waits for the driver loop to stop
 
 
 def _ros_bytes(buffer: numpy.ndarray) -> array.array:
@@ -252,6 +257,20 @@ class RosInterface(InterfaceBase):
             qos_profile=self.__QOS_PROFILE,
         )
 
+        # Srv: Pause. std_srvs/SetBool `envs/pause` (data=true: stop, false: continue). While paused the driver loop
+        # (`ros_agent`, via `hold_if_paused`) takes no env step: physics, /clock and every TF / sensor stamp stand still,
+        # while the executor thread keeps serving callbacks (commands are latched into the action buffer, nothing acts on
+        # them until the loop continues). The research repo's mission agent pauses the simulator while it waits for its
+        # foundation model, so mission time (sim seconds) excludes model latency and gateway queueing. The call returns
+        # once the loop has actually stopped (after the step in flight is finished and published); `message` is JSON
+        # {paused, sim_t, step} with the sim time the clock stands at. Nothing pauses unless a client calls it.
+        self._paused = False
+        self._pause_acked = threading.Event()
+        self._pause_clock_wall = 0.0
+        self._srv_pause: Service = self._node.create_service(
+            SetBoolSrv, "envs/pause", self._cb_pause, callback_group=MutuallyExclusiveCallbackGroup()
+        )
+
         ## Pub: Transforms (all scene assets)
         self._tf_broadcaster = TransformBroadcaster(
             self._node, qos=self.__QOS_PROFILE_TF
@@ -410,6 +429,55 @@ class RosInterface(InterfaceBase):
             self._profile_tick(
                 tf=_t1 - _t0, joint_states=_t2 - _t1, sensors=_t3 - _t2
             )
+
+    ## Pause ##
+
+    def _sim_time_s(self) -> float:
+        return self._env.common_step_counter * self._env.step_dt
+
+    def _cb_pause(self, request: SetBoolSrv.Request, response: SetBoolSrv.Response):
+        from srb.utils import logging
+
+        if request.data:
+            self._pause_acked.clear()
+            self._paused = True
+            response.success = self._pause_acked.wait(timeout=_PAUSE_ACK_TIMEOUT_S)
+            if not response.success:
+                self._paused = False  # the loop never stopped; leave the simulator running and let the client see the failure
+        else:
+            # the loop is stopped, so this is the sim time it continues from
+            response.success = True
+        response.message = json.dumps(
+            dict(
+                paused=bool(request.data) and response.success,
+                sim_t=self._sim_time_s(),
+                step=int(self._env.common_step_counter),
+            )
+        )
+        if not request.data:
+            self._paused = False
+            self._pause_acked.clear()
+        what = ("paused" if response.success else "PAUSE FAILED") if request.data else "resumed"
+        logging.info(f"[pause] {what}: {response.message}")
+        return response
+
+    def hold_if_paused(self) -> bool:
+        """Called by the driver loop before every env step: True while the simulator is paused, and the caller skips
+        the step. The first call that sees the pause acknowledges it to the service, i.e. the step in flight was
+        finished and published. While paused, the (standing) /clock is re-published at a low rate so that a node that
+        joins during the pause still gets a time."""
+        if not self._paused:
+            return False
+        self._pause_acked.set()
+        time.sleep(_PAUSE_POLL_S)
+        now = time.monotonic()
+        if now - self._pause_clock_wall >= _PAUSE_CLOCK_EVERY_S:
+            self._pause_clock_wall = now
+            time_s = self._sim_time_s()
+            self._clock_pub.publish(
+                Clock(clock=Time(sec=int(time_s), nanosec=int((time_s % 1) * 1e9)))
+            )
+        return True
 
     def _profile_tick(self, **buckets_s: float):
         """Accumulate per-tick timings and log the mean every 100 ticks."""
@@ -1102,37 +1170,30 @@ class RosInterface(InterfaceBase):
     ## Transforms ##
 
     def _broadcast_transforms(self, time_msg: Time):
+        # The same transforms as before, read from each asset's tensors with one `tolist()` instead of one `.item()` per
+        # number: every `.item()` on a device tensor synchronizes, and that was ~38 ms of every tick (SRB_ROS_PROFILE,
+        # research repo AKR validation). Values, frames and rate are unchanged.
+        def stamped(parent: str, child: str, p, q) -> TransformStamped:
+            return TransformStamped(
+                header=Header(stamp=time_msg, frame_id=parent),
+                child_frame_id=child,
+                transform=Transform(
+                    translation=Vector3(x=p[0], y=p[1], z=p[2]),
+                    rotation=Quaternion(w=q[0], x=q[1], y=q[2], z=q[3]),
+                ),
+            )
+
         transforms: List[TransformStamped] = []
         for asset_name, asset in (
             self._env.scene._rigid_objects.items()
             | self._env.scene._articulations.items()
         ):
             assert isinstance(asset, (RigidObject, Articulation))
-            root_pos = asset.data.root_pos_w - self._env.scene.env_origins
+            pos = (asset.data.root_pos_w - self._env.scene.env_origins).tolist()
+            quat = asset.data.root_quat_w.tolist()
             transforms.extend(
-                [
-                    TransformStamped(
-                        header=Header(
-                            stamp=time_msg,
-                            frame_id=f"srb/env{i}",
-                        ),
-                        child_frame_id=f"srb/env{i}/{asset_name}",
-                        transform=Transform(
-                            translation=Vector3(
-                                x=root_pos[i, 0].item(),
-                                y=root_pos[i, 1].item(),
-                                z=root_pos[i, 2].item(),
-                            ),
-                            rotation=Quaternion(
-                                w=asset.data.root_quat_w[i, 0].item(),
-                                x=asset.data.root_quat_w[i, 1].item(),
-                                y=asset.data.root_quat_w[i, 2].item(),
-                                z=asset.data.root_quat_w[i, 3].item(),
-                            ),
-                        ),
-                    )
-                    for i in range(self._num_envs)
-                ]
+                stamped(f"srb/env{i}", f"srb/env{i}/{asset_name}", pos[i], quat[i])
+                for i in range(self._num_envs)
             )
         for asset_name, asset in self._env.scene._sensors.items():
             if isinstance(asset, (Camera, RayCasterCamera)):
@@ -1143,66 +1204,22 @@ class RosInterface(InterfaceBase):
                 root_quat = asset.data.quat_w
             else:
                 continue
-
+            pos, quat = root_pos.tolist(), root_quat.tolist()  # type: ignore
             transforms.extend(
-                [
-                    TransformStamped(
-                        header=Header(
-                            stamp=time_msg,
-                            frame_id=f"srb/env{i}",
-                        ),
-                        child_frame_id=f"srb/env{i}/{asset_name}",
-                        transform=Transform(
-                            translation=Vector3(
-                                x=root_pos[i, 0].item(),
-                                y=root_pos[i, 1].item(),
-                                z=root_pos[i, 2].item(),
-                            ),
-                            rotation=Quaternion(
-                                w=root_quat[i, 0].item(),  # type: ignore
-                                x=root_quat[i, 1].item(),  # type: ignore
-                                y=root_quat[i, 2].item(),  # type: ignore
-                                z=root_quat[i, 3].item(),  # type: ignore
-                            ),
-                        ),
-                    )
-                    for i in range(self._num_envs)
-                ]
+                stamped(f"srb/env{i}", f"srb/env{i}/{asset_name}", pos[i], quat[i])
+                for i in range(self._num_envs)
             )
-
         for asset_name, asset in self._env.scene._rigid_object_collections.items():
             assert isinstance(asset, RigidObjectCollection)
-            object_pos = (
+            pos = (
                 asset.data.object_pos_w
-                - self._env.scene.env_origins.unsqueeze(1).repeat(
-                    1, asset.num_objects, 1
-                )
-            )
+                - self._env.scene.env_origins.unsqueeze(1).repeat(1, asset.num_objects, 1)
+            ).tolist()
+            quat = asset.data.object_quat_w.tolist()
             transforms.extend(
-                [
-                    TransformStamped(
-                        header=Header(
-                            stamp=time_msg,
-                            frame_id=f"srb/env{i}",
-                        ),
-                        child_frame_id=f"srb/env{i}/{object_name}",
-                        transform=Transform(
-                            translation=Vector3(
-                                x=object_pos[i, object_id, 0].item(),
-                                y=object_pos[i, object_id, 1].item(),
-                                z=object_pos[i, object_id, 2].item(),
-                            ),
-                            rotation=Quaternion(
-                                w=asset.data.object_quat_w[i, object_id, 0].item(),
-                                x=asset.data.object_quat_w[i, object_id, 1].item(),
-                                y=asset.data.object_quat_w[i, object_id, 2].item(),
-                                z=asset.data.object_quat_w[i, object_id, 3].item(),
-                            ),
-                        ),
-                    )
-                    for i in range(self._num_envs)
-                    for object_id, object_name in enumerate(asset.object_names)
-                ]
+                stamped(f"srb/env{i}", f"srb/env{i}/{object_name}", pos[i][object_id], quat[i][object_id])
+                for i in range(self._num_envs)
+                for object_id, object_name in enumerate(asset.object_names)
             )
         for asset_name, asset in self._env.scene._articulations.items():
             assert isinstance(asset, Articulation)
@@ -1212,34 +1229,14 @@ class RosInterface(InterfaceBase):
                 asset.data.body_pos_w,
                 asset.data.body_quat_w,
             )
+            pos, quat = body_pos.tolist(), body_quat.tolist()
             transforms.extend(
-                [
-                    TransformStamped(
-                        header=Header(
-                            stamp=time_msg,
-                            frame_id=f"srb/env{i}/{asset_name}",
-                        ),
-                        child_frame_id=f"srb/env{i}/{asset_name}/{body_name}",
-                        transform=Transform(
-                            translation=Vector3(
-                                x=body_pos[i, body_id, 0].item(),
-                                y=body_pos[i, body_id, 1].item(),
-                                z=body_pos[i, body_id, 2].item(),
-                            ),
-                            rotation=Quaternion(
-                                w=body_quat[i, body_id, 0].item(),
-                                x=body_quat[i, body_id, 1].item(),
-                                y=body_quat[i, body_id, 2].item(),
-                                z=body_quat[i, body_id, 3].item(),
-                            ),
-                        ),
-                    )
-                    for i in range(self._num_envs)
-                    for (
-                        body_name,
-                        body_id,
-                    ) in asset.root_physx_view.shared_metatype.link_indices.items()
-                ]
+                stamped(f"srb/env{i}/{asset_name}", f"srb/env{i}/{asset_name}/{body_name}", pos[i][body_id], quat[i][body_id])
+                for i in range(self._num_envs)
+                for (
+                    body_name,
+                    body_id,
+                ) in asset.root_physx_view.shared_metatype.link_indices.items()
             )
         self._tf_broadcaster.sendTransform(transforms)
 

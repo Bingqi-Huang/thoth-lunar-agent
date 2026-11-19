@@ -12,12 +12,11 @@ help). Every model output is decoded into OpenRAL's typed `ReasonerToolCall` uni
 
 The plan tool keeps OpenRAL's `MissionState` ledger and `decompose_mission` modes (replace the open tasks, or split the
 active task in place) but takes plain task strings: OpenRAL's `DecomposeMissionTool` requires every subtask to
-name one tabletop object (`GroundedSubtask`), which rejects mission-level tasks such as "return to the dock"
-.
+name one tabletop object (`GroundedSubtask`), which rejects mission-level tasks such as "return to the dock".
   report_to_operator       -> EmitPromptTool(target_topic=REPORT_TOPIC)
   request_operator         -> EmitPromptTool(target_topic=REQUEST_TOPIC)
 
-`Agent.dispatch` (space_runtime/agent.py) publishes both as `PromptStamped` on their topic. Mission control sits
+`Agent.dispatch()` (space_runtime/agent.py) publishes both as `PromptStamped` on their topic. Mission control sits
 behind the Earth link, so `request_operator` does not block: the answer arrives asynchronously (store-and-forward) and
 is recorded as an `operator_answered` event when it does; `wait_for_mission_control` (local/wait) holds the robot until
 it arrives or a time limit passes -- the operator PROTOCOL (when to escalate, what an answer means) stays outside this
@@ -44,6 +43,7 @@ REPLY_TOPIC = "/space/operator/reply"  # console -> requester: the operator's an
 SET_TASK_STATUS = "local/set_task_status"
 DECOMPOSE = "local/decompose_mission"
 WAIT = "local/wait_for_mission_control"
+CHECK = "local/check_proposition"  # AKR executor only (prompts/akr/tools.yaml): the planner's typed sensing
 TEXTS = yaml.safe_load(ablation.prompt("tools.yaml").read_text())
 
 
@@ -69,7 +69,9 @@ def _function(name: str, description: str, inputs: dict) -> dict:
 
 def tool_schemas(texts: dict = TEXTS) -> list[dict]:
     """The palette: every mission-level capability contract, then the harness-local tools (prompts/ours/tools.yaml)."""
-    tools = [_function(name, f"{texts['group'][group]}. {' '.join(c['description'].split())}", c.get("inputs") or {})
+    hidden = texts.get("hidden_inputs") or {}   # contract inputs this palette's planner does not fill
+    tools = [_function(name, f"{texts['group'][group]}. {' '.join(c['description'].split())}",
+                       {k: v for k, v in (c.get("inputs") or {}).items() if k not in hidden.get(name, ())})
              for group in ("effects", "queries") for name, c in CONTRACTS[group].items()
              if not c.get("engineering")]  # stage-level capabilities are not mission tools (plan v4 granularity rule)
     return tools + [_function(name, " ".join(c["description"].split()), c["inputs"]) for name, c in texts["local"].items()]
@@ -92,6 +94,8 @@ def decode(name: str, args: dict):
             return ExecuteRskillTool(rskill_id=DECOMPOSE, goal_params_json=json.dumps(args), rationale=rationale)
         if name == "wait_for_mission_control":
             return ExecuteRskillTool(rskill_id=WAIT, goal_params_json=json.dumps(args), rationale=rationale)
+        if name == "check_proposition":
+            return ExecuteRskillTool(rskill_id=CHECK, goal_params_json=json.dumps(args), rationale=rationale)
         if name == "report_to_operator":
             return EmitPromptTool(target_topic=REPORT_TOPIC, text=args["text"], rationale=rationale)
         if name == "request_operator":
@@ -125,7 +129,7 @@ class HarnessToolClient:
         # <run>/ours/model_io.jsonl (§R1): the raw request/response `last_reply`/`tool_proposed` only keep a
         # paraphrase of -- the exact messages sent (system prompt + the harness context the model actually saw
         # that step) and the exact response (every tool call offered, finish_reason, token usage), not just the
-        # one call the agent went with. `events.jsonl` alone lets `context.render` reconstruct what a *current*
+        # one call the agent went with. `events.jsonl` alone lets `context.render()` reconstruct what a *current*
         # checkout of this module would have sent; this is what was actually sent, immune to that code changing.
         self._model_io_path = (run_dir / "model_io.jsonl") if run_dir else None
         self.step = 0  # set by Agent before each tick, same pattern as HarnessRenderer.step
@@ -137,7 +141,8 @@ class HarnessToolClient:
         msg = resp.choices[0].message
         usage = resp.usage
         entry = {
-            "step": self.step, "wall_t": time.time(), "model": self.model_id, "latency_s": round(latency_s, 3),
+            "step": self.step, "wall_t": time.time(), "model": self.model_id, "served_model": getattr(resp, "model", None),
+            "latency_s": round(latency_s, 3),
             "request": {"messages": messages},
             "response": {
                 "content": msg.content or "", "reasoning": getattr(msg, "reasoning_content", None) or "",
@@ -145,7 +150,12 @@ class HarnessToolClient:
                 "tool_calls": [{"name": tc.function.name, "arguments": tc.function.arguments} for tc in (msg.tool_calls or [])],
             },
             "usage": {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens,
-                      "total_tokens": usage.total_tokens} if usage else None,
+                      "total_tokens": usage.total_tokens,
+                      # the gateway's prefix cache (billed at the cached-input price)
+                      "cached_tokens": getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None),
+                      # thinking mode: the reasoning tokens, part of completion_tokens and billed as output
+                      "reasoning_tokens": getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None)}
+                     if usage else None,
         }
         with self._model_io_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")

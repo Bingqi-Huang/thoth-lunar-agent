@@ -41,6 +41,7 @@ from openral_msgs.msg import PromptStamped, SafetyStatus
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile
 from space_harness_msgs.action import ExecuteCapability
 from space_harness_msgs.srv import QueryCapability
+from std_srvs.srv import SetBool
 
 from openral_ext.capability_server.contracts import CONTRACTS, IX
 from space_runtime import ablation
@@ -48,7 +49,7 @@ from space_runtime.context import HarnessRenderer, system_text
 from space_runtime.facts import FactStore
 from space_runtime.guard import Guard
 from space_runtime.report import write_report
-from space_runtime.tools import DECOMPOSE, REPLY_TOPIC, REPORT_TOPIC, REQUEST_TOPIC, SET_TASK_STATUS, TEXTS, WAIT, HarnessToolClient
+from space_runtime.tools import CHECK, DECOMPOSE, REPLY_TOPIC, REPORT_TOPIC, REQUEST_TOPIC, SET_TASK_STATUS, TEXTS, WAIT, HarnessToolClient
 from space_runtime.verification import reported, verify
 
 REPO = Path(__file__).resolve().parents[1]
@@ -81,6 +82,8 @@ class Agent:
         self.node.create_subscription(Clock, "/clock", lambda m: setattr(self, "sim_t", m.clock.sec + m.clock.nanosec * 1e-9), 10)
         self.cap = ActionClient(self.node, ExecuteCapability, "/space/capability/execute")
         self.qry = self.node.create_client(QueryCapability, "/space/capability/query")
+        # the simulator's pause (SRB RosInterface `envs/pause`): the AKR planner holds the clock while the model thinks
+        self.pause_cli = self.node.create_client(SetBool, "/srb/envs/pause")
         # FDIR facts (§10.3): the safety kernel's latched state; folded into the record between steps
         self.fdir_inbox = []
         self.node.create_subscription(SafetyStatus, "/openral/safety_status", self.fdir_inbox.append,
@@ -104,7 +107,7 @@ class Agent:
         self.renderer = HarnessRenderer(self.store, self.max_steps, lambda: self.sim_t)
         self.palette = ToolPalette(execute_rskill_ids=frozenset([*(k for k, c in CONTRACTS["effects"].items() if not c.get("engineering")),
                                                                  *(k for k, c in CONTRACTS["queries"].items() if not c.get("engineering")),
-                                                                 SET_TASK_STATUS, DECOMPOSE, WAIT]))
+                                                                 SET_TASK_STATUS, DECOMPOSE, WAIT, CHECK]))
 
     def event(self, kind: str, **data) -> dict:
         return self.store.append(kind, sim_t=round(self.sim_t, 2), **data)
@@ -298,10 +301,15 @@ class Agent:
         self.core = ReasonerCore(client=self.client, retry_cap_per_kind=self.cfg["reasoner"]["retry_cap_per_call"],
                                  system_prompt=system_text(f, self.guard.target_authority))
         step = sum(ev["kind"] in ("tool_proposed", "reasoner_step_failed") for ev in self.store.events)
+        if self.cfg.get("akr"):
+            self.step = step
+            self.run_akr()
+            write_report(self.store, self.store.path.parent / "report.md")
+            return
         while f["terminal"] is None:
             # The step budget counts calls on the robot -- effects, queries, messages to mission control -- and failed
             # steps. Writing and closing the working plan does not count: it is the model's own advisory record
-            #, and it had spent up to a fifth of the budget.
+            # and it had spent up to a fifth of the budget.
             used = sum(ev["kind"] == "reasoner_step_failed" or (ev["kind"] == "tool_proposed" and ev["tool"] not in PLAN_TOOLS)
                        for ev in self.store.events)
             if used >= self.max_steps:
@@ -327,6 +335,34 @@ class Agent:
             self.node.get_logger().info(f"step {step} ({llm_s}s): {res.tool_call.model_dump_json()[:300]}")
             self.dispatch(res.tool_call)
         write_report(self.store, self.store.path.parent / "report.md")
+
+    def run_akr(self) -> None:
+        """The run under the AKR executor (manuscript Algorithm 1): the strategy (AKR_STRATEGY: akr | ffreplan |
+        kreplanner), the mission key of the vocabulary (AKR_MISSION) and the injected faults (AKR_INJECTION, JSON
+        of space_runtime.akr.injection.Injection) are the run's configuration."""
+        from space_runtime.akr.executor import Executor
+        from space_runtime.akr.injection import Injection, wrap
+        from space_runtime.akr.live import LlmPlanner, RosWorld
+        from space_runtime.akr.vocabulary import Vocabulary
+        ac = self.cfg["akr"]
+        inj = Injection.from_dict(json.loads(os.environ.get("AKR_INJECTION") or "{}"))
+        inj.ground_decision = os.environ.get("AKR_GROUND_DECISION") or inj.ground_decision  # the console reads the same variable
+        strategy, mission = os.environ["AKR_STRATEGY"], os.environ["AKR_MISSION"]
+        tel, man = self.query("power_status", {}), self.query("manifest", {})
+        self.event("akr_inputs", strategy=strategy, mission_key=mission, injection=inj.to_dict(), telemetry=tel["value"],
+                   manifest=man["value"])
+        vocab = Vocabulary(yaml.safe_load((REPO / ac["vocabulary"]).read_text()), self.store.facts["site"], tel["value"],
+                           man["value"], mission, t_vis=inj.earth_set_s, telemetry_removed=tuple(inj.telemetry_removed))
+        holder = {}
+        planner = LlmPlanner(self, vocab, self.max_steps, ac.get("planner_call_guard", 200))
+        world, wrapped = wrap(RosWorld(self, vocab, lambda: holder["ex"].K), planner, inj, vocab.exogenous)
+        meta = {**inj.to_dict(), "record_false_count": inj.record_false if isinstance(inj.record_false, int) else None}
+        ex = holder["ex"] = Executor(vocab, world, wrapped, strategy, ac["cap_L"], ac.get("planner_call_guard", 200), vocab.goal(),
+                                     list(vocab.k0().items()), vocab.record(),
+                                     lambda kind, **fields: self.store.append(kind, sim_t=round(self.sim_t, 2), **fields),
+                                     injection_meta=meta, mission=mission, skill_budget=self.max_steps)
+        planner.executor = ex
+        ex.run()
 
 
 def main():

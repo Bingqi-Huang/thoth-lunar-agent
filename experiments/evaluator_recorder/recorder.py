@@ -35,7 +35,7 @@ What this subscribes and why (sources in docs/evaluator_violations.md):
     (`srb/env0/lb_<name>`, `OBJECT_PREFIX = "lb_"` in `srb/assets/scenery/lunar_base.py`) and the arm's `srb/env0/robot/Link7` (the body
     `lunar_base_mission_b/task.py::tcp_pos_env` itself measures the TCP offset from -- ground truth, no
     AMCL). Looked up in the common `srb/env0` frame (`Buffer.lookup_transform`, the same pattern
-    `openral_ext/capability_server/node.py::_tf` already uses) once per `mission_state` message
+    `openral_ext/capability_server/node.py::_tf()` already uses) once per `mission_state` message
     (~5 Hz), logged as a `pose` event per frame found. A frame a mission structurally has no object for
     (Mission A has no `lb_spare_*`) raises `tf2_ros.LookupException` -- caught and simply not logged for
     that tick, not a defensive corner case: it is the expected shape of a run without that object.
@@ -95,7 +95,11 @@ FRAME_JPEG_QUALITY = 85  # ~38 KB/frame at 640x480 (measured); two cameras at 1 
 POSE_REFERENCE_FRAME = "srb/env0"
 # every movable object of the scene's interaction layer (OBJECT_PREFIX "lb_"), and the arm's Link7
 _IX = json.loads((Path(__file__).resolve().parents[2] / "space_robotics_bench/assets/lunar_base/usd/scene/lunar_base/interaction.json").read_text())
-TRACKED_POSE_FRAMES = (*(f"srb/env0/lb_{name}" for name in _IX["objects"]), "srb/env0/robot/Link7")
+# and the rover's own root (`srb/env0/robot`, the chassis: where the rover stands, for the location judgments)
+TRACKED_POSE_FRAMES = (*(f"srb/env0/lb_{name}" for name in _IX["objects"]), "srb/env0/robot/Link7", "srb/env0/robot")
+# the robot's joint positions (arm posture, jaw opening), logged with each mission_state: what the arm and the
+# gripper truly do, for the stow and held-item judgments (recording only; the same topic the capability server reads)
+JOINT_STATES_TOPIC = "/srb/env0/robot/joint_states"
 
 # SRB's own undesired-contact penalty term (WEIGHT_UNDESIRED_ROBOT_CONTACTS = -1.0 in every task file
 # that computes it): a violation tick publishes -1.0, a clean tick publishes 0.0. Comparing against the
@@ -124,7 +128,7 @@ class EvaluatorEventLog:
 
 def run_cli(run_dir: Path) -> None:
     """Blocking spin: subscribes the topics above, logs every evaluator-relevant transition/message.
-    Assumes `rclpy.init` has already been called by the caller (so a self-test publisher can share
+    Assumes `rclpy.init()` has already been called by the caller (so a self-test publisher can share
     one context, as in `operator_console.console`)."""
     import cv2
     import numpy as np
@@ -178,9 +182,14 @@ def run_cli(run_dir: Path) -> None:
             t, q = tr.transform.translation, tr.transform.rotation
             log.append("pose", sim_t=state["sim_t"], frame=frame, x=t.x, y=t.y, z=t.z, qw=q.w, qx=q.x, qy=q.y, qz=q.z)
 
+    def on_joints(msg) -> None:
+        state["joints"] = dict(zip(msg.name, (round(float(x), 5) for x in msg.position)))
+
     def on_mission_state(msg: String) -> None:
         log.append("mission_state", sim_t=state["sim_t"], state=json.loads(msg.data))
         log_tracked_poses()
+        if state.get("joints"):
+            log.append("joints", sim_t=state["sim_t"], position=state["joints"])
 
     def on_safety_status(msg: SafetyStatus) -> None:
         log.append("safety_status", sim_t=state["sim_t"], latched=bool(msg.latched), drop_reason=int(msg.drop_reason),
@@ -195,6 +204,8 @@ def run_cli(run_dir: Path) -> None:
     node.create_subscription(Clock, CLOCK_TOPIC, on_clock, 10)
     node.create_subscription(Float32, CONTACT_TOPIC, on_contact, 10)
     node.create_subscription(String, MISSION_STATE_TOPIC, on_mission_state, 10)
+    from sensor_msgs.msg import JointState
+    node.create_subscription(JointState, JOINT_STATES_TOPIC, on_joints, 10)
     node.create_subscription(SafetyStatus, SAFETY_STATUS_TOPIC, on_safety_status, 10)
     node.create_subscription(Empty, ESTOP_TOPIC, on_estop, 10)
     node.create_subscription(Empty, ESTOP_CLEARED_TOPIC, on_estop_cleared, 10)

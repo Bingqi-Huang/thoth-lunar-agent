@@ -22,6 +22,7 @@ Run inside a sourced graph (ROS Humble + openral install + ros/install):
 """
 
 import base64
+import contextlib
 import json
 import yaml
 import sys
@@ -40,7 +41,7 @@ import rclpy
 from moveit_msgs.srv import GetPositionIK, GetStateValidity
 from openral_msgs.action import ExecuteRskill
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve.parents[2]))  #: space_context
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # space_context
 from workspace.footprint import DOCK_ERROR_M, SCAN_CHECK_RANGE_M, clear_distance, dock_path, nav_map_occupied, swept_hits  # noqa: E402
 from workspace.reach import reach_map  # noqa: E402
 
@@ -78,7 +79,7 @@ from space_harness_msgs.action import ExecuteCapability
 from space_harness_msgs.srv import QueryCapability
 from tf2_ros import Buffer, TransformListener
 
-from contracts import CONTRACTS, IX, check_args, item_catalogue
+from contracts import APPEARANCE, CONTRACTS, IX, check_args, item_catalogue
 from space_context import link
 # The arm's ready posture (robot, not mission): out of the travel posture, tool 0.84 m behind the rover origin at 1.19 m,
 # pitched 30 deg down at the work, wrist camera above the tool axis. It stays out of the column any
@@ -109,7 +110,8 @@ POINT_TYPES = {
 # but that gateway stalled image requests coming from the runner process for the full deadline while the same request
 # from a shell answered in seconds. deepseek-flash reads these frames: on the recorded marked views it names the
 # handle's mark, a different one per view, and answers null on a blank image.
-VLM_MODEL = os.environ.get("SPACE_VLM_MODEL", "DeepSeek-V4.1-Flash")
+# from 2026-11-10 the planner and the camera questions use one model, DeepSeek-V4.1-Flash-1017 (the gateway's listed id)
+VLM_MODEL = os.environ.get("SPACE_VLM_MODEL", "DeepSeek-V4.1-Flash-1017")
 VLM_ENDPOINT = os.environ.get("SPACE_VLM_ENDPOINT", "https://YOUR-OPENAI-COMPATIBLE-ENDPOINT/v1")
 LOCATE_PROMPT = ('Locate {target} in this {w}x{h} camera image. Reply with JSON only: {{"found": true or false, "center": [x, y], '
                  '"box": [x1, y1, x2, y2]}} in pixel coordinates, origin at the top-left. found=false if it is not clearly visible.')
@@ -282,7 +284,7 @@ def held_item(a: dict) -> dict:
 
 
 def lower(capability: str, a: dict) -> dict:
-    """Contract arguments -> the rSkill's goal_params (the D0 checks' settings, F51)."""
+    """Contract arguments -> the rSkill's goal_params."""
     if capability == "navigate_to_pose":
         return {"pose": {"header": {"frame_id": "map"}, "pose": {
             "position": {"x": float(a["x"]), "y": float(a["y"]), "z": 0.0},
@@ -341,8 +343,9 @@ def lower(capability: str, a: dict) -> dict:
                 **({"release_constraint": a["release_constraint"]} if "release_constraint" in a else {})}
     if capability == "press":
         # the surveyed point of the target, for the skill to point its camera at; what it presses is what it then
-        # sees there, and where to stand off and how far to press past the face are its own defaults
-        return {"target": a["target"], "feature_xyz_map": IX["points"][a["feature"]]["xyz"],
+        # sees there, and where to stand off and how far to press past the face are its own defaults. A caller that
+        # names only the feature gets the button's surveyed look (configs/button_appearance.yaml)
+        return {"target": a.get("target") or APPEARANCE[a["feature"]], "feature_xyz_map": IX["points"][a["feature"]]["xyz"],
                 "feature_normal_map": IX["points"][a["feature"]]["normal"], "interface": IX["points"][a["feature"]].get("interface")}
     raise KeyError(capability)
 
@@ -430,10 +433,18 @@ class CapabilityServer(Node):
         # the gateway answers one view in 10-115 s with six runs at once: 300 s, as pick and press allow
         self.vlm = OpenAI(api_key=os.environ["SPACE_LLM_API_KEY"], base_url=VLM_ENDPOINT, timeout=300)
         self.vlm_pool = ThreadPoolExecutor(8)
+        # the simulator's clock is held while the vision-language model answers (SRB RosInterface `envs/pause`), as the
+        # planner's model call holds it: inference time is not mission time. Each call's wall
+        # latency and tokens go to <run>/vlm_calls.jsonl, never into the observation.
+        from std_srvs.srv import SetBool  # noqa: E402
+
+        self._pause = self.create_client(SetBool, "/srb/envs/pause", callback_group=cb)
+        self._hold_n, self._hold_lock = 0, threading.Lock()
+        self._vlm_log = self.evidence_dir.parent / "vlm_calls.jsonl"
         self.rskill = ActionClient(self, ExecuteRskill, "/openral/execute_rskill", callback_group=cb)
         self.ik = self.create_client(GetPositionIK, "/compute_ik", callback_group=cb)
         self.validity = self.create_client(GetStateValidity, "/check_state_validity", callback_group=cb)
-        self._seeds = working_seeds  # built here: it reads the ready posture and the working-branch windows defined below
+        self._seeds = working_seeds()  # built here: it reads the ready posture and the working-branch windows defined below
         self._free_cache: dict = {}  # tool pose -> whether some self-collision-free configuration reaches it
         self._ok_cache: dict = {}  # (kind, distance, height) -> whether the whole job can be done from there
         self._reach_lock = threading.Lock()
@@ -482,7 +493,7 @@ class CapabilityServer(Node):
         return {"frame": "map", "point_types": POINT_TYPES,
                 "equipment_catalogue": CATALOGUE,
                 "points": {k: {"type": v["type"], "equipment": v["asset"], **({"unit": v["unit"]} if "unit" in v else {}), "xyz": v["xyz"], "normal": [round(c, 3) for c in v["normal"]],
-                               **({"role": v["role"]} if "role" in v else {})}
+                               **({"role": v["role"]} if "role" in v else {}), **({"appearance": APPEARANCE[k]} if k in APPEARANCE else {})}
                            for k, v in fixed.items()},
                 "view_poses": {k: {"x": v["xy"][0], "y": v["xy"][1], "yaw": round(math.radians(v["yaw_deg"]), 4), "looks_at": v["target"]}
                                for k, v in IX["view_poses"].items()},
@@ -512,15 +523,67 @@ class CapabilityServer(Node):
         return dict(camera=camera, path=path, stamp=stamp, K=np.array(info.k).reshape(3, 3), w=m.width, h=m.height, pose_odom=pose,
                     turn=turn, uw=upright.shape[1], uh=upright.shape[0], depth=depth)
 
-    def ask_vlm(self, path: Path, text: str) -> str:
+    def _set_pause(self, on: bool) -> dict:
+        """`envs/pause` (True: the clock stops once the step in flight is done; False: it runs on). Its answer is
+        `{paused, sim_t, step}`. Idempotent, so a request whose answer is lost (Humble drops the first answer after
+        discovery) is sent again."""
+        from std_srvs.srv import SetBool  # noqa: E402
+
+        if not self._pause.wait_for_service(timeout_sec=60):
+            raise RuntimeError("the simulator has no envs/pause service (an SRB build without it)")
+        futures = [self._pause.call_async(SetBool.Request(data=on))]
+        t0 = time.time()
+        while not any(f.done() for f in futures):
+            if time.time() - t0 > 120.0:
+                raise RuntimeError(f"envs/pause(data={on}) did not answer in 120 s")
+            if time.time() - t0 > 2.0 * len(futures):
+                futures.append(self._pause.call_async(SetBool.Request(data=on)))
+            time.sleep(0.005)
+        r = next(f for f in futures if f.done()).result()
+        if not r.success:
+            raise RuntimeError(f"envs/pause(data={on}) failed: {r.message}")
+        return json.loads(r.message)
+
+    @contextlib.contextmanager
+    def clock_held(self, query: str):
+        """The simulator's clock held for the block (nested and concurrent holds share one pause); one line per block
+        in vlm_calls.jsonl with the sim time the clock stood at, the wall time and each model call's usage."""
+        rec = {"query": query, "calls": []}
+        with self._hold_lock:
+            self._hold_n += 1
+            if self._hold_n == 1:
+                rec["sim_t_stopped"] = self._set_pause(True)["sim_t"]
+        t0 = time.time()
+        try:
+            yield rec
+        finally:
+            rec["wall_s"] = round(time.time() - t0, 3)
+            with self._hold_lock:
+                self._hold_n -= 1
+                if self._hold_n == 0:
+                    rec["sim_t_released"] = self._set_pause(False)["sim_t"]
+            with self._vlm_log.open("a") as f:
+                f.write(json.dumps(rec) + "\n")
+
+    def ask_vlm(self, path: Path, text: str, rec: dict | None = None) -> str:
         b64 = base64.b64encode(path.read_bytes()).decode()
+        t0 = time.time()
         r = self.vlm.chat.completions.create(model=VLM_MODEL, messages=[{"role": "user", "content": [
             {"type": "text", "text": text}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}])
+        if rec is not None:
+            u = getattr(r, "usage", None)
+            details = getattr(u, "completion_tokens_details", None)
+            cached = getattr(getattr(u, "prompt_tokens_details", None), "cached_tokens", None)
+            rec["calls"].append({"wall_s": round(time.time() - t0, 3), "model": VLM_MODEL, "served_model": getattr(r, "model", None),
+                                 "prompt_tokens": getattr(u, "prompt_tokens", None),
+                                 "cached_tokens": cached, "completion_tokens": getattr(u, "completion_tokens", None),
+                                 "reasoning_tokens": getattr(details, "reasoning_tokens", None)})
         return (r.choices[0].message.content or "").strip()
 
     def observe(self, camera: str, question: str):
-        f = self.frame(camera)
-        answer = self.ask_vlm(f["path"], f"{question}\nAnswer from this camera image only, briefly. If it cannot be seen clearly, say so.")
+        f = self.frame(camera)     # taken with the clock running: the TF at its stamp may still have to arrive
+        with self.clock_held("observe") as rec:
+            answer = self.ask_vlm(f["path"], f"{question}\nAnswer from this camera image only, briefly. If it cannot be seen clearly, say so.", rec)
         return {"camera": camera, "answer": answer, "frame_stamp_s": round(f["stamp"], 2), "image": str(f["path"]), "model": VLM_MODEL}
 
     def drive_limits(self, carrying: bool) -> dict:
@@ -561,7 +624,7 @@ class CapabilityServer(Node):
             return {"carrying": carrying, "changed": False}
         req = SetParameters.Request(parameters=[
             ParamMsg(name=n, value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE_ARRAY, double_array_value=v))
-            for n, v in want.items if n not in ("lever_m", "gravity_m_s2")])  # evidence, not smoother parameters
+            for n, v in want.items() if n not in ("lever_m", "gravity_m_s2")])  # evidence, not smoother parameters
         answer(self._smoother_params.call_async(req), "the velocity smoother's parameter write")
         self._drive_limits = want
         self.get_logger().info(f"drive limits: {'carrying' if carrying else 'free'} {want['max_velocity'][0]} m/s, "
@@ -581,10 +644,14 @@ class CapabilityServer(Node):
         that cannot answer: held by a handle, the item's body hangs below the wrist camera's frame and what fills
         it is the handle head. The two are labelled separately and are not reconciled here.
         """
-        f = self.frame("wrist")
+        f = self.frame("wrist")    # taken with the clock running: the TF at its stamp may still have to arrive
+        with self.clock_held("held_item") as rec:
+            return self._held_item(rec, f)
+
+    def _held_item(self, rec: dict, f: dict) -> dict:
 
         def read(prompt: str) -> dict:
-            reply = self.ask_vlm(f["path"], prompt)
+            reply = self.ask_vlm(f["path"], prompt, rec)
             found = re.search(r"\{.*\}", reply, re.S)
             if not found:
                 raise ValueError(f"the model did not answer with JSON: {reply[:200]!r}")
@@ -614,7 +681,11 @@ class CapabilityServer(Node):
     def detect(self, camera: str, target: str) -> dict:
         """Where a target described in words is in the current image of a camera: pixel, and its 3-D point in `odom` from the
         registered depth."""
-        f = self.frame(camera)
+        f = self.frame(camera)     # taken with the clock running: the TF at its stamp may still have to arrive
+        with self.clock_held("detect") as rec:
+            return self._detect(camera, target, rec, f)
+
+    def _detect(self, camera: str, target: str, rec: dict, f: dict) -> dict:
         # A single VLM answer is not stable: the same frame gave the button once and a rail point below it the next time,
         # and pointing at an elongated part wanders along it by tens of pixels. Ask several times
         # concurrently and take the per-axis median of the answers that found the target.
@@ -623,7 +694,7 @@ class CapabilityServer(Node):
 
         def ask(_):  # the gateway times out now and then (ob6_s15d): an unanswered ask is not an answer
             try:
-                return self.ask_vlm(f["path"], prompt)
+                return self.ask_vlm(f["path"], prompt, rec)
             except Exception as exc:  # reason: any transport/API error of the external model service
                 errors.append(f"{type(exc).__name__}: {exc}")
                 return ""
@@ -710,7 +781,7 @@ class CapabilityServer(Node):
         configuration that does not hit the robot itself -- wherever within the docking band the rover actually
         lands. The boundary used to answer with the tool's reach at a point, collisions off: gb2 reached the point
         and stalled short of the seat, gb6 reached the seat and had no configuration for the stand-off
-, ma5 reached a button from two stands at which every configuration folded the arm into itself.
+        ma5 reached a button from two stands at which every configuration folded the arm into itself.
         The camera's look angle is not reported: the interface is fitted from whatever elevation the arm has, and a
         constraint the harness no longer had kept the model deliberating over it for 50 s.
         """
@@ -1019,7 +1090,7 @@ class CapabilityServer(Node):
         p, n = self.feature_geometry(feature)
         heights = work_heights(feature)
         near = clear_distance(p[:2], n[:2])
-        cands = reach_map.stand_candidates(heights, near)  # every distance the arm's reach map offers, roomiest first
+        cands = reach_map().stand_candidates(heights, near)  # every distance the arm's reach map offers, roomiest first
         for d, _room in cands:
             if self.reaches_work(feature, d, heights):
                 self.get_logger().info(f"stand at {feature}: {d:.3f} m from the point (hull clear from {near:.3f} m, "
@@ -1210,7 +1281,7 @@ class CapabilityServer(Node):
         along that path: the surveyed map, through the rover's localization, and what the lidar sees now within
         SCAN_CHECK_RANGE_M, in the rover's own frame -- the path relative to where the rover stands does not depend on
         where it believes it is. The second is the one that holds when the localization is wrong: in ours_l2b_habitat_r2
- AMCL was 7 m off, every drive was clear on the map, and the rover drove into the habitat
+        AMCL was 7 m off, every drive was clear on the map, and the rover drove into the habitat
         module's hull and stairs."""
         b = self.base_pose()
         (gx, gy), gyaw = params["position"], params["yaw"]
@@ -1244,7 +1315,7 @@ class CapabilityServer(Node):
         place just before it (the rover squaring up at the approach point) scrubs the wheels, the odometry is off by
         10-19 cm, and the filter was still pulling back when the dock stopped: at bess_stand every dock ended 8-13 cm
         from where the rover believed it was, and every item set down there landed that far off the surveyed point
-. Standing still, AMCL's own no-motion update
+        Standing still, AMCL's own no-motion update
         weighs the current scan again; after a few the estimate is the scan's, and a dock that it shows short is
         finished with the same servo, straight in along the goal axis.
 

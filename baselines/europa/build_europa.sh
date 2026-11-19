@@ -35,3 +35,7 @@ done
 # this baseline: the EUROPA planner the host calls, and the PLEXIL adapter that links the host to the exec
 mkdir -p $HERE/planner/build && cd $HERE/planner/build && cmake .. && make
 mkdir -p $HERE/plexil/build && cd $HERE/plexil/build && cmake .. && make
+# the re-authored L2-B task model's planner (baselines/revised/europa-l2b, BASELINE_REVISION=reauth/europa-l2b): its own
+# horizon start; the other revised EUROPA models use the planner above
+R=$HERE/../revised/europa-l2b/europa/planner
+mkdir -p $R/build && cd $R/build && cmake .. && make

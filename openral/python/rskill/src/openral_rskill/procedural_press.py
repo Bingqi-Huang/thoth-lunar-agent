@@ -35,7 +35,7 @@ from openral_rskill.procedural_pick import tool_in_view, tool_rotation
 __all__ = ["PressRskill"]
 
 
-#: How long the vision-language model may take to answer one view. On the paratera DeepSeek-V4.1-Flash gateway, six
+#: How long the vision-language model may take to answer one view. On the DeepSeek-V4.1-Flash gateway used in the experiments, six
 #: runs at once, a pick's region choice answered in 10-115 s (median 61 s, research repo F112) and 10 of 41 requests
 #: were cut by the former 120 s; the model reasons before it answers.
 VLM_TIMEOUT_S = 300.0

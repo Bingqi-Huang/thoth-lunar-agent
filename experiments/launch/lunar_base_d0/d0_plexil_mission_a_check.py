@@ -14,21 +14,26 @@ Run with D0_CAPABILITY_SERVER=1 D0_CHECK=d0_plexil_mission_a_check.py.
 import subprocess
 import threading
 
-from d0_common import *  # noqa:
+from d0_common import *  # noqa: F401,F403
 from space_harness_msgs.action import ExecuteCapability
 
 REPO = HERE / "../../.."
 PLAN_DIR = (REPO / "baselines/plexil").resolve()
+# BASELINE_REVISION=reauth/plexil-<case>: that re-authored task model (baselines/revised/plexil-<case>/plexil: its plans
+# and its interface config, which names its item table); unset: the original. The exec runs from PLAN_DIR either way
+# (its Debug.cfg). The revision reaches the adapter too, through the exec's environment.
+REVISION = os.environ.get("BASELINE_REVISION")
+MODEL_DIR = (REPO / "baselines/revised" / REVISION.removeprefix("reauth/") / "plexil").resolve() if REVISION else PLAN_DIR
 PLEXIL_HOME = Path.home() / "Programs/plexil"
 assert ActionClient(n, ExecuteCapability, "/space/capability/execute").wait_for_server(timeout_sec=120), "boundary not up"
 
 env = dict(os.environ, PLEXIL_HOME=str(PLEXIL_HOME),
            LD_LIBRARY_PATH=f"{(REPO / 'ros/install/lib').resolve()}:{PLEXIL_HOME / 'lib'}:{os.environ.get('LD_LIBRARY_PATH', '')}")
-log("PLAN", executive="PLEXIL universalExec 6.1.3", plan="MissionA_Covered.plx")
+log("PLAN", executive="PLEXIL universalExec 6.1.3", plan="MissionA_Covered.plx", **({"revision": REVISION} if REVISION else {}))
 t0, sim0 = time.time(), sim["t"]
-exec_proc = subprocess.Popen([str(PLEXIL_HOME / "bin/universalExec"), "-c", str(PLAN_DIR / "interface-config.xml"),
-                              "-L", str(PLAN_DIR / "plans/lib"),  # MissionA_Covered.plx now calls the reusable library nodes
-                              "-p", str(PLAN_DIR / "plans/MissionA_Covered.plx")],
+exec_proc = subprocess.Popen([str(PLEXIL_HOME / "bin/universalExec"), "-c", str(MODEL_DIR / "interface-config.xml"),
+                              "-L", str(MODEL_DIR / "plans/lib"),  # MissionA_Covered.plx now calls the reusable library nodes
+                              "-p", str(MODEL_DIR / "plans/MissionA_Covered.plx")],
                              cwd=PLAN_DIR, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 exec_out = []
 # read the exec's output on a thread: a blocking readline here stopped the spin, and with it the sim clock

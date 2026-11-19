@@ -1,0 +1,32 @@
+// Reusable library node: fold the arm into its travel pose (jaws must already be empty --
+// contracts.yaml `stow`) and drive back to the dock.
+//
+// Result comes back through `ok` (InOut); see lib/DriveAndDock.ple for why not node outcome.
+//
+// Failure handling: each call at most 3 identical attempts (Try; docs/baselines/authoring_spec.md tier 1).
+
+Boolean Command stow(Real);
+Boolean Command navigate_to_pose(Real, Real, Real);
+
+StowAndReturn:
+{
+  In Real dock_x;
+  In Real dock_y;
+  In Real dock_yaw;
+  InOut Boolean ok;
+
+  Stow: Try
+  {
+    PreCondition ok;
+    Stow1: { EndCondition isKnown(ok); PostCondition ok; ok = stow(0.08); }
+    Stow2: { EndCondition isKnown(ok); PostCondition ok; ok = stow(0.08); }
+    Stow3: { EndCondition isKnown(ok); PostCondition ok; ok = stow(0.08); }
+  }
+  Return: Try
+  {
+    PreCondition ok;
+    Return1: { EndCondition isKnown(ok); PostCondition ok; ok = navigate_to_pose(dock_x, dock_y, dock_yaw); }
+    Return2: { EndCondition isKnown(ok); PostCondition ok; ok = navigate_to_pose(dock_x, dock_y, dock_yaw); }
+    Return3: { EndCondition isKnown(ok); PostCondition ok; ok = navigate_to_pose(dock_x, dock_y, dock_yaw); }
+  }
+}

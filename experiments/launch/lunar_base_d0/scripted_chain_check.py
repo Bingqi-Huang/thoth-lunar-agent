@@ -9,7 +9,7 @@ import json
 
 import yaml
 
-from d0_common import *  # noqa:
+from d0_common import *  # noqa: F401,F403
 from rclpy.action import ActionClient
 from space_harness_msgs.action import ExecuteCapability
 
@@ -67,6 +67,10 @@ for name, args in chain:
             arm={k: round(float(v), 3) for k, v in arm.items()}, mission=dict(mission))
         if r["success"]:
             break
+        if name == "press" and os.environ.get("CHAIN_STOW_BEFORE_RETRY"):
+            # a failed press leaves the arm part-way out, and an identical retry from there fails at once (the shared
+            # press limitation at the BESS panel): fold first, as a method would (validation chains only)
+            log("STOW_BEFORE_RETRY", success=call("stow", {})["success"])
     else:
         log("STOPPED", at=name)
         break

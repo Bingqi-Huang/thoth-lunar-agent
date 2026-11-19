@@ -43,7 +43,7 @@ procedural:
       "target": "",
       "evidence_dir": "/tmp/openral_evidence",
       "vlm_model": "DeepSeek-V4.1-Flash",
-      "vlm_endpoint": "https://llmapi.paratera.com/v1",
+      "vlm_endpoint": "https://YOUR-OPENAI-COMPATIBLE-ENDPOINT/v1",
       "view_part_depth_m": [0.42, 0.34, 0.52],
       "standoff_m": 0.10,
       "servo_gain_per_s": 0.5,

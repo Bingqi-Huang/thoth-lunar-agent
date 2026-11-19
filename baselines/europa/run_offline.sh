@@ -8,6 +8,9 @@ set -eo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=${REPO:-$(cd $HERE/../.. && pwd)}   # the colcon install with the capability adapter and messages
 RUN=$1; shift
+# BASELINE_REVISION=reauth/europa-<case>: that re-authored task model's host and stand-in boundary
+# (baselines/revised/europa-<case>/europa, its domain and configuration beside them); unset: this baseline's own
+M=$HERE; [ -z "$BASELINE_REVISION" ] || M=$(cd $HERE/../revised/${BASELINE_REVISION#reauth/}/europa && pwd)
 mkdir -p $RUN
 export ROS_DOMAIN_ID=92 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST PLEXIL_HOME=$HOME/Programs/plexil
 export PATH=$PLEXIL_HOME/scripts:/usr/bin:/bin   # no conda: ROS Humble's python 3.10
@@ -17,9 +20,9 @@ source $REPO/ros/install/local_setup.bash
 export LD_LIBRARY_PATH=$REPO/ros/install/lib:$HERE/plexil/build:$PLEXIL_HOME/lib:$LD_LIBRARY_PATH
 (cd $HERE/plexil/plans && plexilc ActivityDispatch.ple > /dev/null)
 
-python3 $HERE/sim_boundary.py "$@" > $RUN/boundary.log 2>&1 &
+python3 $M/sim_boundary.py "$@" > $RUN/boundary.log 2>&1 &
 BOUNDARY=$!
-python3 $HERE/host.py --run-dir $RUN --goal depot_stand/slot_0@work --final dock > $RUN/host.log 2>&1 &
+python3 $M/host.py --run-dir $RUN --goal depot_stand/slot_0@work --final dock > $RUN/host.log 2>&1 &
 HOST=$!
 sleep 2
 $PLEXIL_HOME/bin/universalExec -c $HERE/plexil/interface-config.xml -p $HERE/plexil/plans/ActivityDispatch.plx \

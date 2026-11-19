@@ -8,7 +8,8 @@ in their directories; changes made for this work are described in each directory
                            Based on commit 93385213 of the DsslRobot fork.
 - space_robotics_bench/    Space Robotics Bench, Apache-2.0 OR MIT (Andrej Orsula). Upstream:
                            https://github.com/AndrejOrsula/space_robotics_bench
-                           Based on commit 94696f61 of the DsslRobot fork. Includes lunar-base scene tooling.
+                           Based on commit 94696f61 of the DsslRobot fork, with the lunar-base equipment dynamics
+                           added for this work. Includes lunar-base scene tooling.
 
 Simulation assets (not in git; see README) are built from third-party models. Each keeps its own license; the full
 list with authors and sources is space_robotics_bench/assets/lunar_base/ATTRIBUTION.md. Several are CC-BY-4.0 and one

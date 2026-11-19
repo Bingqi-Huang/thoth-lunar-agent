@@ -1,4 +1,5 @@
 import json
+import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, ClassVar, Dict, Sequence
 
@@ -27,6 +28,9 @@ LUNAR_BASE_INTERACTION = LUNAR_BASE_USD.parent.joinpath("interaction.json")
 OBJECT_PREFIX = "lb_"
 
 
+DEFAULT_USD_OVERRIDE = "bat_bess=power/bat_0101_v2,bat_spare=power/bat_0102_v2"
+
+
 @lru_cache
 def load_interaction() -> Dict:
     data = json.loads(LUNAR_BASE_INTERACTION.read_text())
@@ -34,6 +38,13 @@ def load_interaction() -> Dict:
     for obj in data["objects"].values():
         # build_scene.py records absolute build paths; re-root them on this checkout
         obj["usd"] = root.joinpath(obj["usd"][obj["usd"].index("assets/lunar_base/") :]).as_posix()
+    # SRB_LB_USD_OVERRIDE="<object>=<category>/<output>,...": a revised asset under its own path. The battery modules
+    # with readable data plates (power/bat_010x_v2, 2026-11-09) are the default from 2026-11-11; an empty value loads
+    # the originals
+    for item in filter(None, os.environ.get("SRB_LB_USD_OVERRIDE", DEFAULT_USD_OVERRIDE).split(",")):
+        name, rel = item.split("=")
+        out = rel.rstrip("/").split("/")[-1]
+        data["objects"][name]["usd"] = SRB_ASSETS_DIR.joinpath("lunar_base", "usd", rel, f"{out}.usdc").as_posix()
     return data
 
 

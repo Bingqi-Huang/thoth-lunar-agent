@@ -10,11 +10,15 @@ import subprocess
 import sys
 import threading
 
-from d0_common import *  # noqa:
+from d0_common import *  # noqa: F401,F403
 from space_harness_msgs.action import ExecuteCapability
 
 REPO = HERE / "../../.."
 EUROPA_DIR = (REPO / "baselines/europa").resolve()
+# BASELINE_REVISION=reauth/europa-<case>: that re-authored task model's host (baselines/revised/europa-<case>/europa,
+# its domain and configuration beside it); unset: the original. The exec and its dispatch plan are this baseline's.
+REVISION = os.environ.get("BASELINE_REVISION")
+MODEL_DIR = (REPO / "baselines/revised" / REVISION.removeprefix("reauth/") / "europa").resolve() if REVISION else EUROPA_DIR
 PLEXIL_HOME = Path.home() / "Programs/plexil"
 assert ActionClient(n, ExecuteCapability, "/space/capability/execute").wait_for_server(timeout_sec=120), "boundary not up"
 
@@ -22,10 +26,10 @@ env = dict(os.environ, PLEXIL_HOME=str(PLEXIL_HOME),
            LD_LIBRARY_PATH=f"{(REPO / 'ros/install/lib').resolve()}:{EUROPA_DIR / 'plexil/build'}:{PLEXIL_HOME / 'lib'}:{os.environ.get('LD_LIBRARY_PATH', '')}")
 assert (EUROPA_DIR / "plexil/plans/ActivityDispatch.plx").exists(), "compile ActivityDispatch.ple first (plexilc)"
 
-log("PLAN", host="EUROPA host.py", model="lunar-base-model.nddl", goals=["restored", "stowed", "final:dock"])
+log("PLAN", host="EUROPA host.py", model="lunar-base-model.nddl", **({"revision": REVISION} if REVISION else {}), goals=["restored", "stowed", "final:dock"])
 t0, sim0 = time.time(), sim["t"]
 D0_LOG = Path(os.environ["D0_LOG"])
-host_proc = subprocess.Popen([sys.executable, str(EUROPA_DIR / "host.py"), "--run-dir", str(D0_LOG),
+host_proc = subprocess.Popen([sys.executable, str(MODEL_DIR / "host.py"), "--run-dir", str(D0_LOG),
                               "--goal", "restored", "--goal", "stowed", "--final", "dock"],
                              cwd=EUROPA_DIR, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 host_out = []

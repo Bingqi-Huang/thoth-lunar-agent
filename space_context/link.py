@@ -13,6 +13,9 @@ if os.environ.get("SPACE_LINK_LOS_S"):
     _shift = PROFILE["los_after_start_s"] - float(os.environ["SPACE_LINK_LOS_S"])
     PROFILE["los_after_start_s"] -= _shift
     PROFILE["aos_after_start_s"] -= _shift
+    # and the mission's own start epoch moves with it (a start earlier in the pass for a later Earth set)
+    import datetime as _dt
+    PROFILE["epoch_utc"] = (_dt.datetime.fromisoformat(PROFILE["epoch_utc"]) + _dt.timedelta(seconds=_shift)).isoformat()
 
 
 def state(mission_t: float) -> dict:

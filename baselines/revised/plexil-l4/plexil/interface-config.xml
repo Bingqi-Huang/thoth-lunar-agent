@@ -1,0 +1,9 @@
+<!-- The re-authored task model reauth/plexil-l4 (BASELINE_REVISION): universalExec -c this file -p one of its plans,
+     run from baselines/plexil like the original (interface-config.xml there).
+     LibPath: the colcon install's lib directory (ros/install/lib/libCapabilityAdapter.so).
+     ItemDescriptions: this revision's item table, relative to baselines/plexil (Lookup ItemDescription). -->
+<Interfaces>
+  <Adapter AdapterType="CapabilityAdapter" LibPath="libCapabilityAdapter.so" ItemDescriptions="../revised/plexil-l4/item_descriptions.json"/>
+  <Adapter AdapterType="Time"/>
+  <Adapter AdapterType="Utility"/>
+</Interfaces>

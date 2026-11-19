@@ -77,7 +77,29 @@ def _own_records(facts: dict, events: list[dict]) -> tuple[dict, dict]:
     return verified, attempts
 
 
-def step_text(facts: dict, step: int, max_steps: int, events: list[dict], mission_t: float) -> str:
+def akr_sections(akr: dict | None, events: list[dict]) -> dict:
+    """GOAL, KNOWLEDGE STATE, INVENTORY RECORD and EXECUTOR from the executor's planner input (Definition 4): the facts
+    section of the step text is the knowledge state, each entry with what decided it last."""
+    if not akr:
+        return dict(goal="", knowledge="", record="", executor="")
+    view, ex = akr["view"], akr["executor"]
+    by = {}
+    for e in events:
+        if e["kind"] == "kappa_write":
+            by[e["prop"]] = f"{e['source']} {e['by']}" if e["source"] in ("sensing", "judgment") else e["source"]
+    val = {"T": True, "F": False}
+    return dict(
+        goal=_lines([{"prop": p, "want": v, "now": val.get(view.kappa.get(p), "undecided")} for p, v in view.goal]),
+        # true entries one per line with what decided them; the false ones (most of a 339-proposition map) on one line
+        knowledge="\n".join([*(_j({"prop": p, "value": True, "decided_by": by.get(p)}) for p, v in sorted(view.kappa.items()) if v == "T"),
+                              _j({"false": sorted(p for p, v in view.kappa.items() if v == "F")})]),
+        record=_lines([{"prop": p, "recorded": v} for p, v in view.record], "(no record entry for an undecided proposition)"),
+        executor=_lines([{"subgoal": [f"{p}={v}".lower() for p, v in view.subgoal] if view.subgoal else None,
+                          "pending_sensing": [s.name for s in ex.cover], "readings_in_flight": sorted(ex.inflight)},
+                         *view.history]))
+
+
+def step_text(facts: dict, step: int, max_steps: int, events: list[dict], mission_t: float, akr: dict | None = None) -> str:
     f = facts
     now = _now(mission_t)
     exchanges = [_exchange(e) for e in events if e["kind"] in ("operator_request_sent", "operator_answered")][-8:]
@@ -102,7 +124,7 @@ def step_text(facts: dict, step: int, max_steps: int, events: list[dict], missio
         status=_j({"unavailable_capabilities": f["unavailable"], "active_faults": {k: v for k, v in f["fdir"].items() if v["active"]}}),
         plan=_lines([{k: t[k] for k in ("task_id", "status", "text", "last_verdict")} for t in f["ledger"]["tasks"]] if f["ledger"] else [],
                     "(no plan written yet)"),
-        recent=_lines(recent))
+        recent=_lines(recent), **akr_sections(akr, events))
 
 
 # ---- ablation no_context: one accumulating conversation instead of a record rebuilt every step -----------------------
@@ -137,6 +159,7 @@ class HarnessRenderer(ContextRenderer):
         super().__init__()
         self.store, self.max_steps, self.step, self.clock = store, max_steps, 0, clock
         self.rendered = None  # no_context: how many events the conversation has seen; None = a new session
+        self.akr = None  # the AKR executor's planner input while it consults the model (space_runtime/akr/live.py)
 
     def render(self, *, world_state=None) -> str:
         if ablation.VARIANT == "no_context":
@@ -145,4 +168,4 @@ class HarnessRenderer(ContextRenderer):
                     else result_text(f, self.step, self.max_steps, events[self.rendered:], self.clock()))
             self.rendered = len(events)
             return text
-        return step_text(self.store.facts, self.step, self.max_steps, self.store.events, self.clock())
+        return step_text(self.store.facts, self.step, self.max_steps, self.store.events, self.clock(), self.akr)

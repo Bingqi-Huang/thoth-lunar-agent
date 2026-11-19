@@ -1,0 +1,90 @@
+block,mission,cls,condition,strategy,rep,serves,wall_h,tokens_M
+T1-a reference parity,restore PDU-2,reference,none,AKR,1,kept reference numbers,0.89,0.56
+T1-a reference parity,restore BESS,reference,none,AKR,1,kept reference numbers,0.89,0.56
+T1-a reference parity,restore ISRU,reference,none,AKR,1,kept reference numbers,0.89,0.56
+T1-a reference parity,locate and restore,reference,none,AKR,1,kept reference numbers,0.89,0.56
+T1-a reference parity,spare module to PDU-3,reference,none,AKR,1,kept reference numbers,0.89,0.56
+T1-a reference parity,battery module to BESS,reference,none,AKR,1,kept reference numbers,0.89,0.56
+T1-a reference parity,consumables to habitat,reference,none,AKR,1,kept reference numbers,0.89,0.56
+T1-b contingency,"PDU-1 overheating, shutter closed",contingency,none,AKR,1,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,"PDU-1 overheating, shutter closed",contingency,none,AKR,2,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,"PDU-1 overheating, shutter closed",contingency,none,AKR,3,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,"PDU-1 overheating, shutter closed",contingency,none,optimistic,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,"PDU-1 overheating, shutter closed",contingency,none,optimistic,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,"PDU-1 overheating, shutter closed",contingency,none,knowledge-only,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,"PDU-1 overheating, shutter closed",contingency,none,knowledge-only,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,"BESS overheating, shutter closed",contingency,none,AKR,1,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,"BESS overheating, shutter closed",contingency,none,AKR,2,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,"BESS overheating, shutter closed",contingency,none,AKR,3,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,"BESS overheating, shutter closed",contingency,none,optimistic,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,"BESS overheating, shutter closed",contingency,none,optimistic,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,"BESS overheating, shutter closed",contingency,none,knowledge-only,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,"BESS overheating, shutter closed",contingency,none,knowledge-only,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,BESS failed battery module,contingency,none,AKR,1,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,BESS failed battery module,contingency,none,AKR,2,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,BESS failed battery module,contingency,none,AKR,3,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,BESS failed battery module,contingency,none,optimistic,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,BESS failed battery module,contingency,none,optimistic,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,BESS failed battery module,contingency,none,knowledge-only,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,BESS failed battery module,contingency,none,knowledge-only,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,ISRU clogged filter,contingency,none,AKR,1,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,ISRU clogged filter,contingency,none,AKR,2,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,ISRU clogged filter,contingency,none,AKR,3,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,ISRU clogged filter,contingency,none,optimistic,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,ISRU clogged filter,contingency,none,optimistic,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,ISRU clogged filter,contingency,none,knowledge-only,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,ISRU clogged filter,contingency,none,knowledge-only,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,PDU-1 no serviceable spare,contingency,none,AKR,1,"Table 5, Table 6, rho/q, Table 7; Fig. 7; Earth-set 'after the bound' cell",1.8,1.31
+T1-b contingency,PDU-1 no serviceable spare,contingency,none,AKR,2,"Table 5, Table 6, rho/q, Table 7; Fig. 7; Earth-set 'after the bound' cell",1.8,1.31
+T1-b contingency,PDU-1 no serviceable spare,contingency,none,AKR,3,"Table 5, Table 6, rho/q, Table 7; Fig. 7; Earth-set 'after the bound' cell",1.8,1.31
+T1-b contingency,PDU-1 no serviceable spare,contingency,none,optimistic,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,PDU-1 no serviceable spare,contingency,none,optimistic,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,PDU-1 no serviceable spare,contingency,none,knowledge-only,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,PDU-1 no serviceable spare,contingency,none,knowledge-only,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,habitat destination occupied,contingency,none,AKR,1,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,habitat destination occupied,contingency,none,AKR,2,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,habitat destination occupied,contingency,none,AKR,3,"Table 5, Table 6, rho/q, Table 7",1.8,1.31
+T1-b contingency,habitat destination occupied,contingency,none,optimistic,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,habitat destination occupied,contingency,none,optimistic,2,"Table 5, Table 6",1.8,1.31
+T1-b contingency,habitat destination occupied,contingency,none,knowledge-only,1,"Table 5, Table 6",1.8,1.31
+T1-b contingency,habitat destination occupied,contingency,none,knowledge-only,2,"Table 5, Table 6",1.8,1.31
+T1-c wrong-record sweep,serial item mislocated,wrong_record,0 false records,AKR,1,"Fig. 8 left, Theorem 3(ii)",1.8,1.31
+T1-c wrong-record sweep,serial item mislocated,wrong_record,0 false records,AKR,2,"Fig. 8 left, Theorem 3(ii)",1.8,1.31
+T1-c wrong-record sweep,serial item mislocated,wrong_record,half false records,AKR,1,"Fig. 8 left, Theorem 3(ii)",1.8,1.31
+T1-c wrong-record sweep,serial item mislocated,wrong_record,half false records,AKR,2,"Fig. 8 left, Theorem 3(ii)",1.8,1.31
+T1-c wrong-record sweep,serial item mislocated,wrong_record,all false records,AKR,1,"Fig. 8 left, Theorem 3(ii); Table 5 wrong-record",1.8,1.31
+T1-c wrong-record sweep,serial item mislocated,wrong_record,all false records,AKR,2,"Fig. 8 left, Theorem 3(ii); Table 5 wrong-record",1.8,1.31
+T1-c wrong-record sweep,serial item mislocated,wrong_record,all false records,optimistic,1,Table 5; record-fault soundness (Fig. 5),1.8,1.31
+T1-c wrong-record sweep,serial item mislocated,wrong_record,all false records,knowledge-only,1,Table 5; record-fault soundness (Fig. 5),1.8,1.31
+T1-c wrong-record sweep,serial records exchanged,wrong_record,0 false records,AKR,1,"Fig. 8 left, Theorem 3(ii)",1.8,1.31
+T1-c wrong-record sweep,serial records exchanged,wrong_record,0 false records,AKR,2,"Fig. 8 left, Theorem 3(ii)",1.8,1.31
+T1-c wrong-record sweep,serial records exchanged,wrong_record,half false records,AKR,1,"Fig. 8 left, Theorem 3(ii)",1.8,1.31
+T1-c wrong-record sweep,serial records exchanged,wrong_record,half false records,AKR,2,"Fig. 8 left, Theorem 3(ii)",1.8,1.31
+T1-c wrong-record sweep,serial records exchanged,wrong_record,all false records,AKR,1,"Fig. 8 left, Theorem 3(ii); Table 5 wrong-record",1.8,1.31
+T1-c wrong-record sweep,serial records exchanged,wrong_record,all false records,AKR,2,"Fig. 8 left, Theorem 3(ii); Table 5 wrong-record",1.8,1.31
+T1-c wrong-record sweep,serial records exchanged,wrong_record,all false records,optimistic,1,Table 5; record-fault soundness (Fig. 5),1.8,1.31
+T1-c wrong-record sweep,serial records exchanged,wrong_record,all false records,knowledge-only,1,Table 5; record-fault soundness (Fig. 5),1.8,1.31
+T1-d sequential fault,BESS module fault then overheating,sequential,none,AKR,1,Table 5; Fig. 8 right (telemetry present),3.45,2.26
+T1-d sequential fault,BESS module fault then overheating,sequential,none,AKR,2,Table 5; Fig. 8 right (telemetry present),3.45,2.26
+T1-d sequential fault,BESS module fault then overheating,sequential,none,optimistic,1,Table 5; Fig. 8 right,3.45,2.26
+T1-d sequential fault,BESS module fault then overheating,sequential,none,knowledge-only,1,Table 5,3.45,2.26
+T1-e proposal faults,PDU-1 no serviceable spare,contingency,ungranted removal proposal inserted,AKR,1,Fig. 5; Fig. 6 points,1.8,1.31
+T1-e proposal faults,PDU-1 no serviceable spare,contingency,ungranted removal proposal inserted,AKR,2,Fig. 5; Fig. 6 points,1.8,1.31
+T1-e proposal faults,PDU-1 no serviceable spare,contingency,ungranted removal proposal inserted,AKR,3,Fig. 5; Fig. 6 points,1.8,1.31
+T1-e proposal faults,PDU-1 no serviceable spare,contingency,ungranted removal proposal inserted,optimistic,1,Fig. 5,1.8,1.31
+T1-e proposal faults,PDU-1 no serviceable spare,contingency,ungranted removal proposal inserted,optimistic,2,Fig. 5,1.8,1.31
+T1-e proposal faults,PDU-1 no serviceable spare,contingency,ungranted removal proposal inserted,optimistic,3,Fig. 5,1.8,1.31
+T1-f perception faults,"PDU-1 overheating, shutter closed",contingency,wrong shutter answer,AKR,1,Fig. 5 hatched; Table 7,1.8,1.31
+T1-f perception faults,"PDU-1 overheating, shutter closed",contingency,wrong shutter answer,AKR,2,Fig. 5 hatched; Table 7,1.8,1.31
+T1-f perception faults,PDU-1 no serviceable spare,contingency,wrong held-item answer,AKR,1,Fig. 5 hatched; Table 7,1.8,1.31
+T1-f perception faults,PDU-1 no serviceable spare,contingency,wrong held-item answer,AKR,2,Fig. 5 hatched; Table 7,1.8,1.31
+T1-g Earth-set deadline,PDU-1 no serviceable spare,contingency,Earth sets before the bound (T_vis 300 s),AKR,1,Fig. 7; certified hold of 5.2,0.74,0.52
+T1-g Earth-set deadline,PDU-1 no serviceable spare,contingency,Earth sets at the bound (T_vis 650 s),AKR,1,Fig. 7,1.8,1.31
+T1-h telemetry removal,BESS module fault then overheating,sequential,breaker telemetry removed,AKR,1,5.3 telemetry paragraph; Fig. 8 right,3.45,2.26
+T1-h telemetry removal,BESS module fault then overheating,sequential,breaker telemetry removed,AKR,2,5.3 telemetry paragraph; Fig. 8 right,3.45,2.26
+T1-h telemetry removal,BESS module fault then overheating,sequential,breaker telemetry removed,optimistic,1,5.3; Fig. 8 right,3.45,2.26
+T1-h telemetry removal,BESS module fault then overheating,sequential,breaker telemetry removed,optimistic,2,5.3; Fig. 8 right,3.45,2.26
+baselines wrong record,serial item mislocated,baseline,original task model,PLEXIL,1,Table 5 last two columns (if not already available),0.79,0.0
+baselines wrong record,serial item mislocated,baseline,original task model,EUROPA→PLEXIL,1,Table 5 last two columns (if not already available),0.79,0.0
+baselines wrong record,serial records exchanged,baseline,original task model,PLEXIL,1,Table 5 last two columns (if not already available),0.79,0.0
+baselines wrong record,serial records exchanged,baseline,original task model,EUROPA→PLEXIL,1,Table 5 last two columns (if not already available),0.79,0.0

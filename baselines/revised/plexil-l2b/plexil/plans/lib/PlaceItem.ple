@@ -1,0 +1,26 @@
+// Reusable library node: set the held item down on a surveyed support. `release_constraint`
+// and `item` are the contract's optional arguments (openral_ext/capability_server/contracts.yaml); the release
+// constraint is the item's catalogued grasp interface's (baselines/item_descriptions.json).
+//
+// Result comes back through `ok` (InOut); see lib/DriveAndDock.ple for why not node outcome.
+//
+// Failure handling: at most 3 identical attempts (Try; docs/baselines/authoring_spec.md tier 1); no branch on
+// place's stage.
+
+Boolean Command place(String, String, String);
+
+PlaceItem:
+{
+  In String support;
+  In String release_constraint;
+  In String item;
+  InOut Boolean ok;
+
+  Place: Try
+  {
+    PreCondition ok;
+    Place1: { EndCondition isKnown(ok); PostCondition ok; ok = place(support, release_constraint, item); }
+    Place2: { EndCondition isKnown(ok); PostCondition ok; ok = place(support, release_constraint, item); }
+    Place3: { EndCondition isKnown(ok); PostCondition ok; ok = place(support, release_constraint, item); }
+  }
+}

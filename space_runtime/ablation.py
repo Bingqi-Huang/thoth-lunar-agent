@@ -25,6 +25,9 @@ PROMPTS = Path(__file__).resolve().parents[1] / "prompts"
 
 
 def prompt(name: str) -> Path:
-    """The variant's own copy of a prompt file when it has one, else the full method's."""
+    """The variant's own copy of a prompt file when it has one, else the full method's. Under the AKR executor
+    (AKR_STRATEGY set: akr, ffreplan or kreplanner, one text for all three) the copy under prompts/akr/."""
     own = PROMPTS / "ours_ablation" / str(VARIANT) / name
+    if os.environ.get("AKR_STRATEGY") and (PROMPTS / "akr" / name).exists():
+        return PROMPTS / "akr" / name
     return own if VARIANT and own.exists() else PROMPTS / "ours" / name

@@ -8,6 +8,8 @@ import yaml
 HERE = Path(__file__).resolve().parent
 CONTRACTS = yaml.safe_load((HERE / "contracts.yaml").read_text())
 IX = json.loads((HERE / "../../space_robotics_bench/assets/lunar_base/usd/scene/lunar_base/interaction.json").resolve().read_text())
+# how each push button looks (site survey): what the press skill looks for when a caller names only the feature
+APPEARANCE = yaml.safe_load((HERE / "../../configs/button_appearance.yaml").resolve().read_text())
 
 
 def item_catalogue(record: dict) -> dict:

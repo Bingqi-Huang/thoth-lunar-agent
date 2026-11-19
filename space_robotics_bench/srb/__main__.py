@@ -940,6 +940,9 @@ def ros_agent(
     ## Run the environment with ROS interface
     with torch.inference_mode():
         while sim_app.is_running():
+            # a client of `envs/pause` (the mission agent, while it waits for its model) stops the simulator's clock
+            if ros_interface.hold_if_paused():
+                continue
             _t0 = time.perf_counter()
             action = ros_interface.action
             observation, reward, terminated, truncated, info = env.step(action)  # type: ignore

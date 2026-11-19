@@ -1,0 +1,61 @@
+# Supplementary experiment (2026-10-29): the masked compound fault at the BESS. `heldout_compound_fault`,
+# `faulted_unit=bess` (SRB exp/compound-fault, lunar_base_mission_a/task.py): initial_trips() sets bess's trip cause
+# to BATTERY_MODULE_FAULT, unserviceable_modules() = {bat_bess} (bat_spare stays serviceable), and
+# initial_closed_covers() = {bess} (HVAC condenser shutter drawn). Site physics unchanged (site.py): after a reset the
+# self-test trips in SELFTEST_S = 3 s, which cancels the 30 s OVERTEMP timer, so the module's cause masks the shutter
+# until a serviceable module is installed; the reset after that closes and trips OVERTEMP after retrip_delay_s = 30 s
+# unless the shutter is opened (its push button). The brief is Mission A's, word for word.
+manifest_version: 1
+scenario_id: mission_a/supplementary/a_compound_fault_bess
+mission_family: mission_a
+coverage: held_out
+level: compound  # L3 and L2-A at once on one unit (stage-4 design, compositional_generalization_feasibility.md §2)
+
+mission_brief: >
+  BESS reported a fault. Inspect the base's serviced units, identify the failed unit, restore it if within
+  your authority, verify the result, and return the rover to the dock with the arm stowed.
+
+simulator:
+  scene_config: openral/scenes/deploy/srb_lunar_base_mission_a.yaml
+  task_variant: lunar_base_mission_a_visual
+  env_overrides: {env.scenario: heldout_compound_fault, env.faulted_unit: bess}
+  scenery_override: null
+  seed: 0
+  faulted_unit: bess
+  reported_unit: bess
+
+required_capabilities:   # the union of L2-A BESS and L3 BESS; no new capability
+  - navigate_to_feature
+  - dock_at_feature
+  - arm_ready
+  - pick
+  - place
+  - press
+  - stow
+  - observe
+  - locate_in_view
+
+mission_deadline_s: null
+space_context_profile: null
+perturbations_semantic_conditions:
+  - "BESS starts tripped on its power-on self-test (BATTERY_MODULE_FAULT): its installed battery module (bat_bess) is unserviceable; a reset alone does not hold"
+  - "the depot spares stand carries a serviceable spare battery module (bat_spare, recorded serviceable in the manifest)"
+  - "the BESS HVAC condenser shutter is drawn: once a serviceable module is installed, a reset closes and trips OVERTEMP about 30 s later unless the shutter is opened at its push button"
+
+evidence_verifier_mapping:
+  source_topic: /srb/env0/mission_state
+  produced_by: srb.tasks.mobile_manipulation.lunar_base_mission_a.task.Task.mission_state
+  logged_as: 'MISSION {...} line in check.log'
+  evaluator_only: true
+  success_condition: "mission.success == true"
+  success_definition: "unit_healthy(bess) and parked_and_stowed() -- task.py mission_success(), unchanged: unit_healthy requires a serviceable module installed (no self-test timer) and the shutter open (no OVERTEMP timer) with the breaker closed"
+  fields_used: [scenario, faulted_unit, reported_unit, units, objects, parked_and_stowed, success]
+
+held_out_basis: >
+  Composition of two Experiment I relations (BATTERY_MODULE_FAULT -> replace the module; OVERTEMP -> open the
+  shutter), no new causal knowledge or capability. One fault masking another until the first is cleared is general
+  fault-diagnosis knowledge; the brief does not mention it.
+
+notes: >
+  Not part of Experiment I's 13 instances. Methods: Thoth frozen as in Experiment I (3 runs); PLEXIL and EUROPA with
+  their L2-A and L3 re-authorings merged (1 run each). Never shown to a method.

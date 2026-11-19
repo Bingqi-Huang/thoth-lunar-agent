@@ -249,6 +249,20 @@ if "serial_label_png" in job:
                     cands.append((round(s[0] / 0.002), abs(cf), ca, sgn * ca, cf, s[0], s[1]))
         if cands:
             seats[sgn] = min(cands)
+    if job.get("serial_label_seat") == "front":
+        # A lid domed across the jaws (the battery module) is flat only at its far ends: the plates there sat low on
+        # the sides, at the edge of the scan view and edge-on to it, and never decoded (tier-1 runs, 2026-11-09). One
+        # plate instead on the crown in front of the column (the rover's side), where the lid runs flat along the
+        # approach and faces the scan camera; the column's footprint (`handle_pedestal`) is 1.4 neck widths deep.
+        col_half = job["top_handle"].get("neck_width_m", 0.030) * 1.4 / 2
+        cf0 = -(col_half + LABEL_GAP + LABEL_H / 2)
+        cands = []
+        for ca in np.arange(-0.010, 0.010 + 1e-6, 0.005):
+            for cf in np.arange(cf0 - 0.020, cf0 + 1e-6, 0.005):
+                s = _seat(ca, cf)
+                if s:
+                    cands.append((round(s[0] / 0.002), abs(cf - cf0) + abs(ca), abs(ca), ca, cf, s[0], s[1]))
+        seats = {1: min(cands)} if cands else seats
     flat = {sgn: s for sgn, s in seats.items() if s[5] <= LABEL_FLAT}
     use, conform = (flat, False) if flat else (seats, True)
     for sgn, (_, _, _, ca, cf, spread, top) in sorted(use.items()):
