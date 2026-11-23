@@ -1,0 +1,285 @@
+"""Deploy-sim camera-slot realignment in rskill_runner_node.
+
+Deploy-sim keys ``WorldState.image_frames`` by the manifest SENSOR NAME (the
+``/openral/cameras/<name>/image`` topic basename), but VLA adapters resolve
+``obs["images"]`` by VLA slot (``camera1``/``camera2``/... — the LIBERO
+convention ``openral sim run`` and the rldx adapter use). Without realignment
+a descriptively-named manifest (franka: ``top``/``wrist``) hands the pi0.5
+adapter ``obs["images"]["top"]`` while it looks up ``camera1``, so the policy
+sees no frames.
+
+Pins the two realignment helpers plus the ``_build_runtime_skill_from_manifest``
+scene-camera override, using real ``robots/franka_panda/robot.yaml`` + real
+``SensorFrame`` objects (no mocks, CLAUDE.md §1.11).
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+from types import ModuleType
+
+import numpy as np
+import pytest
+from openral_core import RobotDescription, RSkillManifest
+from openral_core.exceptions import ROSRuntimeError
+from openral_core.schemas import FrameEncoding, SensorFrame
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_skill_runner_module() -> ModuleType:
+    """Load the runner helpers without requiring a sourced ROS 2 workspace."""
+    source = (
+        _REPO_ROOT
+        / "packages"
+        / "openral_rskill_ros"
+        / "openral_rskill_ros"
+        / "rskill_runner_node.py"
+    )
+    spec = importlib.util.spec_from_file_location("_test_camera_skill_runner_node", source)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_RUNNER = _load_skill_runner_module()
+_build_runtime_skill_from_manifest = _RUNNER._build_runtime_skill_from_manifest
+_decode_image_frames = _RUNNER._decode_image_frames
+_sensor_name_to_vla_slot = _RUNNER._sensor_name_to_vla_slot
+_vla_camera_slots = _RUNNER._vla_camera_slots
+
+
+def _franka() -> RobotDescription:
+    return RobotDescription.from_yaml(str(_REPO_ROOT / "robots" / "franka_panda" / "robot.yaml"))
+
+
+def _rgb_frame(name: str, *, fill: int, h: int = 2, w: int = 2) -> SensorFrame:
+    data = np.full((h, w, 3), fill, dtype=np.uint8).tobytes()
+    return SensorFrame(
+        sensor_id=name,
+        stamp_monotonic_ns=1,
+        stamp_wall_ns=2,
+        encoding=FrameEncoding.RGB8,
+        width=w,
+        height=h,
+        channels=3,
+        data=data,
+    )
+
+
+class TestVlaCameraSlots:
+    def test_franka_slots_in_manifest_order(self) -> None:
+        assert _vla_camera_slots(_franka()) == ("camera1", "camera2", "camera3")
+
+    def test_franka_name_to_slot_map(self) -> None:
+        assert _sensor_name_to_vla_slot(_franka()) == {
+            "top": "camera1",
+            "wrist": "camera2",
+            "front": "camera3",
+        }
+
+    def test_none_description_is_empty(self) -> None:
+        assert _vla_camera_slots(None) == ()
+        assert _sensor_name_to_vla_slot(None) == {}
+
+
+class TestDecodeImageFrames:
+    def test_remaps_sensor_names_to_vla_slots(self) -> None:
+        slot_map = {"front": "camera1", "wrist": "camera2"}
+        frames = {
+            "front": _rgb_frame("front", fill=10),
+            "wrist": _rgb_frame("wrist", fill=20),
+        }
+        images = _decode_image_frames(frames, slot_map)
+        assert set(images) == {"camera1", "camera2"}
+        assert int(images["camera1"][0, 0, 0]) == 10
+        assert int(images["camera2"][0, 0, 0]) == 20
+        assert images["camera1"].shape == (2, 2, 3)
+
+    def test_unmapped_sensor_passes_through_under_its_name(self) -> None:
+        images = _decode_image_frames({"extra_cam": _rgb_frame("extra_cam", fill=7)}, {})
+        assert set(images) == {"extra_cam"}
+        assert int(images["extra_cam"][0, 0, 0]) == 7
+
+    def test_frames_without_data_are_skipped(self) -> None:
+        frame = SensorFrame(
+            sensor_id="front",
+            stamp_monotonic_ns=1,
+            stamp_wall_ns=2,
+            encoding=FrameEncoding.RGB8,
+            width=2,
+            height=2,
+            topic="/openral/cameras/front/image",  # data=None
+        )
+        images = _decode_image_frames({"front": frame}, {"front": "camera1"})
+        assert images == {}
+
+
+class TestBuildRuntimeSkillSceneCameras:
+    def test_threads_manifest_policy_extras_into_runtime_vla(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deploy runner preserves adapter-owned rSkill configuration."""
+        import openral_sim.factory as _sim_factory
+
+        yaml_path = _REPO_ROOT / "rskills" / "lingbot-va-galaxea-a1-fruit-placement" / "rskill.yaml"
+        description = RobotDescription.from_yaml(
+            str(_REPO_ROOT / "robots" / "galaxea_a1" / "robot.yaml")
+        )
+        captured: dict[str, object] = {}
+
+        def _capture(env_cfg: object) -> object:
+            captured["extra"] = dict(env_cfg.vla.extra)  # type: ignore[attr-defined]
+            raise ImportError("stop before A1 Runtime import")
+
+        monkeypatch.setattr(_sim_factory, "make_policy", _capture)
+
+        with pytest.raises(ROSRuntimeError):
+            _build_runtime_skill_from_manifest(
+                yaml_path=yaml_path,
+                prompt="put the mango into the blue bowl",
+                scene_cameras=("front", "wrist"),
+                description=description,
+            )
+
+        manifest = RSkillManifest.from_yaml(str(yaml_path))
+        assert captured["extra"] == {
+            **manifest.policy_extras,
+            "latency_budget_ms": manifest.latency_budget.per_chunk_ms,
+            # Deploy-runtime default (setdefault — a manifest's
+            # ``policy_extras.chunk_prefetch: false`` wins over it).
+            "chunk_prefetch": True,
+        }
+
+    def test_smolvla_deploy_enables_realtime_chunk_prefetch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Deploy opts SmolVLA into overlap; benchmark construction remains synchronous."""
+        import openral_sim.factory as _sim_factory
+
+        yaml_path = (
+            _REPO_ROOT / "rskills" / "rskill-smolvla-so101-eraser_place-bf16" / "rskill.yaml"
+        )
+        description = RobotDescription.from_yaml(
+            str(_REPO_ROOT / "robots" / "so101_follower" / "robot.yaml")
+        )
+        captured: dict[str, object] = {}
+
+        def _capture(env_cfg: object) -> object:
+            captured["extra"] = dict(env_cfg.vla.extra)  # type: ignore[attr-defined]
+            raise ImportError("stop before policy import")
+
+        monkeypatch.setattr(_sim_factory, "make_policy", _capture)
+
+        with pytest.raises(ROSRuntimeError):
+            _build_runtime_skill_from_manifest(
+                yaml_path=yaml_path,
+                prompt="place the erase on the blue square",
+                scene_cameras=("top", "wrist"),
+                description=description,
+            )
+
+        extra = captured["extra"]
+        assert isinstance(extra, dict)
+        # Deploy opts EVERY chunked family into overlap via the shared
+        # `build_chunk_executor` contract; the lead itself defaults to 20
+        # actions inside that factory (`chunk_prefetch_at`).
+        assert extra["chunk_prefetch"] is True
+
+    def test_overrides_sensor_name_scene_cameras_with_vla_slots(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sensor-name ``scene_cameras`` (what runtime_node passes) → VLA slots.
+
+        ``runtime_node`` forwards manifest sensor names (e.g. ``top``/``wrist``)
+        as ``scene_cameras``; the adapter needs VLA slots (``camera1``/``camera2``)
+        for its checkpoint's ``cam_alias``. Captures ``env_cfg.scene.cameras`` by
+        monkey-patching ``make_policy`` at the lerobot/torch process boundary
+        (CLAUDE.md §1.11) to raise before the heavy import.
+        """
+        import openral_sim.factory as _sim_factory
+
+        yaml_path = _REPO_ROOT / "rskills" / "pi05-libero-int8" / "rskill.yaml"
+        if not yaml_path.is_file():
+            pytest.skip(f"missing in-tree fixture: {yaml_path}")
+
+        captured: dict[str, object] = {}
+
+        def _capture(env_cfg: object) -> object:
+            captured["cameras"] = tuple(env_cfg.scene.cameras)  # type: ignore[attr-defined]
+            raise ImportError("stop before torch import")
+
+        monkeypatch.setattr(_sim_factory, "make_policy", _capture)
+
+        with pytest.raises(ROSRuntimeError):  # factory translates the ImportError
+            _build_runtime_skill_from_manifest(
+                yaml_path=yaml_path,
+                prompt="pick up the milk",
+                scene_cameras=("top", "wrist"),  # sensor names, as runtime_node passes
+                description=_franka(),
+            )
+
+        assert captured["cameras"] == ("camera1", "camera2")
+
+    def test_vla_slots_supersede_caller_supplied_slots(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A description with RGB sensors always wins, even if the caller passed slots.
+
+        Intentional supersede in ``_build_runtime_skill_from_manifest``: manifest
+        VLA slots replace any caller-supplied ``scene_cameras`` once the description
+        declares RGB sensors — the manifest, not the caller, is the source of truth.
+        """
+        import openral_sim.factory as _sim_factory
+
+        yaml_path = _REPO_ROOT / "rskills" / "pi05-libero-int8" / "rskill.yaml"
+        if not yaml_path.is_file():
+            pytest.skip(f"missing in-tree fixture: {yaml_path}")
+
+        captured: dict[str, object] = {}
+
+        def _capture(env_cfg: object) -> object:
+            captured["cameras"] = tuple(env_cfg.scene.cameras)  # type: ignore[attr-defined]
+            raise ImportError("stop before torch import")
+
+        monkeypatch.setattr(_sim_factory, "make_policy", _capture)
+
+        with pytest.raises(ROSRuntimeError):  # factory translates the ImportError
+            _build_runtime_skill_from_manifest(
+                yaml_path=yaml_path,
+                prompt="pick up the milk",
+                scene_cameras=("stale", "values"),  # caller's value is discarded
+                description=_franka(),
+            )
+
+        assert captured["cameras"] == ("camera1", "camera2")
+
+    def test_falls_back_to_passed_scene_cameras_without_description(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No description → keep the caller's ``scene_cameras`` untouched."""
+        import openral_sim.factory as _sim_factory
+
+        yaml_path = _REPO_ROOT / "rskills" / "pi05-libero-int8" / "rskill.yaml"
+        if not yaml_path.is_file():
+            pytest.skip(f"missing in-tree fixture: {yaml_path}")
+
+        captured: dict[str, object] = {}
+
+        def _capture(env_cfg: object) -> object:
+            captured["cameras"] = tuple(env_cfg.scene.cameras)  # type: ignore[attr-defined]
+            raise ImportError("stop before torch import")
+
+        monkeypatch.setattr(_sim_factory, "make_policy", _capture)
+
+        with pytest.raises(ROSRuntimeError):  # factory translates the ImportError
+            _build_runtime_skill_from_manifest(
+                yaml_path=yaml_path,
+                prompt="pick up the milk",
+                scene_cameras=("camera1", "camera2"),
+                description=None,
+            )
+
+        assert captured["cameras"] == ("camera1", "camera2")

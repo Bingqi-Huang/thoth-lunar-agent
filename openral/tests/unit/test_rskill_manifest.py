@@ -1,0 +1,1259 @@
+"""Unit tests for the RSkillManifest schema (V1) and ``rskill.yaml`` loader.
+
+Covers the rSkill *package* contract (CLAUDE.md §6.4 / RFC §1.4, §8.7) —
+distinct from the in-process ``Skill`` ABC (tested in ``test_skill.py``).
+
+``schema_version`` stays "0.1" (unpublished, so extended in place rather than
+bumped). V1 additions: ``actuators_required`` mirrors ``sensors_required``
+(required, ``min_length=1``); ``"custom"`` embodiment tag requires
+``embodiment_extra`` plus explicit ``n_dof``/``vla_action_key`` on every
+actuator. Also tightened: HF Hub regex on name/fallback_skill_id, SemVer on
+version, ``hf://``/``local://`` discriminator on weights_uri, closed Literal
+sets for embodiment_tags/model_family/benchmarks keys, required chunk_size,
+derived ``is_commercial_use_allowed`` (replaces removed free-field
+``commercial_use_allowed``).
+"""
+
+from __future__ import annotations
+
+import pathlib
+
+import pytest
+import yaml
+from openral_core import (
+    ActionRepresentation,
+    ActuatorRequirement,
+    ControlMode,
+    ControlModeSemantics,
+    EmbodimentExtra,
+    JointUnits,
+    QuantizationBackend,
+    QuantizationConfig,
+    QuantizationDtype,
+    RSkillLatencyBudget,
+    RSkillLicensePosture,
+    RSkillManifest,
+    RSkillRuntime,
+)
+from pydantic import ValidationError
+
+
+def _minimal_manifest_dict() -> dict[str, object]:
+    """Return a minimal valid manifest dict for tests.
+
+    The schema surface was extended with actuators_required +
+    embodiment_extra; the rSkill self-containment audit added
+    ``control_mode_semantics`` (required per actuator, Gap 2) and a
+    ``processors`` block (required for modern lerobot families, Gap 1+3).
+    The version string stays at "0.1" because the schema has not been
+    published yet.
+    """
+    return {
+        "schema_version": "0.1",
+        "name": "openral/rskill-pick-cube-so100",
+        "version": "0.1.0",
+        "license": "apache-2.0",
+        "role": "s1",
+        "kind": "vla",
+        "model_family": "smolvla",
+        "embodiment_tags": ["so100_follower"],
+        "runtime": "pytorch",
+        "weights_uri": "hf://lerobot/smolvla_base@main",
+        "chunk_size": 16,
+        "latency_budget": {"per_chunk_ms": 100.0},
+        "actuators_required": [
+            {
+                "kind": "joint_position",
+                "control_mode_semantics": {"mode": "absolute"},
+            }
+        ],
+        "processors": {
+            "preprocessor_uri": "hf://lerobot/smolvla_base/policy_preprocessor.json",
+            "postprocessor_uri": "hf://lerobot/smolvla_base/policy_postprocessor.json",
+        },
+        "description": "Minimal V1 manifest fixture for the rSkill schema test suite.",
+        "actions": ["generalist"],
+    }
+
+
+def _custom_embodiment_extra_dict() -> dict[str, object]:
+    """Return a valid embodiment_extra block for the ``"custom"`` hatch."""
+    return {
+        "sensors": [
+            {
+                "modality": "rgb",
+                "vla_feature_key": "observation.images.wrist",
+                "min_width": 224,
+                "min_height": 224,
+            }
+        ],
+        "actuators": [
+            {
+                "kind": "joint_position",
+                "n_dof": 6,
+                "vla_action_key": "action.joints.arm",
+                "control_mode_semantics": {"mode": "absolute"},
+            }
+        ],
+    }
+
+
+def _default_semantics() -> dict[str, str]:
+    """Default control_mode_semantics for joint_position kind in tests."""
+    return {"mode": "absolute"}
+
+
+# ── Construction ─────────────────────────────────────────────────────────────
+
+
+class TestRSkillManifestConstruction:
+    def test_minimal_valid(self) -> None:
+        m = RSkillManifest.model_validate(_minimal_manifest_dict())
+        assert m.schema_version == "0.1"
+        assert m.name == "openral/rskill-pick-cube-so100"
+        assert m.role == "s1"
+        assert m.license is RSkillLicensePosture.APACHE_2_0
+        assert m.runtime is RSkillRuntime.PYTORCH
+        assert m.model_family == "smolvla"
+        assert m.embodiment_tags == ["so100_follower"]
+        assert m.embodiment_extra is None
+        assert m.chunk_size == 16
+        assert m.benchmarks == {}
+        assert m.is_commercial_use_allowed is True
+        assert len(m.actuators_required) == 1
+        assert m.actuators_required[0].kind is ControlMode.JOINT_POSITION
+        # auto-fill is loader-side; on the schema they default to None.
+        assert m.actuators_required[0].n_dof is None
+        assert m.actuators_required[0].vla_action_key is None
+
+    def test_missing_required_weights_uri_raises(self) -> None:
+        d = _minimal_manifest_dict()
+        del d["weights_uri"]
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_missing_required_latency_budget_raises(self) -> None:
+        d = _minimal_manifest_dict()
+        del d["latency_budget"]
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_missing_required_chunk_size_raises(self) -> None:
+        d = _minimal_manifest_dict()
+        del d["chunk_size"]
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_missing_required_model_family_raises(self) -> None:
+        d = _minimal_manifest_dict()
+        del d["model_family"]
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_missing_required_version_raises(self) -> None:
+        d = _minimal_manifest_dict()
+        del d["version"]
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_extra_fields_rejected(self) -> None:
+        """extra='forbid' guards against silent typos in rskill.yaml."""
+        d = _minimal_manifest_dict()
+        d["unknwon_field"] = "oops"
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_removed_v0_fields_rejected(self) -> None:
+        """V0 fields must not parse under V1 — surfaces stale manifests loudly."""
+        for stale_field, value in [
+            ("commercial_use_allowed", False),
+            ("dispatch_target", "edge"),
+            ("engine_uri", "hf://x/y/engine.plan"),
+            ("signature", "STUBSIG=="),
+            ("metadata", {"paper": "x"}),
+        ]:
+            d = _minimal_manifest_dict()
+            d[stale_field] = value
+            with pytest.raises(ValidationError):
+                RSkillManifest.model_validate(d)
+
+    def test_invalid_role_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["role"] = "s9"
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_invalid_schema_version_rejected(self) -> None:
+        """Only ``"0.1"`` is accepted today; a future shape bumps post-1.0."""
+        d = _minimal_manifest_dict()
+        d["schema_version"] = "1"
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+        d["schema_version"] = "0"
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_quantization_default(self) -> None:
+        m = RSkillManifest.model_validate(_minimal_manifest_dict())
+        assert isinstance(m.quantization, QuantizationConfig)
+        assert m.quantization.dtype is QuantizationDtype.FP32
+
+    def test_custom_quantization(self) -> None:
+        d = _minimal_manifest_dict()
+        d["quantization"] = {"dtype": "int8", "backend": "tensorrt", "per_channel": True}
+        m = RSkillManifest.model_validate(d)
+        assert m.quantization.dtype is QuantizationDtype.INT8
+        assert m.quantization.backend is QuantizationBackend.TENSORRT
+        assert m.quantization.per_channel is True
+
+
+# ── V1 validators ────────────────────────────────────────────────────────────
+
+
+class TestSchemaVersion:
+    def test_default_is_v0_1(self) -> None:
+        d = _minimal_manifest_dict()
+        del d["schema_version"]
+        m = RSkillManifest.model_validate(d)
+        assert m.schema_version == "0.1"
+
+
+class TestNameRegex:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "owner/repo",
+            "OpenRAL/rskill-pick-cube-so100",
+            "user_42/skill.v2",
+            "A-B/x.y_z-1",
+        ],
+    )
+    def test_valid_names_accepted(self, name: str) -> None:
+        d = _minimal_manifest_dict()
+        d["name"] = name
+        RSkillManifest.model_validate(d)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "no-slash",
+            "/leading",
+            "trailing/",
+            "two/slashes/here",
+            "owner/repo with space",
+            "_leading_underscore/repo",
+            "",
+        ],
+    )
+    def test_invalid_names_rejected(self, name: str) -> None:
+        d = _minimal_manifest_dict()
+        d["name"] = name
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+
+class TestSemVerVersion:
+    @pytest.mark.parametrize(
+        "version",
+        ["0.1.0", "1.2.3", "10.20.30", "1.0.0-alpha", "1.0.0-rc.1", "1.0.0+build.7"],
+    )
+    def test_valid_semver_accepted(self, version: str) -> None:
+        d = _minimal_manifest_dict()
+        d["version"] = version
+        RSkillManifest.model_validate(d)
+
+    @pytest.mark.parametrize(
+        "version",
+        ["v1.0.0", "1.0", "1", "1.0.0.0", "1.0.0-", "abc", ""],
+    )
+    def test_invalid_versions_rejected(self, version: str) -> None:
+        d = _minimal_manifest_dict()
+        d["version"] = version
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+
+class TestWeightsUri:
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "hf://owner/repo",
+            "hf://owner/repo@main",
+            "hf://owner/repo@abc1234",
+            "local://rskills/diffusion-pusht",
+            "local://./local/skill",
+        ],
+    )
+    def test_valid_weights_uri_accepted(self, uri: str) -> None:
+        d = _minimal_manifest_dict()
+        d["weights_uri"] = uri
+        RSkillManifest.model_validate(d)
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "http://example.com/weights",
+            "https://example.com/weights",
+            "s3://bucket/key",
+            "owner/repo",  # missing scheme
+            "hf://no-slash",
+            "rskill://rskills/diffusion-pusht",  # rskill:// scheme removed
+            "rskill://",  # empty path + removed scheme
+            "file:///tmp/x",
+        ],
+    )
+    def test_invalid_weights_uri_rejected(self, uri: str) -> None:
+        d = _minimal_manifest_dict()
+        d["weights_uri"] = uri
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+
+class TestEmbodimentTags:
+    def test_empty_list_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["embodiment_tags"] = []
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_off_list_tag_rejected(self) -> None:
+        """Tags outside the canonical robots/ set must be rejected."""
+        d = _minimal_manifest_dict()
+        d["embodiment_tags"] = ["lerobot"]
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_multiple_canonical_tags_accepted(self) -> None:
+        d = _minimal_manifest_dict()
+        d["embodiment_tags"] = ["franka_panda", "sawyer"]
+        m = RSkillManifest.model_validate(d)
+        assert m.embodiment_tags == ["franka_panda", "sawyer"]
+
+
+class TestModelFamily:
+    @pytest.mark.parametrize(
+        "fam",
+        ["smolvla", "pi05", "xvla", "act", "diffusion", "rldx", "molmoact2", "gr00t", "openvla"],
+    )
+    def test_supported_families_accepted(self, fam: str) -> None:
+        d = _minimal_manifest_dict()
+        d["model_family"] = fam
+        RSkillManifest.model_validate(d)
+
+    # "groot" (single-zero typo) stays rejected — the canonical spelling is "gr00t".
+    @pytest.mark.parametrize("fam", ["groot", "custom", "smolvla2", ""])
+    def test_unsupported_family_rejected(self, fam: str) -> None:
+        d = _minimal_manifest_dict()
+        d["model_family"] = fam
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+
+class TestChunkSize:
+    def test_positive_chunk_size(self) -> None:
+        d = _minimal_manifest_dict()
+        d["chunk_size"] = 50
+        m = RSkillManifest.model_validate(d)
+        assert m.chunk_size == 50
+
+    @pytest.mark.parametrize("size", [0, -1, -100])
+    def test_non_positive_chunk_size_rejected(self, size: int) -> None:
+        d = _minimal_manifest_dict()
+        d["chunk_size"] = size
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+
+class TestBenchmarks:
+    def test_valid_keys_and_scores(self) -> None:
+        d = _minimal_manifest_dict()
+        d["benchmarks"] = {"libero_spatial": 0.8, "libero_10": 0.59}
+        m = RSkillManifest.model_validate(d)
+        assert m.benchmarks == {"libero_spatial": 0.8, "libero_10": 0.59}
+
+    def test_unknown_benchmark_key_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["benchmarks"] = {"my_custom_suite": 0.5}
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    @pytest.mark.parametrize("score", [-0.01, 1.01, 2.0, -1.0])
+    def test_score_out_of_range_rejected(self, score: float) -> None:
+        d = _minimal_manifest_dict()
+        d["benchmarks"] = {"pusht": score}
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_default_empty_dict(self) -> None:
+        m = RSkillManifest.model_validate(_minimal_manifest_dict())
+        assert m.benchmarks == {}
+
+
+class TestMinVramGb:
+    def test_keyed_by_quantization_dtype(self) -> None:
+        d = _minimal_manifest_dict()
+        d["min_vram_gb"] = {"fp32": 14.0, "bf16": 7.0}
+        m = RSkillManifest.model_validate(d)
+        assert m.min_vram_gb == {QuantizationDtype.FP32: 14.0, QuantizationDtype.BF16: 7.0}
+
+    def test_unknown_dtype_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["min_vram_gb"] = {"sextupling": 99.0}
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_non_positive_vram_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["min_vram_gb"] = {"fp32": 0.0}
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_default_is_none(self) -> None:
+        m = RSkillManifest.model_validate(_minimal_manifest_dict())
+        assert m.min_vram_gb is None
+
+
+class TestPaperAndSourceUrls:
+    def test_paper_url_accepts_http_and_https(self) -> None:
+        for u in ["http://arxiv.org/abs/2410.24164", "https://arxiv.org/abs/2410.24164"]:
+            d = _minimal_manifest_dict()
+            d["paper_url"] = u
+            RSkillManifest.model_validate(d)
+
+    def test_paper_url_rejects_non_http(self) -> None:
+        d = _minimal_manifest_dict()
+        d["paper_url"] = "ftp://example.com/x"
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_dataset_uri_requires_hf_scheme(self) -> None:
+        d = _minimal_manifest_dict()
+        d["dataset_uri"] = "https://huggingface.co/datasets/lerobot/libero"
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_dataset_uri_accepts_hf_uri(self) -> None:
+        d = _minimal_manifest_dict()
+        d["dataset_uri"] = "hf://lerobot/libero@v1"
+        RSkillManifest.model_validate(d)
+
+    def test_source_repo_same_regex_as_dataset(self) -> None:
+        d = _minimal_manifest_dict()
+        d["source_repo"] = "hf://lerobot/smolvla_base"
+        RSkillManifest.model_validate(d)
+
+
+class TestDescription:
+    def test_short_description_accepted(self) -> None:
+        d = _minimal_manifest_dict()
+        d["description"] = "A small skill."
+        RSkillManifest.model_validate(d)
+
+    def test_500_char_description_accepted(self) -> None:
+        d = _minimal_manifest_dict()
+        d["description"] = "x" * 500
+        RSkillManifest.model_validate(d)
+
+    def test_over_500_char_description_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["description"] = "x" * 501
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+
+class TestFallbackSkillId:
+    def test_valid_hf_id_accepted(self) -> None:
+        d = _minimal_manifest_dict()
+        d["fallback_skill_id"] = "openral/rskill-smaller"
+        RSkillManifest.model_validate(d)
+
+    def test_malformed_fallback_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["fallback_skill_id"] = "no-slash"
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_self_reference_rejected(self) -> None:
+        """A skill cannot list itself as its own fallback."""
+        d = _minimal_manifest_dict()
+        d["fallback_skill_id"] = d["name"]
+        with pytest.raises(ValidationError, match="fallback_skill_id"):
+            RSkillManifest.model_validate(d)
+
+
+# ── Derived commercial-use posture ───────────────────────────────────────────
+
+
+class TestIsCommercialUseAllowed:
+    @pytest.mark.parametrize(
+        "lic, expected",
+        [
+            (RSkillLicensePosture.APACHE_2_0, True),
+            (RSkillLicensePosture.MIT, True),
+            (RSkillLicensePosture.BSD, True),
+            (RSkillLicensePosture.PERMISSIVE_RESEARCH, False),
+            (RSkillLicensePosture.NVIDIA_NON_COMMERCIAL, False),
+            # GR00T N1.7+ Open Model License permits commercial use.
+            (RSkillLicensePosture.NVIDIA_OPEN_MODEL, True),
+            (RSkillLicensePosture.PROPRIETARY, False),
+            (RSkillLicensePosture.UNKNOWN, False),
+        ],
+    )
+    def test_derivation(self, lic: RSkillLicensePosture, expected: bool) -> None:
+        d = _minimal_manifest_dict()
+        d["license"] = lic.value
+        m = RSkillManifest.model_validate(d)
+        assert m.is_commercial_use_allowed is expected
+
+
+# ── Latency budget ───────────────────────────────────────────────────────────
+
+
+class TestRSkillLatencyBudget:
+    def test_per_chunk_ms_must_be_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            RSkillLatencyBudget(per_chunk_ms=0.0)
+        with pytest.raises(ValidationError):
+            RSkillLatencyBudget(per_chunk_ms=-1.0)
+
+    def test_warmup_load_optional(self) -> None:
+        b = RSkillLatencyBudget(per_chunk_ms=50.0)
+        assert b.warmup_ms is None
+        assert b.load_ms is None
+
+    def test_warmup_must_be_positive_when_set(self) -> None:
+        with pytest.raises(ValidationError):
+            RSkillLatencyBudget(per_chunk_ms=50.0, warmup_ms=0.0)
+
+
+# ── YAML round-trip ──────────────────────────────────────────────────────────
+
+
+class TestRSkillManifestYAML:
+    def test_from_yaml_loads_minimal(self, tmp_path: pathlib.Path) -> None:
+        path = tmp_path / "rskill.yaml"
+        path.write_text(yaml.safe_dump(_minimal_manifest_dict()))
+        m = RSkillManifest.from_yaml(str(path))
+        assert m.name == "openral/rskill-pick-cube-so100"
+
+    def test_from_yaml_missing_file_raises(self, tmp_path: pathlib.Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            RSkillManifest.from_yaml(str(tmp_path / "nope.yaml"))
+
+    def test_from_yaml_invalid_content_raises(self, tmp_path: pathlib.Path) -> None:
+        path = tmp_path / "bad.yaml"
+        path.write_text("name: only-name\n")
+        with pytest.raises(ValidationError):
+            RSkillManifest.from_yaml(str(path))
+
+    def test_json_roundtrip(self) -> None:
+        m1 = RSkillManifest.model_validate(_minimal_manifest_dict())
+        m2 = RSkillManifest.model_validate_json(m1.model_dump_json())
+        assert m1 == m2
+
+
+# ── actuators_required ────────────────────────────────────────────────────────────────
+
+
+class TestActuatorsRequired:
+    def test_missing_actuators_required_rejected(self) -> None:
+        """actuators_required is mandatory (min_length=1)."""
+        d = _minimal_manifest_dict()
+        del d["actuators_required"]
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_empty_actuators_required_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["actuators_required"] = []
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_multiple_actuators_accepted(self) -> None:
+        d = _minimal_manifest_dict()
+        d["actuators_required"] = [
+            {
+                "kind": "joint_position",
+                "control_mode_semantics": {"mode": "absolute"},
+            },
+            {
+                "kind": "gripper_binary",
+                "control_mode_semantics": {
+                    "mode": "absolute",
+                    "gripper_convention": "binary_close_one",
+                },
+            },
+        ]
+        m = RSkillManifest.model_validate(d)
+        assert [a.kind.value for a in m.actuators_required] == [
+            "joint_position",
+            "gripper_binary",
+        ]
+
+    def test_unknown_kind_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["actuators_required"] = [
+            {"kind": "telekinesis", "control_mode_semantics": {"mode": "absolute"}}
+        ]
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_explicit_n_dof_and_vla_action_key_accepted(self) -> None:
+        """Manifest author may override the loader's auto-fill explicitly."""
+        d = _minimal_manifest_dict()
+        d["actuators_required"] = [
+            {
+                "kind": "joint_position",
+                "n_dof": 6,
+                "vla_action_key": "action.joints.arm",
+                "control_mode_semantics": {"mode": "absolute"},
+            }
+        ]
+        m = RSkillManifest.model_validate(d)
+        assert m.actuators_required[0].n_dof == 6
+        assert m.actuators_required[0].vla_action_key == "action.joints.arm"
+
+    def test_actuator_requirement_extra_fields_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["actuators_required"] = [
+            {
+                "kind": "joint_position",
+                "control_mode_semantics": {"mode": "absolute"},
+                "foo": "bar",
+            }
+        ]
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+
+# ── "custom" embodiment escape hatch ──────────────────────────────────────
+
+
+class TestCustomEmbodimentHatch:
+    def test_custom_requires_embodiment_extra(self) -> None:
+        d = _minimal_manifest_dict()
+        d["embodiment_tags"] = ["custom"]
+        # actuators_required must also carry n_dof + vla_action_key for "custom"
+        d["actuators_required"] = [
+            {
+                "kind": "joint_position",
+                "n_dof": 6,
+                "vla_action_key": "action.joints.arm",
+                "control_mode_semantics": {"mode": "absolute"},
+            }
+        ]
+        with pytest.raises(ValidationError, match="embodiment_extra"):
+            RSkillManifest.model_validate(d)
+
+    def test_custom_with_embodiment_extra_accepted(self) -> None:
+        d = _minimal_manifest_dict()
+        d["embodiment_tags"] = ["custom"]
+        d["actuators_required"] = [
+            {
+                "kind": "joint_position",
+                "n_dof": 6,
+                "vla_action_key": "action.joints.arm",
+                "control_mode_semantics": {"mode": "absolute"},
+            }
+        ]
+        d["embodiment_extra"] = _custom_embodiment_extra_dict()
+        m = RSkillManifest.model_validate(d)
+        assert m.embodiment_extra is not None
+        assert len(m.embodiment_extra.sensors) == 1
+        assert len(m.embodiment_extra.actuators) == 1
+
+    def test_non_custom_with_embodiment_extra_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["embodiment_extra"] = _custom_embodiment_extra_dict()
+        with pytest.raises(ValidationError, match="custom"):
+            RSkillManifest.model_validate(d)
+
+    def test_custom_with_missing_actuator_n_dof_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["embodiment_tags"] = ["custom"]
+        d["embodiment_extra"] = _custom_embodiment_extra_dict()
+        d["actuators_required"] = [
+            {"kind": "joint_position", "control_mode_semantics": {"mode": "absolute"}}
+        ]
+        with pytest.raises(ValidationError, match="n_dof"):
+            RSkillManifest.model_validate(d)
+
+    def test_custom_with_missing_actuator_vla_action_key_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["embodiment_tags"] = ["custom"]
+        d["embodiment_extra"] = _custom_embodiment_extra_dict()
+        d["actuators_required"] = [
+            {
+                "kind": "joint_position",
+                "n_dof": 6,
+                "control_mode_semantics": {"mode": "absolute"},
+            }
+        ]
+        with pytest.raises(ValidationError, match="vla_action_key"):
+            RSkillManifest.model_validate(d)
+
+    def test_embodiment_extra_requires_non_empty_sensors(self) -> None:
+        extra = _custom_embodiment_extra_dict()
+        extra["sensors"] = []
+        with pytest.raises(ValidationError):
+            EmbodimentExtra.model_validate(extra)
+
+    def test_embodiment_extra_requires_non_empty_actuators(self) -> None:
+        extra = _custom_embodiment_extra_dict()
+        extra["actuators"] = []
+        with pytest.raises(ValidationError):
+            EmbodimentExtra.model_validate(extra)
+
+    def test_embodiment_extra_extra_fields_rejected(self) -> None:
+        extra = _custom_embodiment_extra_dict()
+        extra["foo"] = "bar"
+        with pytest.raises(ValidationError):
+            EmbodimentExtra.model_validate(extra)
+
+
+# ── ActuatorRequirement (standalone) ────────────────────────────────────────
+
+
+class TestActuatorRequirement:
+    @staticmethod
+    def _abs_sem() -> ControlModeSemantics:
+        return ControlModeSemantics(mode="absolute")
+
+    def test_kind_only_is_valid(self) -> None:
+        a = ActuatorRequirement(
+            kind=ControlMode.JOINT_POSITION,
+            control_mode_semantics=self._abs_sem(),
+        )
+        assert a.kind is ControlMode.JOINT_POSITION
+        assert a.n_dof is None
+        assert a.vla_action_key is None
+
+    def test_non_positive_n_dof_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ActuatorRequirement(
+                kind=ControlMode.JOINT_POSITION,
+                n_dof=0,
+                control_mode_semantics=self._abs_sem(),
+            )
+        with pytest.raises(ValidationError):
+            ActuatorRequirement(
+                kind=ControlMode.JOINT_POSITION,
+                n_dof=-1,
+                control_mode_semantics=self._abs_sem(),
+            )
+
+    def test_unknown_kind_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ActuatorRequirement(
+                kind="warp_drive",  # type: ignore[arg-type]
+                control_mode_semantics=self._abs_sem(),
+            )
+
+
+# ── Real in-tree manifests parse against V1 ──────────────────────────────────
+
+
+class TestInTreeManifests:
+    """The 9 ``rskills/*/rskill.yaml`` files must all validate against V1.
+
+    This is the migration safety net: if any manifest is missed during a
+    schema bump, this test fails before CI.
+    """
+
+    def test_all_in_tree_manifests_parse(self) -> None:
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
+        manifest_paths = sorted(repo_root.glob("rskills/*/rskill.yaml"))
+        assert manifest_paths, (
+            f"No skills/*/rskill.yaml manifests found under {repo_root}; "
+            "the test is in the wrong place or the tree is missing skills."
+        )
+        for p in manifest_paths:
+            RSkillManifest.from_yaml(str(p))
+
+
+# ── joint_units declaration on joint-position rSkills (issue #135) ────────────
+
+
+class TestJointUnitsDeclared:
+    """Every joint-position rSkill must declare ``action_contract.joint_units``.
+
+    skill_runner converts deg↔rad at the policy boundary; an undeclared
+    checkpoint falls back to a stats heuristic that mis-detected a
+    degrees-trained SmolVLA SO-101 checkpoint as radians and drove a real arm
+    into its joint limits (issue #135).
+    ``RSkillManifest._check_joint_units_declared`` makes this a hard,
+    fail-loud requirement.
+    """
+
+    def test_every_intree_joint_position_manifest_declares_units(self) -> None:
+        """No ``rskills/*/rskill.yaml`` joint-position manifest may omit units."""
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
+        manifest_paths = sorted(repo_root.glob("rskills/*/rskill.yaml"))
+        assert manifest_paths, f"No rskills/*/rskill.yaml manifests under {repo_root}."
+        offenders: list[str] = []
+        for p in manifest_paths:
+            m = RSkillManifest.from_yaml(str(p))
+            ac = m.action_contract
+            if (
+                ac is not None
+                and ac.representation is ActionRepresentation.JOINT_POSITIONS
+                and ac.joint_units is None
+            ):
+                offenders.append(p.parent.name)
+        assert not offenders, (
+            "joint-position rSkills missing action_contract.joint_units "
+            f"(verify against the checkpoint's normalizer stats): {offenders}"
+        )
+
+    def test_validator_rejects_joint_positions_without_units(self) -> None:
+        """A joint-position action_contract with no joint_units fails to load."""
+        d = _minimal_manifest_dict()
+        d["action_contract"] = {"dim": 6, "representation": "joint_positions"}
+        with pytest.raises(ValidationError, match="joint_units"):
+            RSkillManifest.model_validate(d)
+
+    def test_validator_accepts_joint_positions_with_units(self) -> None:
+        """Declaring joint_units lets a joint-position manifest load."""
+        d = _minimal_manifest_dict()
+        d["action_contract"] = {
+            "dim": 6,
+            "representation": "joint_positions",
+            "joint_units": "degrees",
+        }
+        m = RSkillManifest.model_validate(d)
+        assert m.action_contract is not None
+        assert m.action_contract.joint_units is JointUnits.DEGREES
+
+
+# ── Optional rSkill envelope ──────────────────────────────────────────────────
+
+
+class TestRSkillEnvelope:
+    """Optional ``envelope: SafetyEnvelope`` field carried by the manifest.
+
+    Pre-existing manifests without ``envelope`` continue to parse — the field
+    is optional and defaults to ``None``. When set, the C++ safety kernel
+    (cpp/openral_safety_kernel/) enforces the intersection of the
+    skill envelope and the robot ceiling; the intersection algebra and the
+    loosening-rejection live in ``openral_safety.envelope_loader``, not
+    here on the schema.
+    """
+
+    def test_envelope_defaults_to_none(self) -> None:
+        m = RSkillManifest.model_validate(_minimal_manifest_dict())
+        assert m.envelope is None
+
+    def test_envelope_accepts_full_safety_envelope_dict(self) -> None:
+        d = _minimal_manifest_dict()
+        d["envelope"] = {
+            "workspace_box_min_xyz": [-0.3, -0.3, 0.0],
+            "workspace_box_max_xyz": [0.3, 0.3, 0.5],
+            "max_ee_speed_m_s": 0.3,
+            "max_ee_accel_m_s2": 1.0,
+            "max_joint_speed_factor": 0.5,
+            "max_force_n": 20.0,
+            "max_torque_nm": 5.0,
+            "deadman_required": True,
+            "contact_force_threshold_n": 10.0,
+        }
+        m = RSkillManifest.model_validate(d)
+        assert m.envelope is not None
+        assert m.envelope.max_ee_speed_m_s == 0.3
+        assert m.envelope.workspace_box_min_xyz == (-0.3, -0.3, 0.0)
+        assert m.envelope.max_force_n == 20.0
+
+    def test_envelope_partial_dict_uses_safety_envelope_defaults(self) -> None:
+        d = _minimal_manifest_dict()
+        d["envelope"] = {"max_force_n": 5.0}
+        m = RSkillManifest.model_validate(d)
+        assert m.envelope is not None
+        assert m.envelope.max_force_n == 5.0
+        # SafetyEnvelope defaults still apply for the unspecified fields.
+        assert m.envelope.max_ee_speed_m_s == 0.5
+
+    def test_envelope_round_trips_through_yaml(self) -> None:
+        d = _minimal_manifest_dict()
+        d["envelope"] = {"max_force_n": 7.5, "max_ee_speed_m_s": 0.2}
+        m = RSkillManifest.model_validate(d)
+        # Dump back to a dict, re-parse, and check the envelope survives.
+        dumped = m.model_dump(mode="python", exclude_none=True)
+        m2 = RSkillManifest.model_validate(dumped)
+        assert m2.envelope is not None
+        assert m2.envelope.max_force_n == 7.5
+        assert m2.envelope.max_ee_speed_m_s == 0.2
+
+    def test_extra_field_inside_envelope_rejected(self) -> None:
+        d = _minimal_manifest_dict()
+        d["envelope"] = {"max_force_n": 5.0, "garbage_field": 999.0}
+        # SafetyEnvelope doesn't declare extra="forbid" — extra fields are silently
+        # ignored, matching every other in-tree RobotDescription.safety block. Pins
+        # current behavior so a future tightening is a deliberate decision.
+        m = RSkillManifest.model_validate(d)
+        assert m.envelope is not None
+        assert m.envelope.max_force_n == 5.0
+
+
+# ── vlm kind ──────────────────────────────────────────────────────────────────
+
+
+def _vlm_manifest_dict() -> dict[str, object]:
+    """Minimal valid manifest dict for kind='vlm'."""
+    return {
+        "schema_version": "0.1",
+        "name": "OpenRAL/rskill-qwen35_4b-any-general-nf4",
+        "version": "0.1.0",
+        "license": "apache-2.0",
+        "role": "s2",
+        "kind": "vlm",
+        "embodiment_tags": ["franka_panda"],
+        "sensors_required": [{"modality": "rgb", "min_width": 336, "min_height": 336}],
+        "actuators_required": [],
+        "runtime": "pytorch",
+        "weights_uri": "hf://Qwen/Qwen3.5-4B",
+        "chunk_size": 1,
+        "latency_budget": {"per_chunk_ms": 3000.0},
+        "description": "Qwen3.5-4B NF4 scene VLM rSkill for robot scene understanding.",
+        "actions": ["query"],
+    }
+
+
+class TestVlmKind:
+    def test_minimal_vlm_valid(self) -> None:
+        m = RSkillManifest.model_validate(_vlm_manifest_dict())
+        assert m.kind == "vlm"
+        assert m.role == "s2"
+        assert m.actuators_required == []
+        assert m.detector is None
+        assert m.action_contract is None
+        assert m.state_contract is None
+        assert m.is_commercial_use_allowed is True
+
+    def test_from_yaml_qwen35_rskill(self) -> None:
+        import pathlib
+
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
+        p = repo_root / "rskills" / "qwen35-4b-nf4" / "rskill.yaml"
+        m = RSkillManifest.from_yaml(str(p))
+        assert m.kind == "vlm"
+        assert m.role == "s2"
+        # weights_uri is the deployable pre-quantized NF4 checkpoint; source_repo
+        # is the SHA-pinned upstream it was quantized from (provenance).
+        assert m.weights_uri == "hf://OpenRAL/rskill-qwen35_4b-any-general-nf4"
+        assert m.source_repo is not None and m.source_repo.startswith("hf://Qwen/Qwen3.5-4B@")
+
+    def test_vlm_missing_weights_uri_raises(self) -> None:
+        d = _vlm_manifest_dict()
+        del d["weights_uri"]
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_vlm_with_actuators_raises(self) -> None:
+        d = _vlm_manifest_dict()
+        d["actuators_required"] = [
+            {"kind": "joint_position", "control_mode_semantics": {"mode": "absolute"}}
+        ]
+        with pytest.raises(ValidationError, match="actuates nothing"):
+            RSkillManifest.model_validate(d)
+
+    def test_vlm_with_detector_block_raises(self) -> None:
+        d = _vlm_manifest_dict()
+        d["detector"] = {"labels": ["cup"], "input_size": [640, 640], "score_threshold": 0.5}
+        with pytest.raises(ValidationError, match="detector"):
+            RSkillManifest.model_validate(d)
+
+    def test_vlm_with_action_contract_raises(self) -> None:
+        d = _vlm_manifest_dict()
+        d["action_contract"] = {"dim": 7}
+        with pytest.raises(ValidationError, match="action_contract"):
+            RSkillManifest.model_validate(d)
+
+    def test_vlm_with_ros_integration_raises(self) -> None:
+        d = _vlm_manifest_dict()
+        d["ros_integration"] = {
+            "action_type": "control_msgs/FollowJointTrajectory",
+            "action_name": "/arm/follow_joint_trajectory",
+        }
+        with pytest.raises(ValidationError, match="ros_integration"):
+            RSkillManifest.model_validate(d)
+
+    def test_vlm_model_family_rejected(self) -> None:
+        d = _vlm_manifest_dict()
+        d["model_family"] = "qwen35"
+        with pytest.raises(ValidationError):
+            RSkillManifest.model_validate(d)
+
+    def test_vlm_query_action_accepted(self) -> None:
+        from openral_core import RSkillAction
+
+        m = RSkillManifest.model_validate(_vlm_manifest_dict())
+        assert RSkillAction.QUERY in m.actions
+
+
+# ── HF-repo naming convention ────────────────────────────────────────────────
+
+
+def _naming_fixture(name: str) -> RSkillManifest:
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    return RSkillManifest.from_yaml(str(repo_root / "rskills" / name / "rskill.yaml"))
+
+
+class TestRepoNameIsCanonical:
+    """``repo_name_is_canonical`` — grammar + vocab parse (kind-aware).
+
+    Hyphens are only the segment separators; tokens use underscores. A
+    non-playbook name must split into exactly 5 parts with canonical
+    model/robot/quant tokens and a shape-valid task; a playbook must be
+    ``rskill-playbook-<name>``.
+    """
+
+    def test_valid_five_segment_name(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        assert repo_name_is_canonical(
+            "OpenRAL/rskill-smolvla-franka_panda-libero_spatial-bf16", kind="vla"
+        )
+
+    def test_valid_playbook_name(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        assert repo_name_is_canonical("OpenRAL/rskill-playbook-find_object", kind="playbook")
+
+    def test_ros_action_is_four_part_no_quant(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        # ROS wrappers carry no weights → no <quant> segment (4 parts).
+        assert repo_name_is_canonical("OpenRAL/rskill-moveit-multi-eef_pose", kind="ros_action")
+
+    def test_ros_action_rejects_a_quant_segment(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        # A weightless wrapper may not carry any 5th (quant) segment.
+        assert not repo_name_is_canonical(
+            "OpenRAL/rskill-moveit-multi-eef_pose-fp32", kind="ros_action"
+        )
+        assert repo_name_is_canonical("OpenRAL/rskill-moveit-multi-eef_pose", kind="ros_action")
+
+    def test_weight_bearing_kind_requires_a_quant_segment(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        # A VLA needs the 5th (quant) segment; the 4-part ROS shape is rejected.
+        assert not repo_name_is_canonical("OpenRAL/rskill-smolvla-franka_panda-libero", kind="vla")
+        # ...and `none` is not a valid quant token for a weight-bearing kind.
+        assert not repo_name_is_canonical(
+            "OpenRAL/rskill-smolvla-franka_panda-libero-none", kind="vla"
+        )
+
+    def test_model_family_consistency_enforced(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        # A valid token for the WRONG family is rejected when model_family is given.
+        assert not repo_name_is_canonical(
+            "OpenRAL/rskill-pi05-franka_panda-libero-bf16", kind="vla", model_family="smolvla"
+        )
+        # openvla family allows both the base and the OFT checkpoint token.
+        assert repo_name_is_canonical(
+            "OpenRAL/rskill-openvla_oft-widowx-simpler-nf4", kind="vla", model_family="openvla"
+        )
+
+    def test_hyphen_inside_token_is_rejected(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        # A hyphenated robot/model token over-splits (6 parts) → not canonical.
+        assert not repo_name_is_canonical(
+            "OpenRAL/rskill-smolvla-franka-panda-libero_spatial-bf16", kind="vla"
+        )
+
+    def test_unknown_model_token_rejected(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        assert not repo_name_is_canonical(
+            "OpenRAL/rskill-notamodel-franka_panda-libero-bf16", kind="vla"
+        )
+
+    def test_noncanonical_quant_rejected(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        # int4 is the schema dtype, not the name token (nf4).
+        assert not repo_name_is_canonical(
+            "OpenRAL/rskill-smolvla-franka_panda-libero-int4", kind="vla"
+        )
+
+    def test_playbook_grammar_not_accepted_for_vla(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        assert not repo_name_is_canonical("OpenRAL/rskill-playbook-find_object", kind="vla")
+
+    def test_owner_prefix_optional(self) -> None:
+        from openral_core import repo_name_is_canonical
+
+        assert repo_name_is_canonical("rskill-smolvla-franka_panda-libero_spatial-bf16", kind="vla")
+
+
+class TestCanonicalTokenSets:
+    def test_model_tokens_use_underscores_not_hyphens(self) -> None:
+        from openral_core import CANONICAL_MODEL_TOKENS
+
+        assert "lingbot_vla" in CANONICAL_MODEL_TOKENS
+        assert "lingbot_vla2" in CANONICAL_MODEL_TOKENS
+        assert "gr00t_n17" in CANONICAL_MODEL_TOKENS
+        assert "3d_diffuser_actor" in CANONICAL_MODEL_TOKENS
+        assert "omdet_turbo" in CANONICAL_MODEL_TOKENS
+        # No hyphenated variant leaks in.
+        assert "lingbot-vla" not in CANONICAL_MODEL_TOKENS
+
+    def test_robot_tokens_include_embodiment_plus_multi(self) -> None:
+        from openral_core import CANONICAL_ROBOT_NAME_TOKENS
+
+        assert "franka_panda" in CANONICAL_ROBOT_NAME_TOKENS
+        assert "any" in CANONICAL_ROBOT_NAME_TOKENS
+        assert "multi" in CANONICAL_ROBOT_NAME_TOKENS
+
+    def test_quant_tokens_exact_set(self) -> None:
+        from openral_core import CANONICAL_QUANT_TOKENS
+
+        # Weight-bearing dtype tokens only; ROS wrappers omit the quant segment.
+        assert set(CANONICAL_QUANT_TOKENS) == {"fp32", "fp16", "bf16", "int8", "nf4"}
+
+
+class TestExpectedRepoName:
+    """``expected_repo_name`` — the canonical SUGGESTION (always valid).
+
+    Exact-value cases use SYNTHETIC manifests (``model_validate`` with a
+    controlled ``name`` + ``evaluated_tasks``) so they don't depend on the
+    in-tree fixture names, which the migration agent rewrites concurrently. Real
+    fixtures are only swept for canonicality of the suggestion.
+    """
+
+    @staticmethod
+    def _vla(name: str, **over: object) -> RSkillManifest:
+        d = _minimal_manifest_dict()
+        d["name"] = name
+        d.update(over)
+        return RSkillManifest.model_validate(d)
+
+    def test_task_from_evaluated_tasks_is_name_independent(self) -> None:
+        from openral_core import expected_repo_name
+
+        # evaluated_tasks drives <task>, so the suggestion is stable regardless
+        # of the current (arbitrary) name.
+        m = self._vla(
+            "openral/rskill-anything",
+            embodiment_tags=["franka_panda"],
+            evaluated_tasks=["libero_spatial/3"],
+        )
+        assert expected_repo_name(m) == "openral/rskill-smolvla-franka_panda-libero_spatial-fp32"
+
+    def test_preserves_owner_prefix(self) -> None:
+        from openral_core import expected_repo_name
+
+        m = self._vla("weird_owner/rskill-x", evaluated_tasks=["libero_object"])
+        assert expected_repo_name(m).startswith("weird_owner/rskill-")
+
+    def test_versioned_model_token_from_family(self) -> None:
+        from openral_core import expected_repo_name
+
+        m = self._vla(
+            "openral/rskill-x",
+            model_family="lingbot_vla2",
+            embodiment_tags=["franka_panda"],
+            evaluated_tasks=["robotwin"],
+        )
+        assert expected_repo_name(m) == "openral/rskill-lingbot_vla2-franka_panda-robotwin-fp32"
+
+    def test_int4_maps_to_nf4_token(self) -> None:
+        from openral_core import expected_repo_name
+
+        m = self._vla(
+            "openral/rskill-x",
+            embodiment_tags=["so100_follower"],
+            evaluated_tasks=["libero_object"],
+            quantization={"dtype": "int4", "backend": "pytorch"},
+        )
+        assert expected_repo_name(m) == "openral/rskill-smolvla-so100-libero_object-nf4"
+
+    def test_multi_robot_token(self) -> None:
+        from openral_core import expected_repo_name
+
+        m = self._vla(
+            "openral/rskill-x",
+            embodiment_tags=["so100_follower", "so101_follower"],
+            evaluated_tasks=["libero_object"],
+        )
+        assert "-multi-" in expected_repo_name(m)
+
+    def test_name_tail_author_slug_distinguishes_pen_skills(self) -> None:
+        from openral_core import expected_repo_name
+
+        # No evaluated_tasks/benchmarks → the name-tail author slug is recovered,
+        # keeping two otherwise-identical skills distinct.
+        pen = self._vla(
+            "openral/rskill-smolvla-so101-pen-bf16",
+            embodiment_tags=["so101_follower"],
+            quantization={"dtype": "bf16", "backend": "pytorch"},
+        )
+        pick = self._vla(
+            "openral/rskill-smolvla-so101-pick_place_pen-bf16",
+            embodiment_tags=["so101_follower"],
+            quantization={"dtype": "bf16", "backend": "pytorch"},
+        )
+        assert expected_repo_name(pen).endswith("-pen-bf16")
+        assert expected_repo_name(pick).endswith("-pick_place_pen-bf16")
+
+    def test_ros_action_suggestion_has_no_quant_segment(self) -> None:
+        from openral_core import expected_repo_name, repo_name_is_canonical
+
+        m = _naming_fixture("rskill-moveit-eef-pose")
+        got = expected_repo_name(m)
+        # 4 hyphen-parts: rskill-<model>-<robot>-<task> (no quant).
+        assert got.split("/", 1)[1].count("-") == 3, got
+        assert got.endswith("-moveit-multi-eef_pose"), got
+        assert repo_name_is_canonical(got, kind=m.kind)
+
+    def test_all_in_tree_suggestions_are_canonical(self) -> None:
+        """For every shipped rskill.yaml, the suggestion validates for its kind.
+
+        Real-fixture sweep (CLAUDE.md §1.11) that does NOT assert exact names —
+        it only requires ``expected_repo_name`` to produce a name
+        ``repo_name_is_canonical`` accepts (model-family-consistent when set).
+        """
+        from openral_core import expected_repo_name, repo_name_is_canonical
+
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
+        for p in sorted(repo_root.glob("rskills/*/rskill.yaml")):
+            if p.parent.name == "template":
+                continue
+            m = RSkillManifest.from_yaml(str(p))
+            got = expected_repo_name(m)
+            assert repo_name_is_canonical(got, kind=m.kind, model_family=m.model_family), (
+                f"{p.parent.name}: {got}"
+            )
+
+
+# ── default_prompt ────────────────────────────────────────────────────────────
+
+
+class TestDefaultPrompt:
+    """The checkpoint's own training string, used when a goal omits `prompt`."""
+
+    def test_absent_by_default(self) -> None:
+        """Generalist checkpoints take arbitrary instructions — no default."""
+        assert RSkillManifest(**_minimal_manifest_dict()).default_prompt is None
+
+    def test_round_trips_verbatim(self) -> None:
+        """Single-task finetunes are conditioned on one exact phrase.
+
+        The training string is preserved byte-for-byte, upstream typos and all
+        (this checkpoint really was trained on "the erase", not "the eraser") —
+        a paraphrase measurably degrades the policy.
+        """
+        d = _minimal_manifest_dict()
+        d["default_prompt"] = "place the erase on the blue square"
+        assert RSkillManifest(**d).default_prompt == "place the erase on the blue square"
+
+    def test_empty_string_rejected(self) -> None:
+        """An empty default is meaningless — omit the field instead."""
+        d = _minimal_manifest_dict()
+        d["default_prompt"] = ""
+        with pytest.raises(ValidationError):
+            RSkillManifest(**d)

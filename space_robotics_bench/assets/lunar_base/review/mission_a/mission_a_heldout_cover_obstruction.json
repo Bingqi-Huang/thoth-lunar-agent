@@ -1,0 +1,447 @@
+{
+ "scenario": "heldout_cover_obstruction",
+ "faulted": "pdu_2",
+ "reported": "pdu_2",
+ "sim_time_s": 337.5,
+ "wall_time_s": 748.4,
+ "final": {
+  "scenario": "heldout_cover_obstruction",
+  "faulted_pdu": "pdu_2",
+  "reported_pdu": "pdu_2",
+  "faults": {
+   "pdu_1": false,
+   "pdu_2": false,
+   "pdu_3": false
+  },
+  "presses": {
+   "pdu_1": 0,
+   "pdu_2": 1,
+   "pdu_3": 0
+  },
+  "blocked_presses": 0,
+  "success": true,
+  "covered": {
+   "pdu_1": false,
+   "pdu_2": false,
+   "pdu_3": false
+  }
+ },
+ "phases": [
+  {
+   "t": 1.5,
+   "phase": "undock",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 1.5,
+   "phase": "drive to pdu_2 inspection pose",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 53.6,
+   "phase": "inspect pdu_2 status lamp",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 77.0,
+   "phase": "reset button blocked by the service cover",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 77.0,
+   "phase": "grasp service cover",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 109.1,
+   "phase": "lift cover off the button",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 131.6,
+   "phase": "carry cover to the spares shelf",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 168.5,
+   "phase": "place cover on the shelf",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 214.8,
+   "phase": "arm to pdu_2 reset button",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 229.5,
+   "phase": "press pdu_2 reset",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": true,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 0,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 238.9,
+   "phase": "stow arm",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 246.6,
+   "phase": "drive to pdu_2 inspection pose",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 281.2,
+   "phase": "inspect pdu_2 status lamp",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 283.2,
+   "phase": "verified pdu_2 lamp green",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 283.2,
+   "phase": "return to dock",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": false,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    }
+   }
+  },
+  {
+   "t": 335.5,
+   "phase": "mission complete",
+   "mission": {
+    "scenario": "heldout_cover_obstruction",
+    "faulted_pdu": "pdu_2",
+    "reported_pdu": "pdu_2",
+    "faults": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    },
+    "presses": {
+     "pdu_1": 0,
+     "pdu_2": 1,
+     "pdu_3": 0
+    },
+    "blocked_presses": 0,
+    "success": true,
+    "covered": {
+     "pdu_1": false,
+     "pdu_2": false,
+     "pdu_3": false
+    }
+   }
+  }
+ ]
+}

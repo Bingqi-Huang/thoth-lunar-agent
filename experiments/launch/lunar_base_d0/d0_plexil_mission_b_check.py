@@ -1,0 +1,58 @@
+"""The PLEXIL baseline runs Mission B `covered` on the live graph.
+
+Mirrors d0_plexil_mission_a_check.py exactly, pointed at baselines/plexil/plans/MissionB_Covered.plx: deliver the
+brief's item from its source to its destination (MISSION_GOAL, `mission_b_goal()` from D0_ENV's env.cargo /
+env.destination), then stow and return to the dock, through the reusable
+library (DriveAndDock/PickItem/PlaceItem/StowAndReturn). Every Command reaches the robot
+only through ros/plexil_capability_adapter -> the common capability boundary -> ExecuteRskill (runner, kernel, HAL,
+SRB), the same path the agent's check uses and the same evaluator (`mission` dict, `d0_common.py`).
+Run with D0_CAPABILITY_SERVER=1 D0_CHECK=d0_plexil_mission_b_check.py.
+"""
+import subprocess
+import threading
+
+from d0_common import *  # noqa: F401,F403
+from space_harness_msgs.action import ExecuteCapability
+
+REPO = HERE / "../../.."
+PLAN_DIR = (REPO / "baselines/plexil").resolve()
+# BASELINE_REVISION=reauth/plexil-<case>: that re-authored task model (baselines/revised/plexil-<case>/plexil: its plans
+# and its interface config, which names its item table); unset: the original. The exec runs from PLAN_DIR either way
+# (its Debug.cfg). The revision reaches the adapter too, through the exec's environment.
+REVISION = os.environ.get("BASELINE_REVISION")
+MODEL_DIR = (REPO / "baselines/revised" / REVISION.removeprefix("reauth/") / "plexil").resolve() if REVISION else PLAN_DIR
+PLEXIL_HOME = Path(os.environ.get("PLEXIL_HOME") or Path.home() / "Programs/plexil")
+assert ActionClient(n, ExecuteCapability, "/space/capability/execute").wait_for_server(timeout_sec=120), "boundary not up"
+
+env = dict(os.environ, PLEXIL_HOME=str(PLEXIL_HOME),
+           LD_LIBRARY_PATH=f"{(REPO / 'ros/install/lib').resolve()}:{PLEXIL_HOME / 'lib'}:{os.environ.get('LD_LIBRARY_PATH', '')}",
+           MISSION_GOAL=mission_b_goal())
+log("PLAN", executive="PLEXIL universalExec 6.1.3", plan="MissionB_Covered.plx", **({"revision": REVISION} if REVISION else {}), goal=json.loads(env["MISSION_GOAL"]))
+t0, sim0 = time.time(), sim["t"]
+exec_proc = subprocess.Popen([str(PLEXIL_HOME / "bin/universalExec"), "-c", str(MODEL_DIR / "interface-config.xml"),
+                              "-L", str(MODEL_DIR / "plans/lib"),  # MissionB_Covered.plx calls the reusable library nodes
+                              "-p", str(MODEL_DIR / "plans/MissionB_Covered.plx")],
+                             cwd=PLAN_DIR, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+exec_out = []
+# read the exec's output on a thread: a blocking readline here stopped the spin, and with it the sim clock
+threading.Thread(target=lambda: exec_out.extend(l.rstrip() for l in exec_proc.stdout), daemon=True).start()
+while exec_proc.poll() is None:
+    rclpy.spin_once(n, timeout_sec=0.2)
+spin(1.0)
+# Full node-transition trace (PLAN_DIR/Debug.cfg enables universalExec's own "Node:transition" debug flag, picked up
+# by default as ./Debug.cfg since cwd=PLAN_DIR): persisted whole, not just the EXEC line's tail, so the plan node of
+# every capability call can be recovered from it.
+(Path(os.environ["D0_LOG"]) / "plexil_node_trace.log").write_text("\n".join(exec_out) + "\n")
+log("EXEC", exit=exec_proc.returncode, wall_s=round(time.time() - t0, 1), sim_s=round(sim["t"] - sim0, 1),
+    tail=[l for l in exec_out if l.strip()][-4:])
+
+step = 0
+for line in (Path(os.environ["D0_LOG"]) / "capability_server.log").read_text().splitlines():
+    if "CAPABILITY " in line:
+        step += 1
+        c = json.loads(line.split("CAPABILITY ", 1)[1])
+        log("STEP", n=step, name=c["capability"], success=c["success"], failure_kind=c["failure_kind"],
+            failure_reason=c["failure_reason"][:200], args=c["args"], sim_s=c["evidence"].get("sim_s"))
+spin(3.0)
+log("DOCK", **base_err([0.0, 0.0], 0.0))
+log("RESULT", mission=dict(mission))

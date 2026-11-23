@@ -1,0 +1,160 @@
+{
+ "scenario": "covered",
+ "destination": "pdu_1",
+ "sim_time_s": 413.2,
+ "wall_time_s": 1017.2,
+ "final": {
+  "scenario": "covered",
+  "destination": "pdu_1",
+  "oru_on": "pdu_1_shelf/shelf",
+  "crate_on": "depot_stand/slot_1",
+  "delivered": true,
+  "success": true
+ },
+ "phases": [
+  {
+   "t": 1.5,
+   "phase": "undock: check the destination shelf first",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_0",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 1.5,
+   "phase": "drive to pdu_1 inspection pose",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_0",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 40.0,
+   "phase": "inspect PDU_1 spares shelf",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_0",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 98.0,
+   "phase": "inspect the depot stand",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_0",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 130.7,
+   "phase": "pick spare ORU from STAND SLOT_0",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "depot_stand/slot_0",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 174.1,
+   "phase": "carry",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 182.2,
+   "phase": "deliver the spare ORU to PDU_1",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 282.3,
+   "phase": "place spare ORU on PDU_1 SHELF",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": false,
+    "success": false
+   }
+  },
+  {
+   "t": 355.6,
+   "phase": "drive to pdu_1 inspection pose",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "pdu_1_shelf/shelf",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": true,
+    "success": false
+   }
+  },
+  {
+   "t": 370.8,
+   "phase": "verify delivery: ORU on the shelf",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "pdu_1_shelf/shelf",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": true,
+    "success": false
+   }
+  },
+  {
+   "t": 372.8,
+   "phase": "return to dock",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "pdu_1_shelf/shelf",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": true,
+    "success": false
+   }
+  },
+  {
+   "t": 411.2,
+   "phase": "mission complete",
+   "mission": {
+    "scenario": "covered",
+    "destination": "pdu_1",
+    "oru_on": "pdu_1_shelf/shelf",
+    "crate_on": "depot_stand/slot_1",
+    "delivered": true,
+    "success": true
+   }
+  }
+ ]
+}

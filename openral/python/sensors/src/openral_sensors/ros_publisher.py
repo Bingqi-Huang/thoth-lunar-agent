@@ -1,0 +1,494 @@
+"""Generalised sensor → ROS 2 image publisher.
+
+``openral_runner.backends.gstreamer.ros_tee.RosImagePublisher`` is
+GStreamer-coupled (republishes frames from a tee'd ``appsink``). This module
+generalises the pattern to any ``SensorReader``: a background thread
+polls ``SensorReader.read_latest`` at a configurable rate and republishes
+each frame as a ``sensor_msgs/Image`` on a configurable topic — used by
+``packages/openral_sensors_ros/`` so OpenCV/RealSense/mock readers reach the
+same dashboard, rosbag2 recorder, and converter as the GStreamer tee does.
+
+A parallel consumer, not an in-line interceptor: the inference hot path keeps
+calling ``reader.read_latest()`` directly, so ROS publication does not slow
+the runner. When the GStreamer backend's zero-copy tee is in use, this class
+is the non-zero-copy fallback.
+
+``rclpy`` is lazy-imported inside ``SensorRosPublisher.start`` so this
+module is importable on hosts without a sourced ROS env; the publisher just
+never starts there (unit tests ``pytest.importorskip("rclpy")``).
+
+QoS per CLAUDE.md §5.3: image streams ``BEST_EFFORT``/``VOLATILE``/
+``KEEP_LAST=5``; ``CameraInfo`` ``RELIABLE``/``VOLATILE``/``KEEP_LAST=1``.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import threading
+import time
+from typing import TYPE_CHECKING, Final, cast
+
+import structlog
+from openral_core import FrameEncoding
+from openral_core.exceptions import ROSPerceptionStale
+
+if TYPE_CHECKING:
+    # Use a Protocol shim to avoid importing openral_runner at module load
+    # time (sensors/runner depend on openral_core; we don't want a cycle).
+    from openral_core import IntrinsicsPinhole
+    from rclpy.node import Node
+    from rclpy.publisher import Publisher
+
+    from openral_sensors._reader_protocol import SensorReaderLike
+
+__all__ = ["SensorRosPublisher"]
+
+_log = structlog.get_logger(__name__)
+
+# Default QoS depth for the image publisher. Matches gscam2's default
+# (``sensor_data``-style: shallow, BEST_EFFORT-friendly).
+_DEFAULT_QOS_DEPTH: Final[int] = 5
+
+# Default join timeout when stopping the background thread. Long enough
+# that a slow rclpy publish or a sleep can finish; short enough that a
+# hung publisher doesn't block the runner indefinitely.
+_THREAD_JOIN_TIMEOUT_S: Final[float] = 2.0
+
+# Map ``FrameEncoding`` to the ROS string encoding (``sensor_msgs/Image.encoding``).
+# Only the CPU-side encodings make sense — the NVMM / DMA-BUF handles
+# the GStreamer publisher owns never reach this fallback path.
+_OPENRAL_TO_ROS_ENCODING: Final[dict[FrameEncoding, str]] = {
+    FrameEncoding.BGR8: "bgr8",
+    FrameEncoding.RGB8: "rgb8",
+    FrameEncoding.MONO8: "mono8",
+    FrameEncoding.DEPTH16: "16UC1",
+}
+
+
+class SensorRosPublisher:
+    """Republish frames from a ``SensorReader`` onto a ROS topic.
+
+    Args:
+        reader: Any backend that satisfies the ``SensorReader``
+            structural protocol (OpenCV, RealSense, mock — anything
+            with ``open / close / read_latest``). The publisher does
+            **not** call ``reader.open`` / ``reader.close``; the
+            caller (typically the ``openral_sensors_ros`` lifecycle
+            node) owns the reader's lifecycle so the publisher can be
+            attached to an already-open reader.
+        topic: ROS topic to publish on (must be absolute, e.g.
+            ``/cameras/wrist_rgb/image_raw``).
+        rate_hz: Publish cadence in Hz. Frames are pulled from the
+            reader at this rate; intermediate frames the reader
+            buffers are dropped at the ``read_latest`` call (which is
+            "latest only" by contract).
+        node_name: Optional override for the ROS node name; defaults
+            to ``openral_sensor_publisher_<sensor_id>``.
+        frame_id: ``Image.header.frame_id`` to stamp on outgoing
+            messages. Defaults to ``reader.sensor_id``.
+        qos_depth: Depth of the image publisher's QoS history queue
+            (CLAUDE.md §5.3 calls for ``KEEP_LAST=5–10`` for sensor
+            streams; defaults to 5).
+        camera_info: Optional ``IntrinsicsPinhole``. When
+            provided, a companion ``CameraInfo`` topic is published at
+            ``info_topic`` with ``RELIABLE`` QoS — matches
+            the ROS 2 ``camera_info_manager`` convention. The
+            publisher rebuilds the message once and re-publishes at
+            the same cadence as the image stream.
+        info_topic: Companion ``CameraInfo`` topic. ``None`` derives
+            ``<topic>/camera_info`` (camera_info_manager convention);
+            the deploy sensor leg overrides it to the OpenRAL sibling
+            layout ``/openral/cameras/<name>/camera_info`` so real
+            cameras match the sim HAL's topics (mono visual SLAM
+            subscribes there).
+        max_size: Optional ``(width, height)`` ceiling for the published
+            image. Frames larger than this are downscaled (aspect ratio
+            preserved) and ``CameraInfo``'s ``k``/``p`` rescaled to match.
+            ``None`` (default) publishes at capture resolution. Rationale: a
+            full-resolution Python→C copy holds the GIL — profiled at ~30 ms
+            per 640x480 frame, 30% of wall time at the sensor leg's capped
+            rate. The policy is unaffected — it reads in-process from the
+            aggregator, never this topic.
+
+    Example:
+        >>> # End-to-end exercised in tests/unit/test_sensor_ros_publisher.py
+        >>> pass
+    """
+
+    def __init__(
+        self,
+        *,
+        reader: SensorReaderLike,
+        topic: str,
+        rate_hz: float,
+        node_name: str | None = None,
+        frame_id: str | None = None,
+        qos_depth: int = _DEFAULT_QOS_DEPTH,
+        camera_info: IntrinsicsPinhole | None = None,
+        info_topic: str | None = None,
+        node: Node | None = None,
+        max_size: tuple[int, int] | None = None,
+    ) -> None:
+        """Stash configuration; no ROS I/O until ``start``."""
+        if not topic.startswith("/"):
+            raise ValueError(
+                f"SensorRosPublisher: topic must be absolute (start with '/'); got {topic!r}"
+            )
+        if rate_hz <= 0:
+            raise ValueError(f"SensorRosPublisher: rate_hz must be > 0; got {rate_hz!r}")
+        if qos_depth <= 0:
+            raise ValueError(f"SensorRosPublisher: qos_depth must be > 0; got {qos_depth!r}")
+
+        self._reader = reader
+        self._topic = topic
+        self._info_topic = info_topic or f"{topic}/camera_info"
+        self._rate_hz = float(rate_hz)
+        self._node_name = node_name or f"openral_sensor_publisher_{reader.sensor_id}"
+        self._frame_id = frame_id or reader.sensor_id
+        self._qos_depth = qos_depth
+        self._camera_info_spec = camera_info
+        if max_size is not None and (max_size[0] <= 0 or max_size[1] <= 0):
+            raise ValueError(f"SensorRosPublisher: max_size must be positive; got {max_size!r}")
+        self._max_size = max_size
+
+        # A composed runtime injects its existing node. Standalone callers
+        # retain the original private-node behavior.
+        self._node: Node | None = node
+        self._owns_node = node is None
+        self._image_publisher: Publisher | None = None
+        self._info_publisher: Publisher | None = None
+        self._we_initialised_rclpy = False
+        self._is_started = False
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        # Stats — useful for the live test + the lifecycle node's
+        # diagnostics topic.
+        self._n_published = 0
+        self._n_stale_skipped = 0
+
+    @property
+    def is_started(self) -> bool:
+        """``True`` between ``start`` and ``stop``."""
+        return self._is_started
+
+    @property
+    def n_published(self) -> int:
+        """Number of image messages successfully published since ``start``."""
+        return self._n_published
+
+    @property
+    def n_stale_skipped(self) -> int:
+        """Number of ticks the reader had no fresh frame and we skipped publish."""
+        return self._n_stale_skipped
+
+    @property
+    def topic(self) -> str:
+        """The configured image topic (read-only)."""
+        return self._topic
+
+    @property
+    def info_topic(self) -> str:
+        """The configured ``CameraInfo`` companion topic (read-only)."""
+        return self._info_topic
+
+    def prepare(self) -> None:
+        """Create ROS resources without starting the frame-pump thread.
+
+        Multi-camera callers prepare every publisher before starting any
+        background pump. This avoids concurrent rclpy operations while another
+        camera's node is still being constructed.
+
+        Raises:
+            RuntimeError: When ``rclpy`` / ``sensor_msgs`` are not
+                importable. Source a ROS 2 install before instantiating
+                the lifecycle node that owns this publisher.
+        """
+        if self._image_publisher is not None:
+            return
+        try:
+            import rclpy
+            from rclpy.qos import (
+                QoSDurabilityPolicy,
+                QoSHistoryPolicy,
+                QoSProfile,
+                QoSReliabilityPolicy,
+            )
+            from sensor_msgs.msg import CameraInfo, Image
+        except ImportError as exc:
+            raise RuntimeError(
+                "SensorRosPublisher.start() requires rclpy + sensor_msgs. "
+                "Source a ROS 2 install (e.g. `source /opt/ros/jazzy/setup.bash`) "
+                "before starting an openral_sensors_ros node."
+            ) from exc
+
+        if not rclpy.ok():
+            rclpy.init()
+            self._we_initialised_rclpy = True
+
+        if self._node is None:
+            from rclpy.node import Node
+
+            self._node = Node(self._node_name)
+        # Image stream QoS — sensor_data-style per CLAUDE.md §5.3.
+        image_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=self._qos_depth,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        self._image_publisher = self._node.create_publisher(Image, self._topic, image_qos)
+        # CameraInfo: RELIABLE, KEEP_LAST=1 (camera_info_manager convention).
+        if self._camera_info_spec is not None:
+            info_qos = QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            )
+            self._info_publisher = self._node.create_publisher(
+                CameraInfo, self._info_topic, info_qos
+            )
+
+    def start(self) -> None:
+        """Prepare ROS resources and start the frame-pump thread."""
+        if self._is_started:
+            return
+        self.prepare()
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._pump_loop,
+            name=f"sensor_ros_publisher:{self._reader.sensor_id}",
+            daemon=True,
+        )
+        self._thread.start()
+        self._is_started = True
+        _log.debug(
+            "sensor_ros_publisher.started",
+            sensor_id=self._reader.sensor_id,
+            topic=self._topic,
+            rate_hz=self._rate_hz,
+            has_camera_info=self._camera_info_spec is not None,
+        )
+
+    def stop(self) -> None:
+        """Signal the pump thread to exit, then tear down ROS resources.
+
+        Idempotent. The thread is given ``_THREAD_JOIN_TIMEOUT_S``
+        to finish its current publish; a stuck thread is logged but
+        not awaited indefinitely.
+        """
+        if not self._is_started and self._image_publisher is None:
+            return
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=_THREAD_JOIN_TIMEOUT_S)
+            if self._thread.is_alive():
+                _log.warning(
+                    "sensor_ros_publisher.thread_join_timeout",
+                    sensor_id=self._reader.sensor_id,
+                    timeout_s=_THREAD_JOIN_TIMEOUT_S,
+                )
+        self._thread = None
+        if self._image_publisher is not None and self._node is not None:
+            self._node.destroy_publisher(self._image_publisher)
+        self._image_publisher = None
+        if self._info_publisher is not None and self._node is not None:
+            self._node.destroy_publisher(self._info_publisher)
+        self._info_publisher = None
+        if self._node is not None and self._owns_node:
+            self._node.destroy_node()
+            self._node = None
+        if self._we_initialised_rclpy and self._owns_node:
+            import rclpy
+
+            if rclpy.ok():
+                with contextlib.suppress(Exception):  # defensive teardown
+                    rclpy.shutdown()
+            self._we_initialised_rclpy = False
+        self._is_started = False
+        _log.debug(
+            "sensor_ros_publisher.stopped",
+            sensor_id=self._reader.sensor_id,
+            n_published=self._n_published,
+            n_stale_skipped=self._n_stale_skipped,
+        )
+
+    # ── Pump thread ─────────────────────────────────────────────────────────
+
+    def _pump_loop(self) -> None:
+        """Poll ``reader.read_latest`` at ``rate_hz`` and publish each frame.
+
+        Runs on the background thread until ``_stop_event`` fires.
+        Stale frames raise ``ROSPerceptionStale`` from the reader;
+        we log + count + continue (the next-tick frame may be fresh).
+        """
+        period_s = 1.0 / self._rate_hz
+        next_deadline = time.monotonic() + period_s
+        while not self._stop_event.is_set():
+            try:
+                frame = self._reader.read_latest()
+            except ROSPerceptionStale:
+                self._n_stale_skipped += 1
+                frame = None
+            except RuntimeError as exc:
+                # Reader was closed under us, or a real backend error.
+                # Log and exit the loop — stop() will tidy up.
+                _log.warning(
+                    "sensor_ros_publisher.reader_error",
+                    sensor_id=self._reader.sensor_id,
+                    error=str(exc),
+                )
+                break
+            if frame is not None:
+                try:
+                    self._publish_frame(frame)
+                except Exception as exc:  # defensive: never kill the thread
+                    _log.warning(
+                        "sensor_ros_publisher.publish_failed",
+                        sensor_id=self._reader.sensor_id,
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                    )
+            # Sleep until the next tick deadline. monotonic-based so
+            # clock-skew doesn't drift the cadence.
+            remaining = next_deadline - time.monotonic()
+            # Use the stop_event.wait so stop() can wake us early.
+            if remaining > 0 and self._stop_event.wait(timeout=remaining):
+                return
+            next_deadline += period_s
+            # If we're way behind (the reader blocked for many periods),
+            # snap to "now + one period" so we don't fire a burst of
+            # publishes to catch up.
+            if time.monotonic() > next_deadline + period_s:
+                next_deadline = time.monotonic() + period_s
+
+    def _publish_frame(self, frame: object) -> None:
+        """Convert a ``SensorFrame`` to ``sensor_msgs/Image`` + publish.
+
+        Frames with no inline ``data`` (e.g. a topic-ref-only frame from
+        a ROS subscriber backend) are skipped silently — there is nothing
+        to republish; the existing ROS topic the frame points at is
+        already on the bus.
+        """
+        from sensor_msgs.msg import Image
+
+        # Avoid importing openral_core.SensorFrame at module load (cycle
+        # risk through openral_sensors); duck-type via attribute access.
+        data = getattr(frame, "data", None)
+        if data is None:
+            return  # topic-ref or handle-only frame; nothing to publish here
+        encoding_enum = getattr(frame, "encoding", None)
+        # Duck-typed frame: encoding may be any FrameEncoding member.
+        # Cast for mypy; the .get() returns None for any non-key value.
+        ros_encoding = _OPENRAL_TO_ROS_ENCODING.get(cast("FrameEncoding", encoding_enum))
+        if ros_encoding is None:
+            _log.warning(
+                "sensor_ros_publisher.unsupported_encoding",
+                sensor_id=self._reader.sensor_id,
+                encoding=str(encoding_enum),
+            )
+            return
+
+        assert self._image_publisher is not None  # type narrowing
+        assert self._node is not None
+
+        width = int(getattr(frame, "width", 0))
+        height = int(getattr(frame, "height", 0))
+        channels = 1 if ros_encoding in {"mono8", "16UC1"} else 3
+
+        scale = self._downscale_factor(width, height)
+        if scale < 1.0:
+            data, width, height = self._downscale(data, width, height, channels, scale)
+
+        msg = Image()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.header.frame_id = self._frame_id
+        msg.height = height
+        msg.width = width
+        msg.encoding = ros_encoding
+        msg.is_bigendian = 0
+        msg.step = width * channels * (2 if ros_encoding == "16UC1" else 1)
+        msg.data = bytes(data)
+        self._image_publisher.publish(msg)
+        self._n_published += 1
+
+        if self._info_publisher is not None and self._camera_info_spec is not None:
+            self._publish_camera_info(width, height, msg.header.stamp)
+
+    def _downscale_factor(self, width: int, height: int) -> float:
+        """Uniform scale that fits ``width x height`` inside ``max_size``.
+
+        Returns ``1.0`` (publish untouched) when no ceiling is configured or
+        the frame already fits. Aspect ratio is preserved — a non-uniform
+        squash would need separate x/y intrinsic scaling and silently break
+        any consumer doing geometry.
+        """
+        if self._max_size is None or width <= 0 or height <= 0:
+            return 1.0
+        max_w, max_h = self._max_size
+        return min(1.0, max_w / width, max_h / height)
+
+    def _downscale(
+        self, data: bytes, width: int, height: int, channels: int, scale: float
+    ) -> tuple[bytes, int, int]:
+        """Resize raw interleaved bytes by ``scale``; returns ``(data, w, h)``.
+
+        Falls back to the original frame if numpy/Pillow is unavailable or the
+        buffer is not the length its geometry implies — publishing a
+        full-resolution frame is merely slower, while publishing a mis-sized
+        buffer would corrupt every subscriber.
+        """
+        raw = bytes(data)  # accepts bytearray/memoryview from a duck-typed frame
+        if len(raw) != width * height * channels:
+            return raw, width, height
+        try:
+            import numpy as np
+            from PIL import Image as PilImage
+        except ImportError:
+            return raw, width, height
+        new_w, new_h = max(1, round(width * scale)), max(1, round(height * scale))
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, channels)
+        mode = "L" if channels == 1 else "RGB"
+        img = PilImage.fromarray(arr.squeeze() if channels == 1 else arr, mode=mode)
+        # BILINEAR, not LANCZOS: this runs on the publish thread and the
+        # consumers are detectors / VLMs, not humans looking for ringing.
+        resized = img.resize((new_w, new_h), PilImage.Resampling.BILINEAR)
+        return np.asarray(resized).tobytes(), new_w, new_h
+
+    def _publish_camera_info(self, width: int, height: int, stamp: object) -> None:
+        """Publish a companion ``CameraInfo`` matching the published image.
+
+        Intrinsics are scaled to ``width x height`` rather than used verbatim:
+        when ``_max_size`` downscales the frame, manifest-resolution
+        ``fx/fy/cx/cy`` against reduced dimensions would silently break every
+        geometric consumer (cuVSLAM, nvblox, the depth provider, object-lift).
+        """
+        from openral_core import scale_intrinsics_to
+        from sensor_msgs.msg import CameraInfo
+
+        assert self._info_publisher is not None
+        assert self._camera_info_spec is not None
+        spec = self._camera_info_spec
+
+        # Uses the same helper as the sim HAL (openral_core.scale_intrinsics_to)
+        # so real-hardware and sim CameraInfo never drift on the rescale rule.
+        # Per-axis, so mismatched declared/actual geometry still lands correctly.
+        # Degenerate spec (zero width/height) is published verbatim, not divided by.
+        if spec.width > 0 and spec.height > 0:
+            scaled = scale_intrinsics_to(spec, width, height)
+            fx, fy, cx, cy = scaled.fx, scaled.fy, scaled.cx, scaled.cy
+        else:
+            fx, fy, cx, cy = spec.fx, spec.fy, spec.cx, spec.cy
+
+        info = CameraInfo()
+        info.header.stamp = stamp
+        info.header.frame_id = self._frame_id
+        info.width = width
+        info.height = height
+        info.distortion_model = spec.distortion_model
+        # ROS expects flat lists; pad/truncate to spec sizes.
+        info.d = list(spec.distortion_coeffs)
+        info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+        info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+        self._info_publisher.publish(info)

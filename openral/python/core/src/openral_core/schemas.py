@@ -1,0 +1,11742 @@
+"""openral schema v0 — normative Pydantic v2 contracts for all layers.
+
+This is the single source of truth for the data contracts between layers.
+Anything imported from openral_core.__init__ is public API.
+Breaking changes require a SemVer MAJOR bump (pre-1.0: MINOR) and a migration entry.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import math
+import re
+from collections.abc import Callable
+from enum import Enum
+from typing import (
+    Annotated,
+    Any,
+    ClassVar,
+    Literal,
+    NamedTuple,
+    TypeAlias,
+    TypeVar,
+    get_args,
+)
+
+# PY310-HUMBLE PATCH: ``typing.Self`` is 3.11+; this fork targets the ROS 2
+# Humble interpreter (3.10). ``typing_extensions`` backports it identically and
+# is already a hard transitive dependency via pydantic.
+from typing_extensions import Self
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PositiveFloat,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
+
+# ROSConfigError lives in the sibling `exceptions` module and is the
+# canonical exception family for any configuration-level failure (see
+# CLAUDE.md §10).
+from openral_core.exceptions import ROSConfigError, ROSGPUMemoryError
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+def _load_yaml_model(model: type[_ModelT], path: str) -> _ModelT:
+    """Load ``path`` as YAML and validate it against ``model``.
+
+    Shared body for every ``from_yaml`` classmethod in this module
+    (docs/methods/14-duplication-watch.md — "from_yaml classmethods").
+    """
+    import yaml  # noqa: PLC0415  # reason: deferred to avoid import-time cost
+
+    with open(path, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+    return model.model_validate(data)
+
+
+# ─── Enums ─────────────────────────────────────────────────────────────────────
+
+
+class EmbodimentKind(str, Enum):
+    """Top-level kinematic class of a robot body."""
+
+    HUMANOID = "humanoid"
+    MANIPULATOR = "manipulator"
+    BIMANUAL = "bimanual"
+    QUADRUPED = "quadruped"
+    MOBILE_BASE = "mobile_base"
+    MOBILE_MANIPULATOR = "mobile_manipulator"
+    DRONE = "drone"
+
+
+class JointType(str, Enum):
+    """Kinematic joint type following URDF conventions."""
+
+    REVOLUTE = "revolute"
+    PRISMATIC = "prismatic"
+    CONTINUOUS = "continuous"
+    FIXED = "fixed"
+    FLOATING = "floating"
+    PLANAR = "planar"
+
+
+class ClockOrigin(str, Enum):
+    """Authoritative source for OpenRAL ``stamp_ns`` values.
+
+    ``/clock`` is not an origin; it is the ROS 2 projection of one of these
+    authorities into nodes that run with ``use_sim_time=true``.
+    """
+
+    HOST_WALL = "host_wall"
+    SIMULATION = "simulation"
+    HARDWARE_SYNCED = "hardware_synced"
+
+
+class ClockEpoch(str, Enum):
+    """Epoch that a ``stamp_ns`` value is measured from."""
+
+    UNIX = "unix"
+    SIMULATION_ELAPSED = "simulation_elapsed"
+    HARDWARE = "hardware"
+
+
+JointRole: TypeAlias = Literal[
+    "arm",
+    "base",
+    "gripper",
+    "torso",
+    "leg",
+    "head",
+    "neck",
+    "wheel",
+    "unknown",
+]
+"""Structural classification of a ``JointSpec``.
+
+Carries the joint's *purpose* in the embodiment's morphology — what
+the runner, safety kernel, and dataset bridge need to identify a
+channel without relying on name-substring heuristics (e.g.
+``"gripper" in name.lower()`` in ``rskill_runner_node._build_joint_permutation``
+which silently misclassifies any joint with ``"gripper"`` in the name).
+
+``"unknown"`` is the default so legacy manifests load unchanged; the
+fleet annotates incrementally as this rolls out.
+"""
+
+
+class ClockAuthority(BaseModel):
+    """Named origin for OpenRAL timestamps across sim, rSkills, ROS, and hardware.
+
+    The invariant is: every serialized ``stamp_ns`` is measured in the active
+    deployment's OpenRAL timestamp domain. Simulation deployments may publish
+    that domain onto ROS ``/clock``; real deployments normally use host wall
+    time or a PTP/hardware clock already synchronized into the graph. rSkills
+    consume stamps from this domain; they do not create a separate clock.
+
+    Attributes:
+        origin: Physical/logical source of the timestamp domain.
+        epoch: Epoch used by ``stamp_ns``.
+        clock_id: Stable human-readable authority identifier.
+        publishes_ros_clock: Whether this authority is projected onto ROS
+            ``/clock`` for nodes using ``use_sim_time``.
+        timestep_s: Optional logical simulation/control timestep in seconds.
+            ``None`` means event-driven or externally determined.
+        notes: Optional operator-facing context.
+
+    Example:
+        >>> ClockAuthority.simulation("robocasa", timestep_s=0.05).epoch
+        <ClockEpoch.SIMULATION_ELAPSED: 'simulation_elapsed'>
+    """
+
+    origin: ClockOrigin
+    epoch: ClockEpoch
+    clock_id: str = Field(min_length=1)
+    publishes_ros_clock: bool = False
+    timestep_s: float | None = Field(default=None, gt=0)
+    notes: str | None = None
+
+    @classmethod
+    def host_wall(cls, clock_id: str = "host_wall") -> ClockAuthority:
+        """Return the default real-deployment authority: host wall/ROS system time."""
+        return cls(origin=ClockOrigin.HOST_WALL, epoch=ClockEpoch.UNIX, clock_id=clock_id)
+
+    @classmethod
+    def simulation(
+        cls,
+        clock_id: str,
+        *,
+        timestep_s: float | None = None,
+        publishes_ros_clock: bool = True,
+    ) -> ClockAuthority:
+        """Return a simulator-owned elapsed-time authority."""
+        return cls(
+            origin=ClockOrigin.SIMULATION,
+            epoch=ClockEpoch.SIMULATION_ELAPSED,
+            clock_id=clock_id,
+            publishes_ros_clock=publishes_ros_clock,
+            timestep_s=timestep_s,
+        )
+
+    @classmethod
+    def hardware_synced(
+        cls,
+        clock_id: str,
+        *,
+        epoch: ClockEpoch = ClockEpoch.UNIX,
+    ) -> ClockAuthority:
+        """Return a hardware/PTP authority already synchronized to the graph."""
+        return cls(origin=ClockOrigin.HARDWARE_SYNCED, epoch=epoch, clock_id=clock_id)
+
+    @model_validator(mode="after")
+    def _validate_origin_epoch(self) -> ClockAuthority:
+        if (
+            self.origin is ClockOrigin.SIMULATION
+            and self.epoch is not ClockEpoch.SIMULATION_ELAPSED
+        ):
+            raise ValueError("simulation clock authorities must use epoch='simulation_elapsed'")
+        if self.origin is ClockOrigin.HOST_WALL and self.epoch is not ClockEpoch.UNIX:
+            raise ValueError("host_wall clock authorities must use epoch='unix'")
+        if self.origin is ClockOrigin.HARDWARE_SYNCED and self.publishes_ros_clock:
+            raise ValueError(
+                "hardware_synced authorities must be mapped into the ROS graph clock, "
+                "not published as a competing /clock source"
+            )
+        return self
+
+
+class ControlMode(str, Enum):
+    """Action space / control interface exposed by a robot or skill."""
+
+    JOINT_POSITION = "joint_position"
+    JOINT_VELOCITY = "joint_velocity"
+    JOINT_TORQUE = "joint_torque"
+    JOINT_TRAJECTORY = "joint_trajectory"
+    CARTESIAN_POSE = "cartesian_pose"  # 6D EE pose absolute
+    CARTESIAN_DELTA = "cartesian_delta"  # 6D EE delta
+    CARTESIAN_TWIST = "cartesian_twist"  # 6D velocity
+    BODY_TWIST = "body_twist"  # base linear/angular velocity
+    FOOT_PLACEMENT = "foot_placement"  # discrete footsteps
+    GRIPPER_BINARY = "gripper_binary"
+    GRIPPER_POSITION = "gripper_position"
+    DEX_HAND_JOINT = "dex_hand_joint"  # multi-DoF fingers
+    # Sim-only robosuite-composite multiplexer flag (e.g.
+    # ``HybridMobileBase.set_goal`` reads ``action[-1]`` to switch the
+    # arm controller between "achieved" (frozen) and "desired"
+    # (responds to delta) modes). 1-D value in ``[-1, +1]``. Real-HW
+    # adapters with independent arm + base controllers ignore this.
+    COMPOSITE_MODE = "composite_mode"
+
+
+# Single source of truth for the `openral_msgs/ActionChunk.control_mode`
+# uint8 wire encoding. Both producers (`openral_runner.ros_publishing_hal`)
+# and consumers (`openral_hal.lifecycle.decode_action_chunk`, the base
+# `_on_safe_action` decoder every robot now shares) import this so a
+# wire-format change happens in one place. The order
+# matches the enum declaration above and the C++ kernel's
+# ``cpp/openral_safety_kernel/include/openral_safety_kernel/validator.hpp::ControlMode``.
+CONTROL_MODE_TO_UINT8: dict[ControlMode, int] = {
+    ControlMode.JOINT_POSITION: 0,
+    ControlMode.JOINT_VELOCITY: 1,
+    ControlMode.JOINT_TORQUE: 2,
+    ControlMode.JOINT_TRAJECTORY: 3,
+    ControlMode.CARTESIAN_POSE: 4,
+    ControlMode.CARTESIAN_DELTA: 5,
+    ControlMode.CARTESIAN_TWIST: 6,
+    ControlMode.BODY_TWIST: 7,
+    ControlMode.FOOT_PLACEMENT: 8,
+    ControlMode.GRIPPER_BINARY: 9,
+    ControlMode.GRIPPER_POSITION: 10,
+    ControlMode.DEX_HAND_JOINT: 11,
+    ControlMode.COMPOSITE_MODE: 12,
+}
+
+# Inverse mapping for consumers that decode `ActionChunk.control_mode`
+# back to the ControlMode enum.
+UINT8_TO_CONTROL_MODE: dict[int, ControlMode] = {v: k for k, v in CONTROL_MODE_TO_UINT8.items()}
+
+# Width of a BODY_TWIST / CARTESIAN_* twist row: (vx, vy, vz, wx, wy, wz).
+# Single source for the HAL packers + safety supervisor that validate
+# 6-vec twist payloads; matches ``Action.body_twist`` (a 6-tuple).
+BODY_TWIST_DIM = 6
+
+# Obstacle-clearance buffer added to a circular base's ``footprint_radius``
+# to derive the Nav2 costmap ``inflation_radius`` (see
+# ``RobotDescription.nav2_param_overrides``). Nav2 requires
+# ``inflation_radius >= the costmap-discretised circumscribed radius``,
+# which exceeds ``footprint_radius`` by up to one cell; a small buffer
+# clears that and gives a thin obstacle-avoidance halo without blocking
+# tight aisles. 0.05 m = one cell at the default 0.05 m costmap
+# resolution.
+NAV2_INFLATION_CLEARANCE_M = 0.05
+
+
+class SensorModality(str, Enum):
+    """Physical sensing modality."""
+
+    RGB = "rgb"
+    DEPTH = "depth"
+    STEREO = "stereo"
+    IR = "ir"
+    POINT_CLOUD = "point_cloud"
+    LIDAR_2D = "lidar_2d"
+    IMU = "imu"
+    FORCE_TORQUE = "force_torque"
+    JOINT_STATE = "joint_state"
+    TACTILE_VISION = "tactile_vision"
+    TACTILE_ARRAY = "tactile_array"
+    AUDIO = "audio"
+    GPS = "gps"
+    BATTERY = "battery"
+
+
+class Hand(str, Enum):
+    """Laterality of an end-effector."""
+
+    LEFT = "left"
+    RIGHT = "right"
+    NA = "na"
+
+
+# ─── Sensors ───────────────────────────────────────────────────────────────────
+
+
+class IntrinsicsPinhole(BaseModel):
+    """Pinhole camera intrinsics.
+
+    Attributes:
+        width: Image width in pixels.
+        height: Image height in pixels.
+        fx: Focal length in x (pixels).
+        fy: Focal length in y (pixels).
+        cx: Principal point x (pixels).
+        cy: Principal point y (pixels).
+        distortion_model: Distortion model name.
+        distortion_coeffs: Distortion coefficients.
+
+    Example:
+        >>> IntrinsicsPinhole(width=640, height=480, fx=600.0, fy=600.0, cx=320.0, cy=240.0)
+        IntrinsicsPinhole(width=640, height=480, fx=600.0, fy=600.0, cx=320.0, cy=240.0, ...)
+    """
+
+    width: int
+    height: int
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    distortion_model: Literal["plumb_bob", "equidistant", "none"] = "plumb_bob"
+    distortion_coeffs: list[float] = Field(default_factory=list)
+
+
+def scale_intrinsics_to(base: IntrinsicsPinhole, width: int, height: int) -> IntrinsicsPinhole:
+    """Linearly rescale pinhole intrinsics to a new render resolution.
+
+    For a camera with a *fixed* field of view, ``fx``/``fy``/``cx``/``cy`` scale
+    linearly with the image dimensions: a frame rendered at twice the width has
+    twice the focal length (px) and twice the principal-point x. This is the
+    consistency rule deploy-sim needs — the canonical manifest pins one nominal
+    resolution, but a scene may render the same MuJoCo camera at another
+    (``scene.observation_width``/``height``). Publishing the manifest's nominal
+    intrinsics on a different-resolution render would back-project depth pixels
+    and project occupancy voxels with the wrong focal length, corrupting the
+    OctoMap voxels and the 2D→3D object lift. Scaling keeps the published camera
+    model matched to whatever was actually rendered.
+
+    The distortion model and coefficients are preserved unchanged (coefficients
+    are resolution-independent for the normalised plumb-bob model). When the
+    target already equals ``base``'s resolution the input is returned as-is.
+
+    Args:
+        base: Nominal pinhole intrinsics (e.g. from a ``SensorSpec``).
+        width: Target render width in pixels (``> 0``).
+        height: Target render height in pixels (``> 0``).
+
+    Returns:
+        Intrinsics scaled so ``(fx, fy, cx, cy)`` correspond to ``(width,
+        height)`` at the same field of view as ``base``.
+
+    Raises:
+        ValueError: If ``width`` or ``height`` is not strictly positive.
+
+    Example:
+        >>> base = IntrinsicsPinhole(width=256, height=256, fx=256.0, fy=256.0, cx=128.0, cy=128.0)
+        >>> hi = scale_intrinsics_to(base, 640, 640)
+        >>> (hi.width, hi.fx, hi.cx)
+        (640, 640.0, 320.0)
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"target resolution must be positive; got ({width}, {height})")
+    if width == base.width and height == base.height:
+        return base
+    sx = width / base.width
+    sy = height / base.height
+    return IntrinsicsPinhole(
+        width=width,
+        height=height,
+        fx=base.fx * sx,
+        fy=base.fy * sy,
+        cx=base.cx * sx,
+        cy=base.cy * sy,
+        distortion_model=base.distortion_model,
+        distortion_coeffs=list(base.distortion_coeffs),
+    )
+
+
+class CameraSimPlacement(BaseModel):
+    """Where an RGB sensor's camera sits in the sim MJCF.
+
+    Lets the generic HAL camera rig (``openral_hal._camera_rig``) splice a
+    manifest camera into a bare-arm MJCF that ships no ``<camera>`` elements, so
+    a ``deploy sim`` digital twin renders the robot's declared cameras without a
+    per-robot scene composer. A camera is a property of the robot's sensor suite
+    (the wrist camera is bolted to the gripper; the overhead camera is a declared
+    sensor), so its sim pose lives on the ``SensorSpec``, not in a scene.
+
+    The rig only splices a camera that is *absent* from the loaded MJCF, so this
+    is a no-op for scene-attached or already-composed models (those carry their
+    own cameras).
+
+    Attributes:
+        parent_body: MJCF body the camera is rigidly mounted to (tracks that
+            body's pose — e.g. the gripper/``Fixed_Jaw`` for a wrist camera).
+            ``None`` mounts it world-fixed in ``<worldbody>`` (an overhead /
+            third-person camera).
+        pos: Camera position ``(x, y, z)`` in metres, in ``parent_body``'s frame
+            (or world when ``parent_body`` is ``None``).
+        target: Look-at point ``(x, y, z)`` in the same frame; the camera's
+            MuJoCo ``-z`` view axis is oriented from ``pos`` toward it.
+        up: World-up hint used to level the camera roll. Defaults to ``(0, 0, 1)``.
+            A camera physically mounted upside-down (e.g. a wrist phone bolted
+            inverted on the gripper) uses ``(0, 0, -1)`` to roll the image 180°.
+        fovy_deg: Vertical field of view in degrees. ``None`` derives it from the
+            sensor's pinhole ``intrinsics`` (``2·atan(height / (2·fy))``) so the
+            rendered FoV matches the declared camera model.
+
+    Example:
+        >>> CameraSimPlacement(pos=(0.5, 0.3, 0.75), target=(0.5, 0.3, 0.0)).parent_body is None
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    parent_body: str | None = None
+    pos: tuple[float, float, float]
+    target: tuple[float, float, float]
+    up: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    fovy_deg: float | None = None
+
+
+class SensorSpec(BaseModel):
+    """Generalizable sensor descriptor — covers all modalities.
+
+    Attributes:
+        name: Human-readable sensor name, e.g. "head_rgb", "left_wrist_depth".
+        modality: Physical sensing modality.
+        frame_id: tf2 frame name.
+        parent_frame: tf2 parent frame (for static transform).
+        static_transform_xyz_rpy: Static transform from parent to this sensor.
+        rate_hz: Expected publishing rate in Hz.
+        intrinsics: Pinhole camera intrinsics (if applicable).
+        encoding: Image encoding, e.g. "rgb8", "16UC1".
+        vla_feature_key: VLA observation dict key this sensor maps to, e.g.
+            'observation.images.camera1'. Used by skill loaders to auto-wire
+            sensors to VLA input_features.
+        ros2_topic: ROS 2 topic name. None for non-ROS robots (USB, sim-only).
+        ros2_msg_type: ROS 2 message type, e.g. "sensor_msgs/Image". None for
+            non-ROS robots (USB, sim-only).
+        qos_profile: QoS profile key.
+        catalog_id: Optional sensor catalog id used as provenance for a
+            catalog-backed physical device. The spec remains fully materialized;
+            calibrated intrinsics, placement, feature keys, and serials stay on
+            this instance.
+        vendor: Sensor vendor name.
+        model: Sensor model, e.g. "RealSense D455".
+        driver_pkg: ROS 2 driver package name.
+        metadata: Additional key-value metadata.
+    """
+
+    model_config = ConfigDict(use_enum_values=True)
+
+    name: str
+    modality: SensorModality
+    frame_id: str
+    parent_frame: str | None = None
+    static_transform_xyz_rpy: tuple[float, float, float, float, float, float] | None = None
+    rate_hz: float
+    # Image / depth / stereo
+    intrinsics: IntrinsicsPinhole | None = None
+    encoding: str | None = None
+    fov_h_deg: float | None = None
+    fov_v_deg: float | None = None
+    # Optional override carrying the MJCF/MuJoCo camera name when it differs
+    # from this sensor's logical ``name`` (issue #191 Phase 3b — mirrors
+    # ``JointSpec.sim_joint_name``). ``MujocoArmHAL.read_images`` renders
+    # ``sim_camera_name or name`` for each RGB sensor, keying the frame by the
+    # sensor ``name`` so ``SimSensorBridge`` finds it. ``None`` = "MJCF camera
+    # name matches ``name``" (the common case). E.g. openarm's ``base`` sensor
+    # renders the MJCF ``top`` camera.
+    sim_camera_name: str | None = None
+    # Where this camera sits in the sim MJCF. When set, the generic
+    # HAL camera rig (``openral_hal._camera_rig``) splices the camera into a
+    # bare-arm MJCF that ships no ``<camera>`` elements, so a ``deploy sim`` twin
+    # renders the robot's declared cameras without a per-robot scene composer.
+    # ``None`` = not rigged (the MJCF is expected to already declare the camera,
+    # e.g. a scene-attached or composed-props model).
+    sim_placement: CameraSimPlacement | None = None
+    # LiDAR / point cloud
+    n_channels: int | None = None
+    range_min_m: float | None = None
+    range_max_m: float | None = None
+    # IMU
+    accel_noise_density: float | None = None
+    gyro_noise_density: float | None = None
+    # F/T
+    n_axes: int | None = None
+    # Tactile
+    tactile_grid: tuple[int, int] | None = None
+    vla_feature_key: str | None = None
+    # ROS 2 wiring
+    ros2_topic: str | None = None
+    ros2_msg_type: str | None = None
+    qos_profile: Literal["sensor_data", "reliable", "transient_local", "parameters"] = "sensor_data"
+    # Driver / vendor
+    catalog_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_.-]*$",
+        description=(
+            "Optional openral_sensors catalog id for the physical device this "
+            "fully materialized SensorSpec was derived from. Calibration and "
+            "instance wiring remain explicit on the spec."
+        ),
+    )
+    vendor: str | None = None
+    model: str | None = None
+    driver_pkg: str | None = None
+    # Real-device binding for `openral deploy run` — the runtime counterpart to
+    # `sim_placement`. Host-specific, so committed reference manifests leave it
+    # unset (`openral detect` fills it per host). Robot-mounted sensors carry it
+    # in robot.yaml; workcell-mounted sensors carry it on a DeployScene.sensors
+    # entry. See `SensorDeployBinding`. Forward ref (defined with the reader
+    # schemas below) resolved by the `SensorSpec.model_rebuild()` after it.
+    deploy_binding: SensorDeployBinding | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+class SensorBundle(BaseModel):
+    """Multi-modal sensor group, e.g. RealSense D455 = (RGB, depth, IMU).
+
+    Attributes:
+        bundle_name: Unique name for this bundle.
+        sensors: List of constituent sensor specs.
+        sync: Synchronization strategy.
+        sync_tolerance_ms: Tolerance for approximate synchronization.
+    """
+
+    bundle_name: str
+    sensors: list[SensorSpec]
+    sync: Literal["hardware", "approximate", "none"] = "approximate"
+    sync_tolerance_ms: float = 30.0
+
+
+# ─── Joints / Actuation ────────────────────────────────────────────────────────
+
+
+class JointSpec(BaseModel):
+    """URDF-derived joint specification.
+
+    Attributes:
+        name: Joint name matching the URDF.
+        joint_type: Kinematic joint type.
+        parent_link: Parent link name.
+        child_link: Child link name.
+        axis_xyz: Rotation/translation axis unit vector.
+        position_limits: (min, max) in the unit of the value that travels
+            on this channel — radians or metres for arm joints, and
+            ``(0.0, 1.0)`` for a gripper whose HAL contract is a normalised
+            jaw fraction (i.e. one declared ``normalised`` in
+            ``SimDescription.grippers``). The safety kernel's envelope,
+            the rSkill runner's pre-clamp and the supervisor's
+            ``gripper_min`` / ``gripper_max`` all compare a **commanded
+            Action value** against these bounds, so declaring a normalised
+            gripper's mechanical radian range here stops the envelope from
+            constraining that channel at all (issue #62). A mechanical range
+            that differs from the channel unit belongs in
+            ``SimGripperDescription.ctrl_range`` / the URDF.
+        velocity_limit: Maximum velocity.
+        effort_limit: Maximum effort (N or Nm).
+        has_position_sensor: Whether position feedback is available.
+        has_velocity_sensor: Whether velocity feedback is available.
+        has_torque_sensor: Whether torque feedback is available.
+        backlash_estimate: Estimated backlash in radians.
+        actuator_kind: Type of actuator.
+        sim_joint_name: Optional override carrying the **MJCF/MuJoCo
+            joint name** as it appears in the simulator's compiled
+            model when that name differs from ``name``. The HAL
+            uses ``name`` for the world-state contract (it's the
+            URDF-shaped logical identifier the safety supervisor sees
+            on every chunk); a separate ``sim_joint_name`` lets a
+            sim-adapter look up ``mj_name2id`` without hardcoding
+            robosuite / robocasa / MuJoCo naming conventions in
+            backend modules. ``None`` means "the MJCF joint name
+            matches ``name``" — true for every fixed-base
+            manipulator we ship; only mobile bases and humanoids
+            whose MJCF auto-prefixes joints (robosuite's
+            ``mobilebase0_…`` namespace, GR-1's ``robot0_…``) need
+            it.
+        role: Structural classification. The downstream
+            runner / safety / dataset-bridge code identifies grippers
+            and base DoFs by this tag instead of substring-matching the
+            joint name (which silently misclassifies any joint
+            containing ``"gripper"``, e.g. ``"gripper_pose"``). Default
+            ``"unknown"`` keeps legacy manifests loadable; the fleet
+            annotates incrementally as this rolls out.
+        origin_xyz: Fixed translation (metres) of this joint's frame in
+            its ``parent_link`` frame — the URDF ``<joint><origin xyz>``.
+            With ``origin_rpy`` and ``axis_xyz`` it gives the
+            kernel everything it needs for forward kinematics.
+            Default ``(0, 0, 0)``; populated by the offline lowering tool
+            (from MJCF/URDF) only for robots that enable self-collision
+            checking — legacy manifests are unaffected.
+        origin_rpy: Fixed orientation (roll, pitch, yaw, radians) of this
+            joint's frame in its ``parent_link`` frame — the URDF
+            ``<joint><origin rpy>``. Default ``(0, 0, 0)``.
+    """
+
+    name: str
+    joint_type: JointType
+    parent_link: str
+    child_link: str
+    axis_xyz: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    origin_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    origin_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    position_limits: tuple[float, float] | None = None
+    velocity_limit: float | None = None
+    effort_limit: float | None = None
+    has_position_sensor: bool = True
+    has_velocity_sensor: bool = True
+    has_torque_sensor: bool = False
+    backlash_estimate: float | None = None
+    actuator_kind: (
+        Literal["dc", "bldc", "stepper", "servo", "tendon", "hydraulic", "pneumatic"] | None
+    ) = None
+    sim_joint_name: str | None = None
+    role: JointRole = "unknown"
+
+
+class EndEffectorSpec(BaseModel):
+    """End-effector specification.
+
+    Attributes:
+        name: End-effector name.
+        kind: Type of end-effector.
+        hand: Laterality.
+        n_dof: Number of controllable degrees of freedom.
+        max_grip_force_n: Maximum grip force in Newtons.
+        max_payload_kg: Maximum payload in kg.
+        workspace_radius_m: Reach radius in meters.
+        tactile_sensors: List of tactile SensorSpec names attached to this EE.
+        actuated: Whether the end-effector is driven by an actuator.
+            False for passive tools (inert flanges,
+            magnetic plates without electromagnet, kinematic-only
+            mounts). When False, the safety kernel rejects any
+            chunk addressed at this EE — the chunk routes to a
+            no-op rather than risking unintended motion. Default
+            True: every actuated gripper / dexterous hand / suction
+            cup we ship is driven.
+    """
+
+    name: str
+    kind: Literal["parallel_gripper", "suction", "dexterous_hand", "tool", "none"]
+    hand: Hand = Hand.NA
+    n_dof: int = 1
+    max_grip_force_n: float | None = None
+    max_payload_kg: float | None = None
+    workspace_radius_m: float | None = None
+    tactile_sensors: list[str] = Field(default_factory=list)
+    actuated: bool = True
+
+
+# ─── Capabilities ──────────────────────────────────────────────────────────────
+
+LocomotionKind: TypeAlias = Literal["bipedal", "quadruped", "wheeled", "tracked", "none"]
+
+# cuMotion (Isaac ROS) GPU floor for the MoveIt planner gate. cuRobo
+# needs an Ampere-or-newer GPU, CUDA toolkit >= 13, and a nominal 8 GB card.
+# Nominal-8 GB GPUs report ~7.99 GiB (the probe divides MiB by 1024), so the
+# VRAM floor sits just below 8.0 GiB rather than at it — otherwise a real 8 GB
+# card (e.g. RTX 4070 Laptop, 8188 MiB -> 7.996 GiB) would be wrongly excluded.
+_CUMOTION_MIN_COMPUTE_CAPABILITY: tuple[int, int] = (8, 0)
+_CUMOTION_MIN_CUDA_MAJOR: int = 13
+_CUMOTION_MIN_VRAM_GIB: float = 7.5
+
+
+def _cuda_major(version: str) -> int | None:
+    """Return the leading integer of a CUDA toolkit version string, or ``None``.
+
+    Accepts forms like ``"13"``, ``"13.2"``, ``"13.0.1"``; returns ``None`` for
+    anything without a leading integer.
+    """
+    head = version.strip().split(".", 1)[0]
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
+class ComputeSpec(BaseModel):
+    """Compute profile for one deployment tier — runtime inference and GPU capabilities.
+
+    Used for all three deployment tiers:
+
+    * **Edge** — on-robot SoC (Jetson AGX Orin, NVIDIA Thor).
+    * **Local** — laptop / workstation tethered to the robot or running the simulation.
+    * **Cloud** — remote GPU node reachable via SSH or HTTP.
+
+    Attached to ``RobotDescription`` as ``compute_edge``, ``compute_local``,
+    and ``compute_cloud``.  Consumed by ``rSkill.check_runtime`` and
+    ``rSkill.check_quantization_dtype`` to match ``RSkillManifest.runtime`` /
+    ``quantization.dtype`` against what the hardware can actually execute.
+
+    Attributes:
+        compute_tops: Peak compute in INT8 TOPS (0 = unknown).
+        system_memory_gb: Total system / unified RAM in GB (0 = unknown).
+        num_gpus: Number of GPUs on this node (default 1; use > 1 for cloud
+            multi-GPU pods — total VRAM budget = ``gpu_vram_gb * num_gpus``).
+        gpu_vram_gb: VRAM of a single GPU in GB (0 when no discrete GPU).
+        cuda_compute_capability: Highest CUDA compute capability (major, minor),
+            e.g. ``(8, 9)`` for Ada Lovelace, ``(10, 0)`` for Blackwell.
+            ``None`` on non-CUDA hosts.
+        cuda_toolkit_version: ``nvcc`` version string, e.g. ``"12.4"``.
+            ``None`` when CUDA is absent or the version cannot be determined.
+        tensorrt_version: TensorRT runtime version string when importable.
+        gpu_supported_runtimes: Inference runtimes the hardware can execute,
+            used by ``rSkill.check_capabilities`` to match
+            ``RSkillManifest.runtime``.  Empty list = "unknown — skip check".
+        gpu_supported_dtypes: Quantization dtypes the accelerator supports
+            (derived from CUDA compute capability or platform).  Empty =
+            "unknown — skip check".
+        nvmm_available: Whether ``libnvbufsurface.so`` is present on this node
+            (Tegra L4T multimedia stack).  ``True`` enables the NVMM zero-copy
+            sensor-ingest path; probed on all tiers and returns ``False``
+            gracefully when the library is absent.
+        endpoint: Remote access address for cloud / SSH nodes.
+            Format: ``ssh://user@host[:port]`` or ``https://host:port``.
+            ``None`` for edge and local nodes.
+        network_latency_ms: Measured round-trip latency to this node in ms.
+            Populated by the SSH probe; ``None`` for local/edge (no network hop).
+            Used by the reasoner dispatcher to decide whether cloud dispatch
+            fits within a skill's latency budget.
+
+    Example:
+        >>> spec = ComputeSpec(
+        ...     gpu_vram_gb=24.0,
+        ...     cuda_compute_capability=(8, 9),
+        ...     cuda_toolkit_version="13.2",
+        ... )
+        >>> spec.supports_cumotion()
+        True
+    """
+
+    compute_tops: float = 0.0
+    system_memory_gb: float = 0.0
+    num_gpus: int = 1
+    gpu_vram_gb: float = 0.0
+    cuda_compute_capability: tuple[int, int] | None = None
+    cuda_toolkit_version: str | None = None
+    tensorrt_version: str | None = None
+    gpu_supported_runtimes: list[RSkillRuntime] = Field(default_factory=list)
+    gpu_supported_dtypes: list[QuantizationDtype] = Field(default_factory=list)
+    nvmm_available: bool = False
+    endpoint: str | None = None
+    network_latency_ms: float | None = None
+
+    def supports_cumotion(self) -> bool:
+        """Whether this compute spec meets the cuMotion (Isaac ROS) GPU floor.
+
+        cuMotion's CUDA motion planner requires an Ampere-or-newer GPU (compute
+        capability >= 8.0), CUDA toolkit >= 13.0, and a nominal 8 GB card. The
+        MoveIt planner gate uses this to choose the cuMotion planning pipeline;
+        when ``False`` it falls back to OMPL.
+
+        Returns:
+            ``True`` only when compute capability, CUDA toolkit version, and
+            VRAM all clear the cuMotion floor. ``False`` on any non-CUDA host or
+            when the CUDA toolkit version is unknown (the floor cannot be
+            confirmed, so the gate stays closed).
+        """
+        if self.cuda_compute_capability is None:
+            return False
+        if self.cuda_compute_capability < _CUMOTION_MIN_COMPUTE_CAPABILITY:
+            return False
+        if self.cuda_toolkit_version is None:
+            return False
+        cuda_major = _cuda_major(self.cuda_toolkit_version)
+        if cuda_major is None or cuda_major < _CUMOTION_MIN_CUDA_MAJOR:
+            return False
+        return self.gpu_vram_gb >= _CUMOTION_MIN_VRAM_GIB
+
+
+class RobotCapabilities(BaseModel):
+    """Physical capability flags for a robot body.
+
+    Describes what the *robot* can do (sensors, actuation, embodiment tags).
+    Runtime compute / GPU properties live on ``ComputeSpec`` and are
+    attached to the ``RobotDescription`` via its ``compute`` field.
+
+    Attributes:
+        locomotion: Locomotion types available.
+        can_lift_kg: Maximum payload in kg.
+        has_dexterous_hands: Whether dexterous hands are present.
+        has_tactile: Whether tactile sensing is available.
+        has_force_control: Whether force/impedance control is supported.
+        has_vision: Whether camera(s) are present.
+        has_lidar: Whether LiDAR is present. Gates the 2D-lidar
+            ``slam_toolbox`` backend.
+        has_vision_slam: Whether the robot should run camera-based visual
+            SLAM (cuVSLAM + nvblox) for localization/mapping, for robots
+            that lack a lidar. Gates the visual SLAM backend.
+            Independent of ``has_lidar``; when both are set the lidar
+            backend wins (it does not require an AI depth model).
+        has_audio: Whether audio I/O is present.
+        bimanual: Whether the robot has two arms.
+        supported_control_modes: List of supported ControlMode values.
+        supported_vla_embodiments: VLA embodiment IDs this robot can run.
+        embodiment_tags: Short tags mapping to VLA heads / dataset splits.
+    """
+
+    locomotion: list[LocomotionKind] = Field(
+        default_factory=lambda: ["none"]  # type: ignore[arg-type]  # reason: ["none"] satisfies LocomotionKind at runtime; cast would be noisier
+    )
+    can_lift_kg: float = 0.0
+    has_dexterous_hands: bool = False
+    has_tactile: bool = False
+    has_force_control: bool = False
+    has_vision: bool = True
+    has_lidar: bool = False
+    has_vision_slam: bool = False
+    has_audio: bool = False
+    bimanual: bool = False
+    supported_control_modes: list[ControlMode] = Field(default_factory=list)
+    supported_vla_embodiments: list[str] = Field(default_factory=list)
+    embodiment_tags: list[str] = Field(default_factory=list)
+
+
+# ─── Safety ────────────────────────────────────────────────────────────────────
+
+
+class SafetyEnvelope(BaseModel):
+    """Safety constraints enforced by the C++ safety kernel.
+
+    Attributes:
+        workspace_box_min_xyz: Lower corner of allowed workspace (m).
+        workspace_box_max_xyz: Upper corner of allowed workspace (m).
+        no_go_zones: List of polygon definitions (dicts with 'vertices').
+        max_ee_speed_m_s: Maximum end-effector linear speed in m/s.
+            Also used by the per-control-mode supervisor as the
+            CARTESIAN_TWIST linear bound.
+        max_ee_accel_m_s2: Maximum end-effector acceleration in m/s².
+        max_joint_speed_factor: Fraction of joint velocity_limit allowed.
+        max_force_n: Maximum contact force in Newtons.
+        max_torque_nm: Maximum joint torque in Nm.
+        deadman_required: Whether a deadman switch is required.
+        e_stop_topic: ROS 2 topic for E-stop commands.
+        e_stop_qos: QoS profile for E-stop topic.
+        contact_force_threshold_n: Force threshold for contact detection.
+        cycle_time_violation_threshold_ms: Control cycle time violation threshold.
+        human_in_loop_required: rSkill names requiring human supervision.
+        max_cartesian_step_m: Per-control-mode supervisor bound —
+            per-step magnitude bound on
+            CARTESIAN_DELTA's xyz triplet (Euclidean). ``None`` means
+            "no per-mode check declared, skip"; today's behaviour
+            preserved. Robots that host OSC-trained checkpoints
+            (panda_mobile, future Franka + π0.7) declare this so the
+            supervisor rejects out-of-distribution arm deltas before
+            they reach the controller.
+        max_cartesian_step_rad: Per-control-mode supervisor bound —
+            per-step magnitude bound on
+            CARTESIAN_DELTA's axis-angle triplet (Euclidean). ``None``
+            skips the check.
+        max_ee_angular_speed_rad_s: Per-control-mode supervisor bound —
+            angular component bound
+            for CARTESIAN_TWIST (the linear bound reuses
+            ``max_ee_speed_m_s``). ``None`` skips the check.
+        max_base_linear_speed_m_s: Per-control-mode supervisor bound —
+            BODY_TWIST linear bound
+            (Euclidean over vx,vy,vz). ``None`` skips the check;
+            mobile manipulators / wheeled bases declare it.
+        max_base_angular_speed_rad_s: Per-control-mode supervisor bound —
+            BODY_TWIST angular
+            bound (Euclidean over wx,wy,wz; for planar bases only
+            wz is non-zero). ``None`` skips the check.
+        self_collision_margin_m: Clearance margin (m) for the
+            kernel's self/world/voxel geometric checks; a pair closer than
+            this fires. Default ``0.0`` (collide on touch). A small
+            **negative** value tolerates the grazing contact inherent to a
+            compact arm's in-distribution operating envelope (e.g. the
+            SO-101 pen VLA, whose links graze at true ≈ 0) while still
+            catching a real jam (deeper penetration). Loosening this is a
+            safety-WG decision and must be justified against the true
+            (non-convex mesh) envelope clearance, not the conservative
+            primitive distance.
+    """
+
+    workspace_box_min_xyz: tuple[float, float, float] | None = None
+    workspace_box_max_xyz: tuple[float, float, float] | None = None
+    no_go_zones: list[dict[str, object]] = Field(default_factory=list)
+    max_ee_speed_m_s: float = 0.5
+    max_ee_accel_m_s2: float = 1.0
+    max_joint_speed_factor: float = 0.7
+    max_force_n: float = 50.0
+    max_torque_nm: float = 10.0
+    deadman_required: bool = True
+    e_stop_topic: str = "/safety/e_stop"
+    e_stop_qos: Literal["reliable"] = "reliable"
+    contact_force_threshold_n: float = 30.0
+    cycle_time_violation_threshold_ms: float = 5.0
+    human_in_loop_required: list[str] = Field(default_factory=list)
+    # Per-control-mode bounds for the supervisor dispatch.
+    # All default to None so legacy behaviour is preserved: a robot
+    # that doesn't declare these gets its chunks passed through the
+    # per-mode check (cartesian / twist / gripper / etc.) verbatim, the
+    # same as today.
+    max_cartesian_step_m: float | None = None
+    max_cartesian_step_rad: float | None = None
+    max_ee_angular_speed_rad_s: float | None = None
+    max_base_linear_speed_m_s: float | None = None
+    max_base_angular_speed_rad_s: float | None = None
+    self_collision_margin_m: float = 0.0  # negative tolerates grazing
+
+
+# ─── VLA observation / action specs ────────────────────────────────────────────
+
+
+class StateRepresentation(str, Enum):
+    """State vector representation format."""
+
+    JOINT_POSITIONS = "joint_positions"
+    EEF_POS_AXISANGLE = "eef_pos_axisangle"
+    EEF_POS_EULER = "eef_pos_euler"
+    EEF_POS_QUAT = "eef_pos_quat"
+    EEF_POS_AXISANGLE_GRIPPER = "eef_pos_axisangle_gripper"
+
+
+class ActionRepresentation(str, Enum):
+    """Action vector representation format."""
+
+    JOINT_POSITIONS = "joint_positions"
+    JOINT_VELOCITIES = "joint_velocities"
+    DELTA_EE_6D_PLUS_GRIPPER = "delta_ee_6d_plus_gripper"
+    DELTA_EE_6D = "delta_ee_6d"
+    # 3-D end-effector translation delta (dx, dy, dz) + 1 gripper scalar = 4-D.
+    # The MetaWorld mocap controller and similar planar-reach envs drive only EE
+    # translation, not orientation. Distinct from the 6-D
+    # variants so the derived cartesian segment is 3 wide, not 6.
+    DELTA_EE_3D_PLUS_GRIPPER = "delta_ee_3d_plus_gripper"
+    CARTESIAN_POSE = "cartesian_pose"
+
+
+class JointUnits(str, Enum):
+    """Angular units a joint-position checkpoint was trained in.
+
+    A joint-position VLA consumes state and emits actions in ONE angular
+    convention (whatever its training dataset recorded). openral's
+    ``JointState`` / ``Action`` contract is **radians**, so the
+    skill_runner must convert deg<->rad at the policy boundary when the
+    checkpoint is in degrees. Getting this wrong is not subtle: feeding a
+    degrees-trained policy radians makes every observation ~57x too small
+    (out-of-distribution -> garbage actions), and emitting its degree actions
+    as radians makes the HAL command ~57x too large (the arm slams its
+    limits). Declaring it on the manifest removes the fragile runtime guess.
+    """
+
+    DEGREES = "degrees"
+    RADIANS = "radians"
+
+
+class RSkillAction(str, Enum):
+    """Closed vocabulary of high-level action verbs an rSkill can perform.
+
+    Declared on ``RSkillManifest.actions`` so the reasoner's LLM tool
+    palette can present each skill with a structured "what does it do"
+    label, in addition to the free-form ``description`` and the slug.
+    The LLM scores tools primarily on natural-language description, but
+    a closed verb vocabulary lets the palette pre-filter and lets the
+    schema be unit-testable. New entries are additive.
+
+    Categories (descriptive only — not part of the wire format):
+
+    - Manipulation primitives: ``PICK``, ``PLACE``, ``PICK_AND_PLACE``,
+      ``TRANSFER``, ``GRASP``, ``RELEASE``.
+    - Articulated / contact-rich: ``OPEN``, ``CLOSE``, ``PUSH``, ``PULL``,
+      ``SLIDE``, ``INSERT``, ``POUR``, ``WIPE``, ``ROTATE``.
+    - Motion: ``REACH``; ``LOOK`` (aim a camera at a point).
+    - Mobile (for mobile-manipulator embodiments): ``NAVIGATE``.
+    - Social / expressive: ``WAVE``, ``SHAKE``.
+    - Generalist marker: ``GENERALIST`` for foundation / multi-task
+      checkpoints (e.g. RoboCasa-365, DROID, MetaWorld-MT50). The palette
+      surfaces a generalist skill for goals that don't match a specific
+      verb.
+    - Perception / reasoning (non-actuating S2 kinds): ``DETECT`` (detector),
+      ``QUERY`` (scene VLM), ``MONITOR`` (reward monitor),
+      ``PLAN`` (playbook decision procedure). These verbs are
+      registry/discovery metadata only — their skills are reached via
+      read-only reasoner tools or system-prompt injection, never an
+      ``ExecuteRskill`` dispatch.
+    """
+
+    PICK = "pick"
+    PLACE = "place"
+    PICK_AND_PLACE = "pick_and_place"
+    TRANSFER = "transfer"
+    GRASP = "grasp"
+    RELEASE = "release"
+    OPEN = "open"
+    CLOSE = "close"
+    PUSH = "push"
+    PULL = "pull"
+    SLIDE = "slide"
+    INSERT = "insert"
+    POUR = "pour"
+    WIPE = "wipe"
+    ROTATE = "rotate"
+    REACH = "reach"
+    LOOK = "look"
+    NAVIGATE = "navigate"
+    WAVE = "wave"
+    SHAKE = "shake"
+    GENERALIST = "generalist"
+    DETECT = "detect"
+    QUERY = "query"
+    MONITOR = "monitor"
+    PLAN = "plan"
+
+
+class ObservationSpec(BaseModel):
+    """VLA observation configuration for this robot.
+
+    Attributes:
+        state_key: Observation dict key for the state vector.
+        state_shape: Shape of the state tensor, e.g. ``(6,)`` for 6-D EEF.
+        state_representation: How the state vector is encoded.
+        image_flip_180: Whether camera images need 180° rotation before
+            feeding to the VLA (common for wrist-mounted cameras).
+    """
+
+    state_key: str = "observation.state"
+    state_shape: tuple[int, ...] = ()
+    state_representation: StateRepresentation | None = None
+    image_flip_180: bool = False
+
+
+class ActionSpec(BaseModel):
+    """VLA action configuration for this robot.
+
+    Attributes:
+        dim: Dimensionality of the action vector.
+        representation: How the action vector is encoded.
+        control_freq_hz: Control frequency the actions are executed at.
+        chunk_size: Number of action steps per inference call (chunk size H).
+    """
+
+    dim: int
+    representation: ActionRepresentation | None = None
+    control_freq_hz: float | None = None
+    chunk_size: int | None = None
+
+
+# ─── Robot description (top-level) ─────────────────────────────────────────────
+
+
+class GripperReadMode(str, Enum):
+    """How ``openral_hal.MujocoArmHAL`` reports the gripper qpos.
+
+    ``SUM_OVER_SCALE`` (default) — ``clip(sum(qpos[addrs]) / scale, 0, 1)``.
+      Matches the Franka parallel gripper where two finger qpos are summed
+      and divided by ``2 * max_finger_extent`` (=0.08 m for Panda).  Public
+      surface is normalised ``[0, 1]``.
+    ``AFFINE_LOW_HIGH`` — ``(qpos[addrs[0]] - ctrl_range[0]) / (ctrl_range[1] - ctrl_range[0])``.
+      Used by the SO-100 menagerie ``Jaw`` joint, a 1-DoF revolute with a
+      non-zero closed position (``-0.174`` rad).  Public surface is
+      normalised ``[0, 1]``.
+    ``PASSTHROUGH`` — ``qpos[addrs[0]]`` reported verbatim, in the same
+      physical units as the MJCF (metres for Aloha prismatic fingers,
+      radians for OpenArm revolute jaws).  The public surface is **not**
+      ``[0, 1]`` — Skills must accept the raw range.
+    """
+
+    SUM_OVER_SCALE = "sum_over_scale"
+    AFFINE_LOW_HIGH = "affine_low_high"
+    PASSTHROUGH = "passthrough"
+
+
+class GripperWriteMode(str, Enum):
+    """How ``openral_hal.MujocoArmHAL`` maps an Action's gripper value to ``ctrl``.
+
+    ``NORMALISED`` (default) — input is ``[0, 1]``, mapped affinely to
+      ``ctrl_range``.  ``low`` ↔ closed (Action.gripper = 0), ``high`` ↔
+      open (Action.gripper = 1).
+    ``PASSTHROUGH`` — input is in the same physical units as ``ctrl_range``
+      (metres / radians), written directly to ``ctrl``.  MuJoCo's actuator
+      ``ctrlrange`` does the clipping.  Used by Aloha (positive-finger
+      metres) and OpenArm (jaw radians).
+    """
+
+    NORMALISED = "normalised"
+    PASSTHROUGH = "passthrough"
+
+
+class SimGripperDescription(BaseModel):
+    """Gripper wiring inside a MuJoCo MJCF.
+
+    Attributes:
+        joint: Name of the gripper joint as it appears in
+            ``RobotDescription.joints`` (the public, lerobot-style name —
+            not the menagerie MJCF name).
+        ctrl_range: ``(low, high)`` raw control range for the gripper
+            actuator.  In ``NORMALISED`` write mode, ``low`` ↔ closed
+            (Action.gripper = 0), ``high`` ↔ open (Action.gripper = 1).  In
+            ``PASSTHROUGH`` write mode this is informational — MuJoCo clips
+            on its own.
+        qpos_addrs: ``qpos`` indices used to compute the reported gripper
+            position.  When the gripper has multiple finger joints (Franka),
+            list every finger's qpos index.
+        qpos_scale: Span used to normalise the summed/raw gripper qpos to
+            ``[0, 1]``.  For Franka with two fingers each in ``[0, 0.04]`` m,
+            ``qpos_scale = 0.08``.  Ignored by ``AFFINE_LOW_HIGH`` and
+            ``PASSTHROUGH`` read modes but kept for symmetry with the
+            base-class invariant.
+        read_mode: How to report the qpos — see ``GripperReadMode``.
+        write_mode: How to map an Action's gripper value to ``ctrl`` — see
+            ``GripperWriteMode``.
+        actuator_index: Explicit MJCF actuator index that receives the
+            (mapped) gripper command.  When omitted, defaults to the
+            position of ``joint`` in ``RobotDescription.joints``
+            (i.e. the 1:1 mapping derived by ``SimDescription`` for arm
+            joints).
+        mirror_actuator_index: Optional second actuator that receives the
+            **negation** of the (mapped) gripper command.  Models the
+            Aloha parallel jaws where one motor drives ``+x`` and the
+            other ``-x`` to keep the fingers symmetric.  ``None`` for
+            single-actuator grippers.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    joint: str
+    ctrl_range: tuple[float, float]
+    qpos_addrs: tuple[int, ...]
+    qpos_scale: float
+    read_mode: GripperReadMode = GripperReadMode.SUM_OVER_SCALE
+    write_mode: GripperWriteMode = GripperWriteMode.NORMALISED
+    actuator_index: int | None = None
+    mirror_actuator_index: int | None = None
+
+
+# The single description-asset ref grammar. The schema validator
+# below only checks the ref *string* shape (cheap, no I/O); the resolver in
+# ``openral_core.assets`` does the file resolution. Both must accept the same
+# schemes, so keep these in lock-step with ``openral_core.assets``.
+_ASSET_SCHEMES = ("rd:", "file:", "gym_aloha:", "openarm:", "menagerie:")
+_ROS2_DYNAMIC = "ros2://robot_description"
+
+
+def _validate_ref(v: str) -> str:
+    """Reject any asset ref that is neither the dynamic marker nor a known scheme."""
+    if v == _ROS2_DYNAMIC or v.startswith(_ASSET_SCHEMES):
+        return v
+    raise ValueError(
+        f"asset ref {v!r} must start with one of {_ASSET_SCHEMES} or be {_ROS2_DYNAMIC!r}"
+    )
+
+
+class UrdfAsset(BaseModel):
+    """A URDF asset reference plus its ``robot_state_publisher`` wiring.
+
+    The ``ref`` is resolved by
+    ``openral_core.assets.resolve_asset``; ``root_frame`` and
+    ``base_to_root_xyz_rpy`` carry the static transform that bridges a URDF
+    whose root link differs from the robot's ``base_frame`` (e.g. Franka's
+    ``panda_link0`` mounted onto a ``base_link`` mobile platform).
+
+    Attributes:
+        ref: Asset reference (``rd:<module>``, ``file:<relpath>``, or
+            ``ros2://robot_description`` for runtime topic-supplied URDFs).
+        root_frame: The URDF's root link name when it differs from
+            ``RobotDescription.base_frame``. ``None`` → the URDF root
+            equals ``base_frame`` (no static transform needed).
+        base_to_root_xyz_rpy: The 6-DoF transform ``[x, y, z, roll, pitch,
+            yaw]`` (metres + radians) published via
+            ``static_transform_publisher`` to bridge ``base_frame`` to
+            ``root_frame``. ``None`` when ``root_frame`` is ``None``.
+
+    Example:
+        >>> UrdfAsset(ref="rd:panda_description", root_frame="panda_link0").root_frame
+        'panda_link0'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ref: str
+    root_frame: str | None = None
+    base_to_root_xyz_rpy: tuple[float, float, float, float, float, float] | None = None
+
+    @field_validator("ref")
+    @classmethod
+    def _validate_urdf_ref(cls, v: str) -> str:
+        return _validate_ref(v)
+
+
+class AssetRefs(BaseModel):
+    """The unified description-asset block on ``RobotDescription``.
+
+    Replaces the scattered ``urdf_path`` / ``mjcf_uri`` /
+    ``srdf_path`` (+ the earlier URDF-root fields) with one block whose refs
+    share the ``openral_core.assets.resolve_asset`` grammar.
+
+    Attributes:
+        urdf: URDF asset (with optional ``robot_state_publisher`` wiring),
+            or ``None`` when the robot ships no URDF.
+        mjcf: MJCF asset ref (MuJoCo wiring), or ``None``.
+        srdf: SRDF asset ref whose ``disable_collisions`` block seeds
+            ``RobotDescription.allowed_collision_pairs``, or ``None``.
+
+    Example:
+        >>> AssetRefs(urdf=UrdfAsset(ref="rd:panda_description")).urdf.ref
+        'rd:panda_description'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    urdf: UrdfAsset | None = None
+    mjcf: str | None = None
+    srdf: str | None = None
+
+    @field_validator("mjcf", "srdf")
+    @classmethod
+    def _validate_optional_ref(cls, v: str | None) -> str | None:
+        return None if v is None else _validate_ref(v)
+
+
+class SimDescription(BaseModel):
+    """MuJoCo wiring for a single-arm robot, consumed by ``MujocoArmHAL``.
+
+    The MJCF itself is named by ``RobotDescription.assets.mjcf``;
+    this block carries only the joint↔qpos/qvel/actuator
+    plumbing. All fields are optional with defaults derived from
+    ``RobotDescription.joints``.  The default mapping is "1:1 in joint
+    order, offset by 7 (qpos) / 6 (qvel) if ``floating_base`` is True" —
+    which is correct for every robot in the open core today bar minor
+    gripper bookkeeping.
+
+    Attributes:
+        floating_base: If True, the robot's MJCF has a 6-DoF free joint
+            before the actuated joints (humanoids).  In that case the
+            default ``joint_qpos_addr[joints[i].name] = 7 + i`` and
+            ``joint_qvel_addr[joints[i].name] = 6 + i``.
+        joint_qpos_addr: Optional override of the joint→qpos-index map.
+            When omitted, the default 1:1 mapping is used.
+        joint_qvel_addr: Optional override of the joint→qvel-index map.
+            When omitted, defaults to ``joint_qpos_addr`` (or its default).
+        actuator_index: Optional override of the joint→actuator-index map.
+            When omitted, defaults to the 1:1 mapping ``joints[i].name → i``.
+        grippers: Optional list of ``SimGripperDescription`` entries.
+            Each must reference a joint by name that is also present in
+            ``RobotDescription.joints``.  Single-arm robots have one
+            entry (or none); bimanual robots have two (left + right).
+        settle_steps_default: Default number of ``mj_step`` calls executed
+            per ``MujocoArmHAL.send_action``.  Defaults to 1.
+        keyframe_index: When set, ``MujocoArmHAL.connect`` calls
+            ``mj_resetDataKeyframe(model, data, keyframe_index)`` before
+            ``mj_forward``.  Required for MJCFs whose default
+            ``MjData.qpos`` (zeros) sits outside the actuator
+            ``ctrlrange`` — e.g. the gym-aloha parallel jaws, whose
+            fingers have ``ctrlrange=[0.021, 0.057]`` and never recover
+            from qpos = 0.
+        seed_ctrl_from_qpos: When True, ``MujocoArmHAL.connect``
+            seeds ``data.ctrl[actuator] = data.qpos[joint_qpos_addr]``
+            for every controllable joint so position actuators hold the
+            initial pose on the first ``mj_step``.  Required by the
+            OpenArm v2 MJCF (its position actuators with per-class PD
+            gains will drive ``qpos`` to ``ctrl == 0`` otherwise).
+
+    Example:
+        >>> SimDescription(floating_base=True).floating_base
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    floating_base: bool = False
+    joint_qpos_addr: dict[str, int] | None = None
+    joint_qvel_addr: dict[str, int] | None = None
+    actuator_index: dict[str, int] | None = None
+    grippers: list[SimGripperDescription] = Field(default_factory=list)
+    settle_steps_default: int = Field(default=1, ge=1)
+    keyframe_index: int | None = None
+    seed_ctrl_from_qpos: bool = False
+
+
+class TopCameraDefaults(BaseModel):
+    """Default placement for the scene-level "top" (a.k.a. "base") camera.
+
+    Per-robot scene defaults consumed by sim backends that render an
+    overview camera (today: the ``openarm_tabletop_pnp`` scene). The
+    values describe a look-at camera pointed from ``pos`` toward
+    ``target`` with vertical field-of-view ``fovy`` in degrees.
+
+    Backend YAML overrides (``scene.backend_options.top_camera_*``) still
+    win — this submodel is the *default* fed to the composer when no
+    override is set, replacing the previous module-level constants in
+    ``openral_sim.backends.openarm_robosuite._assets``.
+
+    Attributes:
+        pos: ``(x, y, z)`` world-frame camera position in metres.
+        target: ``(x, y, z)`` world-frame look-at point in metres.
+        fovy: Vertical field-of-view in degrees.
+
+    Example:
+        >>> TopCameraDefaults(pos=(0.2, 0.0, 0.95), target=(0.65, 0.0, 0.05), fovy=65.0).fovy
+        65.0
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pos: tuple[float, float, float]
+    target: tuple[float, float, float]
+    fovy: float = Field(gt=0.0, lt=180.0)
+
+
+class SceneComposition(BaseModel):
+    """Declarative MJCF scene composition for a manifest-driven HAL.
+
+    Lets a robot whose sim HAL needs a *composed* MJCF (a bare arm spliced onto
+    a tabletop + props) declare the composer in its manifest instead of a
+    bespoke ``_create_hal`` lifecycle subclass (issue #191 Phase 3b). The
+    manifest-driven node calls ``composer`` before constructing the HAL and
+    threads the resulting MJCF path in as the HAL's ``mjcf_path``.
+
+    The composer is a ``"module.path:function"`` import string. The function is
+    called with ``**params`` and MUST return ``(xml: str, meshdir: Path)`` — the
+    composed MJCF XML and the mesh directory it references (the node writes the
+    XML next to ``meshdir`` so relative mesh paths resolve). Today's only
+    composer is ``openral_sim.backends.openarm_robosuite._assets:compose_openarm_tabletop_mjcf``.
+
+    Attributes:
+        composer: ``"module.path:function"`` returning ``(xml, meshdir)``.
+        params: Keyword arguments for the composer (e.g. ``robot_lift_z``,
+            ``white_background``).
+
+    Example:
+        >>> sc = SceneComposition(
+        ...     composer="pkg.scenes:compose_tabletop",
+        ...     params={"robot_lift_z": 0.36, "white_background": True},
+        ... )
+        >>> sc.params["robot_lift_z"]
+        0.36
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    composer: str
+    params: dict[str, object] = Field(default_factory=dict)
+
+
+class SceneDefaults(BaseModel):
+    """Per-robot scene rendering defaults.
+
+    These are values that scene composers may consult when the
+    ``SimScene`` YAML does not override them. Today the
+    only field is ``top_camera``, which the
+    ``openarm_tabletop_pnp`` backend consumes; future scenes can extend
+    this submodel as new defaults are pulled out of backend hardcodes.
+
+    Attributes:
+        top_camera: Default placement for the scene-overview camera.
+
+    Example:
+        >>> sd = SceneDefaults(
+        ...     top_camera=TopCameraDefaults(
+        ...         pos=(0.2, 0.0, 0.95),
+        ...         target=(0.65, 0.0, 0.05),
+        ...         fovy=65.0,
+        ...     ),
+        ... )
+        >>> sd.top_camera.pos
+        (0.2, 0.0, 0.95)
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    top_camera: TopCameraDefaults | None = None
+    # issue #191 Phase 3b — declarative MJCF scene composition (openarm tabletop).
+    # The manifest-driven node composes the MJCF before building the HAL.
+    composition: SceneComposition | None = None
+
+
+# ─── Collision geometry ─────────────────────────────────────────────
+
+
+class SphereShape(BaseModel):
+    """Sphere collision primitive — the simplest convex link/obstacle volume.
+
+    Attributes:
+        shape: Discriminator (always ``"sphere"``).
+        radius_m: Sphere radius in metres.
+
+    Example:
+        >>> SphereShape(radius_m=0.05).shape
+        'sphere'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    shape: Literal["sphere"] = "sphere"
+    radius_m: float = Field(gt=0.0)
+
+
+class CapsuleShape(BaseModel):
+    """Capsule collision primitive — a segment swept by a radius.
+
+    The central segment runs along the local +Z axis from ``-length_m / 2``
+    to ``+length_m / 2`` (the MJCF / URDF capsule convention); it is placed
+    and oriented by the owning frame (``LinkCollisionGeometry.origin_xyz_rpy``
+    for a link, ``WorldCollisionPrimitive.pose`` for an obstacle).
+    Capsules bound most robot links tightly, so the safety check stays
+    conservative.
+
+    Attributes:
+        shape: Discriminator (always ``"capsule"``).
+        radius_m: Capsule radius in metres.
+        length_m: Length of the central segment in metres (the cylinder
+            portion; the total span is ``length_m + 2 * radius_m``). ``0.0``
+            degenerates to a sphere.
+
+    Example:
+        >>> CapsuleShape(radius_m=0.04, length_m=0.3).length_m
+        0.3
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    shape: Literal["capsule"] = "capsule"
+    radius_m: float = Field(gt=0.0)
+    length_m: float = Field(ge=0.0)
+
+
+class BoxShape(BaseModel):
+    """Oriented box (OBB) collision primitive — a rectangular convex block.
+
+    An axis-aligned box in the primitive's local frame (placed and oriented by
+    the owning frame's ``origin_xyz_rpy`` / ``pose``), spanning
+    ``[-half_extents_m[k], +half_extents_m[k]]`` along each local axis ``k``.
+
+    A box fits a *blocky* link (a near-cubic housing, e.g. the SO-ARM100/101
+    ``base``) far tighter than a capsule: a capsule's circular cross-section
+    must bulge past the block's flat faces, so it over-reports clearance at
+    poses where the flat faces are what actually face a neighbour. That bulge
+    is what makes the manifest capsule model false-E-stop the SO-101 at its
+    home pose (base↔lower_arm / base↔wrist reported penetrating while the true
+    mesh clearance is +0.16 m / +0.24 m). See issue #84.
+
+    Attributes:
+        shape: Discriminator (always ``"box"``).
+        half_extents_m: Half-sizes ``(hx, hy, hz)`` along the local x/y/z axes
+            in metres (the full box is ``2*hx x 2*hy x 2*hz``).
+
+    Example:
+        >>> BoxShape(half_extents_m=(0.055, 0.048, 0.036)).shape
+        'box'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    shape: Literal["box"] = "box"
+    half_extents_m: tuple[PositiveFloat, PositiveFloat, PositiveFloat]
+
+
+CollisionShape: TypeAlias = Annotated[
+    CapsuleShape | SphereShape | BoxShape, Field(discriminator="shape")
+]
+"""Discriminated union of convex collision primitives.
+
+Discriminator field is ``shape``. Used by ``LinkCollisionGeometry``
+(robot links), ``WorldCollisionPrimitive`` (world obstacles) and
+``AttachedCollisionPrimitive`` (carried payloads). Mesh primitives are
+excluded — the allocation-free safety kernel checks only convex analytic
+shapes; mesh-accurate collision is a planning-layer concern.
+
+Notes:
+
+- Validating a mapping requires the ``shape`` key; an untagged dict (e.g.
+  ``{"radius_m": ...}``) is rejected with ``union_tag_not_found`` rather than
+  structurally guessed. Every ``robots/`` manifest already writes the tag.
+- Constructing a member directly is unaffected: ``BoxShape(...)`` still fills
+  ``shape="box"`` from its default.
+- Never dump a shape with ``exclude_defaults=True`` — it drops the tag and
+  the result no longer re-validates.
+"""
+
+
+DOP_AXES: tuple[tuple[float, float, float], ...] = (
+    (1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+    (0.0, 0.0, 1.0),
+    (0.5773502691896258, 0.5773502691896258, 0.5773502691896258),
+    (0.5773502691896258, 0.5773502691896258, -0.5773502691896258),
+    (0.5773502691896258, -0.5773502691896258, 0.5773502691896258),
+    (0.5773502691896258, -0.5773502691896258, -0.5773502691896258),
+    (0.7071067811865476, 0.7071067811865476, 0.0),
+    (0.7071067811865476, -0.7071067811865476, 0.0),
+    (0.7071067811865476, 0.0, 0.7071067811865476),
+    (0.7071067811865476, 0.0, -0.7071067811865476),
+    (0.0, 0.7071067811865476, 0.7071067811865476),
+    (0.0, 0.7071067811865476, -0.7071067811865476),
+)
+"""The 26-DOP's 13 unit axis directions, in the owning box's own local frame.
+
+Deliberate mirror of ``kDopAxis`` in
+``cpp/openral_safety_kernel/include/openral_safety_kernel/collision.hpp``: the
+manifest and the kernel must index the same slab with the same direction, or
+the containment proof recorded in one does not transfer to the other. See
+``docs/methods/14-duplication-watch.md``.
+
+The first three entries **are** the box's own axes, which is load-bearing
+rather than cosmetic: a 26-DOP lies inside its own first three slabs, so
+checking those three against the box's half-extents proves containment for the
+whole polytope without enumerating a single vertex.
+"""
+
+MAX_TIGHT_HULL_VERTICES = 320
+"""Ceiling on a stage-2 hull's vertex count, mirroring ``kMaxTightHullVertices``.
+
+A cost bound set by measurement, not a geometry choice: the kernel's stage-2
+support function is an exhaustive scan (the only form whose result is provably
+the true support, which is what keeps its distance bound sound), so its cost is
+linear in the vertex count and the staged path stops paying for itself past
+roughly this many vertices. See ``docs/reference/collision-hull-narrow-phase.md``.
+"""
+
+TIGHT_CONTAINMENT_EPSILON_M = 1e-9
+"""Floating-point slack when checking a hull vertex against its own DOP slab.
+
+Mirrors ``kTightContainmentEpsilonM``. The slab bound is the maximum of ``u·x``
+over the same vertex set, so the relation is an equality on at least one vertex
+per axis and the only open question is evaluation order. One nanometre buys
+numerical agreement, not geometric room.
+"""
+
+
+class TightCollisionGeometry(BaseModel):
+    """Tight convex geometry refining a link's ``BoxShape`` for the kernel's narrow phases.
+
+    The safety kernel's arm-link-vs-world-voxel check runs a **staged** narrow
+    phase when a link declares this: a 26-DOP separating-axis bound on every
+    occupied cell, then GJK on the link's exact convex hull for the cells the
+    DOP cannot clear. Self-collision does the same for a box pair the OBBs
+    cannot separate, when *both* links declare a stage-2 hull — which retired
+    the ``panda_link5``/``panda_link7`` allowed-collision exemption (issue
+    #191). Both stages are strict subsets of the box they refine, so the
+    broad-phase window (sized from ``half_extents_m`` alone) does not move.
+    Expressed in the box's own local frame (``LinkCollisionGeometry.origin_xyz_rpy``).
+
+    Containment is checked here, again by the kernel at ``on_configure``
+    (``validate_tight_geometry``), and once more against the real source mesh
+    by ``tests/unit/test_collision_tight_geometry.py`` — **definitional
+    rather than fitted**: the slabs are tangent halfspaces ``u·x <= max over
+    the mesh of u·x``, the hull is ``conv(vertices)`` of the mesh, no
+    optimiser tolerance anywhere.
+
+    Generated by ``tools/generate_tight_geometry.py``; not hand-authored.
+
+    Attributes:
+        dop_lo_m: Per-axis lower slab bound along ``DOP_AXES``, 13 entries.
+        dop_hi_m: Per-axis upper slab bound, 13 entries.
+        hull_vertices_m: Exact convex-hull vertices in the box frame, at most
+            ``MAX_TIGHT_HULL_VERTICES`` of them. **Empty means stage 1
+            only** — the DOP still tightens the check, but no exact test runs.
+            That is the representation a link whose hull is over the ceiling
+            gets, and it is a cost decision, not a safety one: the DOP is a
+            containing solid either way.
+        hull_overhang_m: How far the hull's surface reaches past the real
+            source mesh it was built from, sampled by
+            ``tools/generate_tight_geometry.py`` (issue #221). Containment
+            (``mesh ⊆ hull``) is proved elsewhere; this is the *other*
+            direction, and it is what an offline adjudicator needs to charge a
+            hull-fidelity self-collision stop an admissible gap instead of
+            leaving it unscorable. ``None`` when ``hull_vertices_m`` is empty,
+            or when the hull has no source mesh on disk to measure against —
+            never defaulted to ``0``, since that would silently claim a
+            perfect fit.
+
+    Example:
+        >>> t = TightCollisionGeometry(
+        ...     dop_lo_m=(-0.05,) * 13,
+        ...     dop_hi_m=(0.05,) * 13,
+        ... )
+        >>> t.hull_vertices_m
+        ()
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dop_lo_m: tuple[float, ...]
+    dop_hi_m: tuple[float, ...]
+    hull_vertices_m: tuple[tuple[float, float, float], ...] = ()
+    hull_overhang_m: float | None = None
+
+    @model_validator(mode="after")
+    def _check_slabs_and_containment(self) -> Self:
+        n = len(DOP_AXES)
+        if len(self.dop_lo_m) != n or len(self.dop_hi_m) != n:
+            msg = f"dop_lo_m and dop_hi_m must each have {n} entries, one per DOP_AXES direction"
+            raise ValueError(msg)
+        for i, (lo, hi) in enumerate(zip(self.dop_lo_m, self.dop_hi_m, strict=True)):
+            if not (math.isfinite(lo) and math.isfinite(hi)):
+                msg = f"DOP slab {i} is not finite"
+                raise ValueError(msg)
+            if lo > hi:
+                msg = f"DOP slab {i} is inverted: lo={lo} > hi={hi}"
+                raise ValueError(msg)
+        if self.hull_overhang_m is not None:
+            if not self.hull_vertices_m:
+                msg = (
+                    "hull_overhang_m is set but hull_vertices_m is empty -- "
+                    "there is no hull to overhang"
+                )
+                raise ValueError(msg)
+            if not (math.isfinite(self.hull_overhang_m) and self.hull_overhang_m >= 0.0):
+                msg = f"hull_overhang_m must be finite and non-negative, got {self.hull_overhang_m}"
+                raise ValueError(msg)
+        if len(self.hull_vertices_m) > MAX_TIGHT_HULL_VERTICES:
+            msg = (
+                f"hull_vertices_m has {len(self.hull_vertices_m)} vertices, over the "
+                f"{MAX_TIGHT_HULL_VERTICES} the kernel's stage-2 cost budget allows; "
+                "leave it empty to run stage 1 (the 26-DOP) only"
+            )
+            raise ValueError(msg)
+        for v in self.hull_vertices_m:
+            for i, axis in enumerate(DOP_AXES):
+                s = axis[0] * v[0] + axis[1] * v[1] + axis[2] * v[2]
+                if (
+                    s > self.dop_hi_m[i] + TIGHT_CONTAINMENT_EPSILON_M
+                    or s < self.dop_lo_m[i] - TIGHT_CONTAINMENT_EPSILON_M
+                ):
+                    msg = (
+                        f"hull vertex {v} escapes DOP slab {i} "
+                        f"([{self.dop_lo_m[i]}, {self.dop_hi_m[i]}], support {s}); "
+                        "the hull must lie inside the DOP or the containment chain breaks"
+                    )
+                    raise ValueError(msg)
+        return self
+
+
+def check_tight_geometry_fits_box(
+    shape: CollisionShape,
+    tight: TightCollisionGeometry,
+    owner: str,
+) -> None:
+    """Prove a stage-2 refinement stays inside the box it refines.
+
+    The kernel's broad-phase window is sized from ``half_extents_m`` alone, so
+    a tight representation that reached *outside* that box would make the
+    kernel skip cells it should visit — a missed collision, not a lost
+    conservatism. That is why this is checked at the manifest/producer
+    boundary rather than deferred to the kernel, and why both owners of a
+    ``TightCollisionGeometry`` (a robot link and a carried payload primitive)
+    run the same check rather than two hand-copied ones.
+
+    It is cheap because the DOP's first three axes are the box's own: a 26-DOP
+    lies inside its own first three slabs, so those three bounds prove
+    containment for the entire polytope.
+
+    Args:
+        shape: The primitive ``tight`` refines. Must be a ``BoxShape``.
+        tight: The refinement.
+        owner: How to name the offender in the error — ``"link 'panda_link1'"``
+            or ``"attached primitive 3"``.
+
+    Raises:
+        ValueError: ``shape`` is not a box, or a slab reaches outside it. No
+            slack is allowed; the shipped boxes carry a real 0.055-0.132 mm
+            inward margin.
+
+    Example:
+        >>> check_tight_geometry_fits_box(
+        ...     BoxShape(half_extents_m=(0.1, 0.1, 0.1)),
+        ...     TightCollisionGeometry(dop_lo_m=(-0.05,) * 13, dop_hi_m=(0.05,) * 13),
+        ...     "link 'demo'",
+        ... )
+    """
+    if not isinstance(shape, BoxShape):
+        msg = (
+            f"{owner} declares tight_geometry on a {type(shape).__name__}; it refines a "
+            "BoxShape only, because the box is the broad-phase bound the containment "
+            "proof is stated against"
+        )
+        raise ValueError(msg)
+    for k, half in enumerate(shape.half_extents_m):
+        if tight.dop_lo_m[k] < -half or tight.dop_hi_m[k] > half:
+            msg = (
+                f"{owner} tight_geometry escapes its box on axis {k}: "
+                f"slab [{tight.dop_lo_m[k]}, {tight.dop_hi_m[k]}] is not inside "
+                f"[{-half}, {half}]; a tight representation that reaches outside the box "
+                "would make the kernel's broad phase skip cells it must visit"
+            )
+            raise ValueError(msg)
+
+
+class LinkCollisionGeometry(BaseModel):
+    """One convex collision volume rigidly attached to a robot link.
+
+    The lowered, kernel-facing form of a link's collision geometry. Authored
+    by hand, or emitted by the offline lowering tool from a robot's MJCF or
+    URDF + SRDF source; the kernel loads these into pre-sized buffers at
+    ``on_configure`` and never parses the source geometry on the hot path.
+    ``link_name`` is a ``JointSpec`` link (``joints`` stays normative for
+    the kinematic chain — this adds geometry only).
+
+    Attributes:
+        link_name: The ``JointSpec.child_link`` (or
+            ``JointSpec.parent_link``) this volume is attached to.
+        shape: The convex primitive (capsule, sphere, or box).
+        origin_xyz_rpy: Pose of the primitive in the link frame —
+            ``(x, y, z, roll, pitch, yaw)`` in metres and radians.
+        tight_geometry: Optional tighter convex geometry the safety kernel uses
+            *in place of* ``shape`` in two narrow phases: arm-link vs world
+            voxel, and — when both links of a pair declare it — self-collision
+            box vs box. ``shape`` remains the broad-phase bound, the
+            containment proof, and the geometry every other check uses. Only
+            valid on a ``BoxShape``, and only when it fits inside it.
+
+    Example:
+        >>> g = LinkCollisionGeometry(
+        ...     link_name="link_1",
+        ...     shape=CapsuleShape(radius_m=0.04, length_m=0.3),
+        ... )
+        >>> g.origin_xyz_rpy
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    link_name: str
+    shape: CollisionShape
+    origin_xyz_rpy: tuple[float, float, float, float, float, float] = (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    )
+    tight_geometry: TightCollisionGeometry | None = None
+
+    @model_validator(mode="after")
+    def _tight_geometry_fits_inside_the_box(self) -> Self:
+        """Prove the DOP is inside the box it refines, at the manifest boundary."""
+        if self.tight_geometry is not None:
+            check_tight_geometry_fits_box(
+                self.shape, self.tight_geometry, f"link {self.link_name!r}"
+            )
+        return self
+
+
+class FixedAttachment(BaseModel):
+    """A rigid, zero-DoF parent→child link attachment in the kinematic tree.
+
+    ``RobotDescription.joints`` enumerates only the robot's **movable**
+    joints — consumed unfiltered as the action-vector width, the sim
+    ``qpos`` map, the reasoner's rSkill state-contract filter and the
+    runner's joint permutation, so a zero-DoF entry there would corrupt all
+    four. But a real robot's collision tree also contains rigid mounts (a
+    Franka hand bolted to the flange, a bimanual rig's two arm pedestals),
+    and without them the tree is a *forest*.
+
+    This list is that missing connectivity and nothing else: no limits, no
+    sensors, no DoF, never a command channel, invisible to every ``joints``
+    consumer. The safety envelope loader unions it with ``joints`` to build
+    the collision tree and **refuses to load a robot whose collision links
+    do not form one connected tree**
+    (``openral_safety.envelope_loader.collision_params_from_description``).
+
+    Every value must come from the robot's real URDF/MJCF at the zero
+    configuration — the same source ``joints``' own ``origin_xyz`` /
+    ``origin_rpy`` come from. Never hand-estimate a mount transform.
+
+    Attributes:
+        name: Attachment name, matching the source URDF ``<joint>`` name where
+            one exists (a composed multi-hop mount is named for its endpoint).
+        parent_link: The link this attachment hangs from. Must be reachable
+            from the tree's single root.
+        child_link: The rigidly attached link.
+        origin_xyz: Translation (metres) of ``child_link``'s frame in
+            ``parent_link``'s frame. When the source model inserts intermediate
+            links between the two, this is the **composed** transform, exactly
+            as ``openral_safety.urdf_lowering.lower_joint_fk`` computes it
+            for movable joints.
+        origin_rpy: Orientation ``(roll, pitch, yaw)`` in radians, same frame
+            convention as ``origin_xyz``.
+
+    Example:
+        >>> a = FixedAttachment(
+        ...     name="panda_hand_joint",
+        ...     parent_link="panda_link7",
+        ...     child_link="panda_hand",
+        ...     origin_xyz=(0.0, 0.0, 0.107),
+        ...     origin_rpy=(0.0, 0.0, -0.7853981633974483),
+        ... )
+        >>> a.child_link
+        'panda_hand'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    parent_link: str
+    child_link: str
+    origin_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    origin_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+class HalParameters(BaseModel):
+    """Per-robot HAL construction defaults declared in the manifest.
+
+    Carries the transport / constructor keyword arguments a robot's HAL needs
+    — the SO-100's serial ``port`` + ``baud``, a ros2_control arm's
+    ``robot_ip`` / ``fci_ip`` — so the manifest is the single source of those
+    defaults instead of a per-robot lifecycle-node subclass. This is the
+    schema seam that lets the unified, ``robot.yaml``-driven
+    ``ManifestHALLifecycleNode`` serve a parameterised HAL without
+    a bespoke ``_create_hal``.
+
+    ``openral_hal.build_hal`` merges ``defaults`` **underneath** any
+    explicit ``transport`` kwargs (so a ``deploy run`` override wins) and then
+    drops every key the target HAL constructor does not accept — exactly the
+    filtering it already applies to ``transport``. Empty by default, so robots
+    that need no construction kwargs (the derived ``MujocoArmHAL`` arms) are
+    unaffected.
+
+    Attributes:
+        defaults: HAL constructor / transport keyword defaults, e.g.
+            ``{"port": "/dev/ttyACM0", "baud": 1_000_000}`` for the SO-100 or
+            ``{"robot_ip": "192.168.1.10"}`` for a real UR arm.
+        can_bus_bindings: Maps a key of ``defaults`` to the **role token**
+            that identifies which physical CAN bus fills it, e.g.
+            ``{"left_can_interface": "left", "right_can_interface": "right"}``.
+            Declaring this opts the robot into having ``openral detect``
+            overwrite those defaults with the interface names actually found
+            on the host, instead of shipping one lab's names to every user.
+
+            A CAN interface name is a property of the *host*, not of the
+            robot: the same arm is ``openarm_left`` on a machine with a udev
+            rule and ``can1`` on one without. The manifest therefore declares
+            only which parameter each bus fills and how to recognise it; the
+            value is discovered. Robots with no CAN bus leave this empty and
+            are untouched.
+
+            The token is matched case-insensitively as a substring of the
+            interface name, so it works for any bus count — one entry for a
+            single-bus arm, two for a bimanual station, N for an N-limb
+            machine. Matching is never positional: alphabetical order is a
+            coincidence, and binding the left arm's trajectory to the right
+            arm's bus is exactly the failure this avoids. An entry that
+            matches no interface, or more than one, is reported as a warning
+            and leaves the manifest value untouched (CLAUDE.md §1.4).
+
+    Example:
+        >>> HalParameters(defaults={"port": "/dev/ttyACM0"}).defaults["port"]
+        '/dev/ttyACM0'
+        >>> HalParameters(can_bus_bindings={"left_can_interface": "left"}).can_bus_bindings
+        {'left_can_interface': 'left'}
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    defaults: dict[str, object] = Field(default_factory=dict)
+    can_bus_bindings: dict[str, str] = Field(default_factory=dict)
+
+
+class HalEntrypoints(BaseModel):
+    """Per-robot simulation and real-hardware HAL import strings.
+
+    The two HALs a robot can expose, declared independently so the choice of
+    HAL *type* lives in the manifest (never in environment config or runtime
+    params). Each value is a ``"module:Attr"`` import string resolved by
+    ``openral_hal.build_hal``, or ``None`` when the robot has no HAL of
+    that kind (sim-only / real-only / scene-only).
+
+    Attributes:
+        sim: Import string for the simulation HAL. When ``None`` **and**
+            ``RobotDescription.sim`` is populated, the resolver derives
+            ``MujocoArmHAL.from_description`` — so every plain arm
+            leaves this null. Set it explicitly only for a non-generic sim
+            HAL (e.g. ``"openral_hal.panda_mobile:PandaMobileHAL"``, which has
+            no ``sim:`` block to derive from).
+        real: Import string for the real-hardware HAL (e.g.
+            ``"openral_hal.ur_real:UR5eRealHAL"``). ``None`` for sim-only
+            robots; the resolver raises ``ROSCapabilityMismatch`` if
+            ``mode="real"`` is requested on a robot whose ``real`` is ``None``.
+        parameters: Per-robot HAL construction defaults (serial ``port``,
+            ``robot_ip``, …) merged into the constructor by
+            ``openral_hal.build_hal``. Empty by default.
+
+    Example:
+        >>> HalEntrypoints(real="openral_hal.ur_real:UR5eRealHAL").sim is None
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sim: str | None = None
+    real: str | None = None
+    parameters: HalParameters = Field(default_factory=HalParameters)
+
+
+class RobotDescription(BaseModel):
+    """Top-level robot manifest — one per robot, published to HuggingFace Hub.
+
+    Attributes:
+        name: Robot name, e.g. "so100_follower".
+        embodiment_kind: Top-level kinematic class.
+        assets: Unified URDF / MJCF / SRDF reference block
+            (``openral_core.assets.resolve_asset`` grammar). Empty by default.
+        base_frame: Base link tf2 frame name.
+        odom_frame: Odometry tf2 frame name.
+        map_frame: Map tf2 frame name.
+        joints: List of joint specifications.
+        end_effectors: List of end-effector specifications.
+        sensors: List of individual sensor specs.
+        sensor_bundles: List of multi-modal sensor bundles.
+        capabilities: Capability flags for skill matching.
+        safety: Safety envelope constraints.
+        ros2_namespace: ROS 2 namespace prefix.
+        middleware: ROS 2 middleware selection.
+        onboard_compute: Onboard compute descriptors.
+        sdk_kind: Whether the SDK is open or closed.
+        hal: Simulation + real-hardware HAL import strings (``deploy sim`` uses ``hal.sim``,
+            ``deploy run`` uses ``hal.real``).
+        observation_spec: VLA observation configuration.
+        action_spec: VLA action configuration.
+        sim: Optional MuJoCo wiring for ``openral_hal.MujocoArmHAL``; lets the HAL build
+            entirely from the manifest.
+        scene_defaults: Optional per-robot scene rendering defaults (``TopCameraDefaults``).
+        base_joints: Optional ordered ``[forward, side, yaw]`` ``JointSpec.name`` refs for a
+            planar mobile base; ``None`` for fixed-base manipulators.
+        collision_geometry: Per-link convex collision primitives (capsules / spheres) for the safety
+            kernel. Empty by default.
+        allowed_collision_pairs: Link-name pairs excluded from self-collision (from the SRDF
+            ``disable_collisions`` block on real robots).
+        compute_edge: Compute spec for the on-robot accelerator; falls back to ``compute_local``
+            when ``None``.
+        compute_local: Compute spec for the attached workstation / laptop.
+        compute_cloud: Optional remote compute endpoint (SSH or HTTPS).
+        schema_version: On-disk schema version for migration tooling; ``"0.1"`` is current.
+
+    Example:
+        >>> desc = RobotDescription(
+        ...     name="smoke_robot",
+        ...     embodiment_kind=EmbodimentKind.MANIPULATOR,
+        ...     joints=[
+        ...         JointSpec(
+        ...             name="j1",
+        ...             joint_type=JointType.REVOLUTE,
+        ...             parent_link="base_link",
+        ...             child_link="link_1",
+        ...         )
+        ...     ],
+        ...     capabilities=RobotCapabilities(
+        ...         supported_control_modes=[ControlMode.JOINT_POSITION],
+        ...         embodiment_tags=["smoke"],
+        ...     ),
+        ...     safety=SafetyEnvelope(),
+        ... )
+        >>> assert desc.name == "smoke_robot"
+    """
+
+    name: str
+    embodiment_kind: EmbodimentKind
+    assets: AssetRefs = Field(default_factory=AssetRefs)
+    base_frame: str = "base_link"
+    odom_frame: str = "odom"
+    map_frame: str = "map"
+    joints: list[JointSpec]
+    end_effectors: list[EndEffectorSpec] = Field(default_factory=list)
+    sensors: list[SensorSpec] = Field(default_factory=list)
+    sensor_bundles: list[SensorBundle] = Field(default_factory=list)
+    capabilities: RobotCapabilities
+    safety: SafetyEnvelope
+    ros2_namespace: str = ""
+    middleware: Literal["fastdds", "cyclonedds", "zenoh"] = "cyclonedds"
+    onboard_compute: dict[str, object] = Field(default_factory=dict)
+    sdk_kind: Literal["open", "closed_with_api", "closed"] = "open"
+    hal: HalEntrypoints = Field(default_factory=HalEntrypoints)
+    observation_spec: ObservationSpec | None = None
+    action_spec: ActionSpec | None = None
+    sim: SimDescription | None = None
+    scene_defaults: SceneDefaults | None = None
+    base_joints: list[str] | None = None
+    # robot_state_publisher wiring now lives on ``assets.urdf``
+    # (``root_frame`` + ``base_to_root_xyz_rpy``) — see ``UrdfAsset``.
+    # Nav2 — generic mobile-base properties so a per-robot
+    # Nav2 param file need not be hand-vendored. ``footprint_radius``
+    # feeds Nav2's ``robot_radius`` (collision envelope, metres) and
+    # ``base_kinematics`` selects the MPPI ``motion_model`` ("omni" /
+    # "holonomic" → holonomic + symmetric lateral bound;
+    # "differential" / "ackermann" → the matching upstream model).
+    # Both ``None`` on fixed-base arms (no Nav2).
+    footprint_radius: float | None = Field(default=None, gt=0.0)
+    base_kinematics: Literal["differential", "holonomic", "omni", "ackermann"] | None = None
+    # Optional Nav2 speed caps (m/s, rad/s). The shared base param file's
+    # velocity bounds are one robot's tuning; a robot whose safety kernel
+    # bounds differ declares its own caps here so Nav2 plans inside them
+    # (the kernel rejects a whole BODY_TWIST chunk above
+    # ``safety.max_base_*``). Must not exceed those safety bounds. ``None``
+    # keeps the base file's values.
+    nav2_max_linear_speed_m_s: float | None = Field(default=None, gt=0.0)
+    nav2_max_angular_speed_rad_s: float | None = Field(default=None, gt=0.0)
+    # Omni bases: MPPI and the velocity smoother bound each axis, but the kernel bounds the planar
+    # SPEED, so vx_max = vy_max = v let a diagonal crab reach sqrt(2) v and E-stop the graph
+    #. With this set, vy is capped here and vx_max = sqrt(v^2 - vy^2), so any
+    # Nav2 command stays inside v. Nav2's cruise envelope only; other callers still crab at v.
+    nav2_max_lateral_speed_m_s: float | None = Field(default=None, gt=0.0)
+    # Nav2 goal checker for bases whose heading control is coarse. ``None`` keeps the
+    # shared base file's values (stateful, 0.05 rad yaw tolerance: panda_mobile tuning).
+    nav2_goal_yaw_tolerance_rad: float | None = Field(default=None, gt=0.0)
+    nav2_goal_checker_stateful: bool | None = None
+    # Base acceleration the controller may assume (m/s^2, rad/s^2; magnitudes). MPPI samples
+    # velocity sequences inside `ax_max`/`ax_min`/`az_max` and the velocity smoother ramps
+    # inside `max_accel`/`max_decel`; the shared base file's 2.5-3.5 are panda_mobile
+    # tuning. A base that brakes far slower (traction-limited on lunar-gravity regolith:
+    # LunarBot stops from 0.55 m/s in ~0.5 m) declares its real limits
+    # here so the controller starts braking where the vehicle actually can. ``None`` keeps
+    # the base file's values.
+    nav2_max_linear_accel_m_s2: float | None = Field(default=None, gt=0.0)
+    nav2_max_linear_decel_m_s2: float | None = Field(default=None, gt=0.0)
+    nav2_max_angular_accel_rad_s2: float | None = Field(default=None, gt=0.0)
+    # Side of the (square, rolling) global costmap in metres. The shared base file's 20 m
+    # window suits a kitchen; a goal outside it makes the planner fail outright ("goal is off
+    # the global costmap") and the BT falls into recoveries. A worksite the size of the lunar
+    # base (~50 m) declares its own. ``None`` keeps the base file's value.
+    nav2_global_costmap_size_m: float | None = Field(default=None, gt=0.0)
+    # A robot-specific Nav2 base params file (a filename in `openral_nav2_bringup/config/`). The
+    # shared file is one robot's tuning; a robot whose worksite differs in kind (terrain relief,
+    # site scale) gets its own copy and keeps the per-robot overrides above on top of it. ``None``
+    # selects the shared file by SLAM backend.
+    nav2_params_file: str | None = None
+    # A robot-specific slam_toolbox params file (a filename in `openral_slam_bringup/config/`), same
+    # rationale as `nav2_params_file`: the shared file is an indoor robot's tuning. ``None`` keeps it.
+    slam_params_file: str | None = None
+    # MoveIt bring-up for this arm (its `<robot>_config` package's move_group launch). Declared on the
+    # robot, not the scene: it is a property of the arm, and every deploy that dispatches a MoveIt
+    # rSkill needs it. `deploy_e2e.launch.py` includes it on both the sim and the real path with the
+    # graph's clock scoped in; until this existed it was a second terminal the operator had to
+    # remember.
+    motion_planning: LaunchInclude | None = None
+    # Geometric safety. ``collision_geometry`` is the lowered,
+    # kernel-facing set of per-link convex primitives; ``allowed_collision_pairs``
+    # is the self-collision exclusion matrix (adjacent links touch by design).
+    # Both are authored by hand or emitted by the offline lowering tool from
+    # this robot's MJCF or URDF + SRDF. ``assets.srdf`` points at an SRDF whose
+    # ``disable_collisions`` block is the canonical source for
+    # ``allowed_collision_pairs`` on real robots. All empty / ``None`` keeps
+    # existing manifests loadable; ``joints`` stays normative for the chain, so
+    # URDF/SRDF contribute geometry + ACM only (no dual source of truth).
+    collision_geometry: list[LinkCollisionGeometry] = Field(default_factory=list)
+    allowed_collision_pairs: list[tuple[str, str]] = Field(default_factory=list)
+    # Rigid (zero-DoF) links of the kinematic tree that ``joints`` cannot
+    # carry — ``joints`` is consumed unfiltered as a DoF vector, so a fixed
+    # entry there would corrupt the action width, the qpos map, the reasoner's
+    # state-contract filter and the runner's permutation. Empty for a robot
+    # whose movable joints already connect every collision link. See
+    # ``FixedAttachment``.
+    fixed_attachments: list[FixedAttachment] = Field(default_factory=list)
+    # Dashboard overlay — optional base footprint as a list of
+    # base-frame ``(x, y)`` vertices in metres (CCW by convention). Used to
+    # draw the robot's true outline on the SLAM occupancy grid; ``None``
+    # falls back to the ``footprint_radius`` circle. Independent of
+    # ``footprint_radius`` (a robot may declare either, both, or neither).
+    footprint_polygon: list[tuple[float, float]] | None = Field(default=None)
+    # Three compute tiers replacing the single ``compute`` slot.
+    # Edge: on-robot SoC (Jetson). Local: workstation / tethered laptop.
+    # Cloud: SSH or HTTPS remote endpoint (set manually or via detect).
+    compute_edge: ComputeSpec | None = None
+    compute_local: ComputeSpec | None = None
+    compute_cloud: ComputeSpec | None = None
+    # Current on-disk format (three-slot compute layout). Manifests
+    # without this field load with the default below.
+    schema_version: Literal["0.1"] = "0.1"
+
+    @model_validator(mode="after")
+    def _validate_footprint_polygon(self) -> RobotDescription:
+        """A declared footprint polygon needs >= 3 vertices with finite coords."""
+        min_polygon_vertices = 3
+        poly = self.footprint_polygon
+        if poly is None:
+            return self
+        if len(poly) < min_polygon_vertices:
+            raise ValueError(
+                f"footprint_polygon needs >= {min_polygon_vertices} vertices; got {len(poly)}"
+            )
+        if any(not math.isfinite(c) for pt in poly for c in pt):
+            raise ValueError("footprint_polygon vertices must be finite (no NaN/inf)")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_nav2_speed_caps(self) -> RobotDescription:
+        """Nav2 speed caps must sit inside the kernel's BODY_TWIST bounds."""
+        for cap, bound, name in (
+            (self.nav2_max_linear_speed_m_s, self.safety.max_base_linear_speed_m_s, "linear"),
+            (self.nav2_max_angular_speed_rad_s, self.safety.max_base_angular_speed_rad_s, "angular"),
+        ):
+            if cap is not None and bound is not None and cap > bound:
+                raise ValueError(
+                    f"nav2_max_{name}_speed ({cap}) exceeds safety.max_base_{name}_speed ({bound}); "
+                    "the kernel would reject Nav2's commands"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_fixed_attachments(self) -> RobotDescription:
+        """Each link may be defined by exactly one edge — a joint or an attachment.
+
+        Two edges claiming the same ``child_link`` make the link's pose
+        ambiguous, and the safety kernel would silently take whichever the
+        loader visited last. Reject the ambiguity at load time instead.
+        """
+        if not self.fixed_attachments:
+            return self
+        defined_by: dict[str, str] = {j.child_link: f"joint {j.name!r}" for j in self.joints}
+        for att in self.fixed_attachments:
+            if att.child_link == att.parent_link:
+                raise ValueError(
+                    f"fixed_attachments[{att.name!r}] attaches {att.child_link!r} to itself"
+                )
+            prior = defined_by.get(att.child_link)
+            if prior is not None:
+                raise ValueError(
+                    f"fixed_attachments[{att.name!r}] re-defines child_link "
+                    f"{att.child_link!r}, already defined by {prior}; a link's pose "
+                    "must have exactly one source"
+                )
+            defined_by[att.child_link] = f"fixed_attachments[{att.name!r}]"
+        return self
+
+    @model_validator(mode="after")
+    def _validate_base_joints_against_joints(self) -> RobotDescription:
+        """Ensure ``base_joints`` is well-formed: ≥3 entries, all real joint names.
+
+        `extract_base_sim_joint_names` specialises to the
+        planar-base case (3 entries: forward / side / yaw). A robot
+        manifest declaring `base_joints: [base_x]` would silently
+        miss the helper's gate and fall back to module defaults.
+        Reject the shape up front so the misconfiguration is loud.
+        """
+        if self.base_joints is None:
+            return self
+        planar_base_dof = 3
+        if len(self.base_joints) < planar_base_dof:
+            raise ValueError(
+                f"base_joints must declare at least {planar_base_dof} entries "
+                f"(forward, side, yaw) for the planar-base helper to engage; "
+                f"got {len(self.base_joints)}."
+            )
+        joint_names = {j.name for j in self.joints}
+        for ref in self.base_joints:
+            if ref not in joint_names:
+                raise ValueError(
+                    f"base_joints[*]={ref!r} is not present in joints (have: {sorted(joint_names)})"
+                )
+        return self
+
+    @property
+    def lidar_sensor(self) -> SensorSpec | None:
+        """The first declared 2-D LiDAR / scan sensor, or ``None``.
+
+        The panda_mobile HAL synthesises a ``sensor_msgs/
+        LaserScan`` from MuJoCo ray-casts; its beam count
+        (``SensorSpec.n_channels``), range
+        (``SensorSpec.range_min_m`` / ``SensorSpec.range_max_m``)
+        and rate (``SensorSpec.rate_hz``) live on this descriptor so
+        ``openral deploy sim`` and the HAL lifecycle node read one source of
+        truth from ``robot.yaml`` instead of each hardcoding scan params.
+        """
+        return next(
+            (s for s in self.sensors if s.modality == SensorModality.LIDAR_2D.value),
+            None,
+        )
+
+    def nav2_footprint_param(self) -> str:
+        """This base's Nav2 ``footprint`` parameter string.
+
+        ``nav2_costmap_2d`` reads ``footprint`` as a string of
+        ``[[x, y], ...]`` vertices and treats **both** ``""`` and ``"[]"``
+        as "no polygon — use ``robot_radius``". So a robot that declares
+        ``footprint_polygon`` gets its measured outline, and one that
+        declares only ``footprint_radius`` gets ``"[]"``, which keeps
+        Nav2 on its cheaper circular path rather than silently inheriting
+        the base param file's polygon (some other robot's shape).
+
+        A polygon matters beyond accuracy: only a polygon footprint can
+        express a carried payload, which is what
+        ``openral_nav2_bringup``'s footprint publisher pushes onto the
+        costmaps' ``footprint`` topic while an object is attached.
+
+        Example:
+            >>> from openral_core import RobotDescription
+            >>> RobotDescription.from_yaml("robots/panda_mobile/robot.yaml").nav2_footprint_param()
+            '[[0.35, 0.25], [-0.35, 0.25], [-0.35, -0.25], [0.35, -0.25]]'
+        """
+        if not self.footprint_polygon:
+            return "[]"
+        inner = ", ".join(f"[{x:g}, {y:g}]" for x, y in self.footprint_polygon)
+        return f"[{inner}]"
+
+    def nav2_param_overrides(self) -> dict[str, str]:
+        """Nav2 param substitutions derived from this robot's base props.
+
+        Lets the Nav2 bringup stay generic: instead of
+        hand-vendoring a per-robot ``nav2_<robot>.yaml``, the launch
+        rewrites a shared base param file with these key→value
+        substitutions. Maps ``footprint_radius`` → ``robot_radius``
+        (collision envelope) **and** the costmap ``inflation_radius``
+        (``footprint_radius`` + ``NAV2_INFLATION_CLEARANCE_M``, so it
+        stays ≥ the inscribed/circumscribed radius Nav2 derives from the
+        footprint — otherwise Nav2 errors and falls back to slow
+        full-footprint collision checks), ``footprint_polygon`` →
+        the costmap ``footprint`` polygon (see
+        ``nav2_footprint_param``), and ``base_kinematics`` →
+        the MPPI ``motion_model``, ``base_frame`` → every Nav2 base-frame key
+        (``robot_base_frame`` / ``base_frame_id`` / ``base_frame``), and the optional ``nav2_max_*_speed``
+        caps → MPPI ``vx_max`` / ``wz_max`` and the velocity smoother's
+        ``max_velocity`` / ``min_velocity``. Returns an empty dict for
+        fixed-base arms (no mobile base → no Nav2). Without declared caps,
+        velocity bounds remain Nav2 tuning in the base param file.
+        """
+        overrides: dict[str, str] = {}
+        if self.footprint_radius is not None or self.footprint_polygon:
+            # Emitted even for a radius-only robot, as Nav2's "[]" sentinel:
+            # leaving the key unrewritten would hand that robot whatever
+            # polygon the shared base file happens to ship.
+            overrides["footprint"] = self.nav2_footprint_param()
+        if self.footprint_radius is not None:
+            overrides["robot_radius"] = str(self.footprint_radius)
+            overrides["inflation_radius"] = (
+                f"{self.footprint_radius + NAV2_INFLATION_CLEARANCE_M:.3f}"
+            )
+        if overrides or self.base_kinematics is not None:
+            # The shared base file names panda_mobile's `base_link`; any other mobile base
+            # (LunarBot: `chassis_base_link`) left unrewritten has costmaps waiting forever
+            # for a `base_link -> odom` TF, blocking controller_server inside its lifecycle
+            # transition.
+            for key in ("robot_base_frame", "base_frame_id", "base_frame"):
+                overrides[key] = self.base_frame
+        if self.base_kinematics is not None:
+            overrides["motion_model"] = {
+                "omni": "Omni",
+                "holonomic": "Omni",
+                "differential": "DiffDrive",
+                "ackermann": "Ackermann",
+            }[self.base_kinematics]
+        if self.nav2_goal_yaw_tolerance_rad is not None:
+            overrides["yaw_goal_tolerance"] = str(self.nav2_goal_yaw_tolerance_rad)
+        if self.nav2_goal_checker_stateful is not None:
+            # a stateful checker latches xy success and then only waits on yaw: a base that
+            # turns poorly in place drifts off the goal while "finishing"
+            overrides["stateful"] = "true" if self.nav2_goal_checker_stateful else "false"
+        v, w = self.nav2_max_linear_speed_m_s, self.nav2_max_angular_speed_rad_s
+        omni = self.base_kinematics in ("omni", "holonomic")
+        lat = self.nav2_max_lateral_speed_m_s if omni else None
+        if v is not None:
+            vx = round(math.sqrt(v * v - lat * lat), 3) if lat is not None and lat < v else v
+            overrides["vx_max"] = str(vx)
+            if omni:
+                vy_cap = lat if lat is not None else v
+                overrides["vy_max"] = str(vy_cap)
+                overrides["vy_min"] = str(-vy_cap)
+        if w is not None:
+            overrides["wz_max"] = str(w)
+        if v is not None or w is not None:
+            # velocity_smoother's [x, y, theta] limits. The lateral axis is the robot's own:
+            # an omni/4WIS base crabs, a differential one cannot.
+            vs, ws = v if v is not None else 0.5, w if w is not None else 2.0
+            vy = (lat if lat is not None else vs) if omni else 0.0
+            if lat is not None and lat < vs:
+                vs = round(math.sqrt(vs * vs - lat * lat), 3)
+            overrides["max_velocity"] = f"[{vs}, {vy}, {ws}]"
+            overrides["min_velocity"] = f"[{-vs}, {-vy}, {-ws}]"
+        if w is not None:
+            # behavior_server's Spin recovery publishes straight to cmd_vel, past the velocity
+            # smoother: the base file's 1.0 rad/s tripped the kernel's 0.5 rad/s envelope and
+            # E-stopped the whole graph the first time a plan failed
+            overrides["max_rotational_vel"] = str(w)
+            overrides["min_rotational_vel"] = str(round(min(0.4, w / 2.0), 3))
+        a, d, aw = self.nav2_max_linear_accel_m_s2, self.nav2_max_linear_decel_m_s2, self.nav2_max_angular_accel_rad_s2
+        if a is not None:
+            overrides["ax_max"] = str(a)
+        if d is not None:
+            overrides["ax_min"] = str(-d)
+        if aw is not None:
+            overrides["az_max"] = str(aw)
+            overrides["rotational_acc_lim"] = str(aw)
+        if self.nav2_global_costmap_size_m is not None:
+            # dotted path, not a bare key: `width`/`height` also name the local costmap's window
+            for k in ("width", "height"):  # nav2_costmap_2d declares these as integers
+                overrides[f"global_costmap.global_costmap.ros__parameters.{k}"] = str(int(round(self.nav2_global_costmap_size_m)))
+        if a is not None or d is not None or aw is not None:
+            # velocity_smoother's [x, y, theta] ramps; the base file's values fill the undeclared axes.
+            aa, dd, ww = a if a is not None else 2.5, d if d is not None else 2.5, aw if aw is not None else 3.2
+            ay = aa if self.base_kinematics in ("omni", "holonomic") else 0.0
+            dy = dd if self.base_kinematics in ("omni", "holonomic") else 0.0
+            overrides["max_accel"] = f"[{aa}, {ay}, {ww}]"
+            overrides["max_decel"] = f"[{-dd}, {-dy}, {-ww}]"
+        return overrides
+
+    @model_validator(mode="after")
+    def _validate_sim_against_joints(self) -> RobotDescription:
+        """Ensure every ``sim.grippers[*].joint`` is also in ``joints``."""
+        if self.sim is None:
+            return self
+        joint_names = {j.name for j in self.joints}
+        for gripper in self.sim.grippers:
+            if gripper.joint not in joint_names:
+                raise ValueError(
+                    f"sim.grippers[].joint={gripper.joint!r} is not present "
+                    f"in joints (have: {sorted(joint_names)})"
+                )
+        # Duplicate-joint guard — a gripper can't be listed twice (would
+        # double-apply the write in send_action).
+        gripper_joints = [g.joint for g in self.sim.grippers]
+        if len(gripper_joints) != len(set(gripper_joints)):
+            raise ValueError(f"sim.grippers contains duplicate joint names: {gripper_joints}")
+        return self
+
+    @classmethod
+    def from_yaml(cls, path: str) -> RobotDescription:
+        """Load and validate a ``RobotDescription`` YAML manifest from disk.
+
+        Args:
+            path: Filesystem path to the ``robot.yaml`` file.
+
+        Returns:
+            A validated ``RobotDescription``.
+
+        Raises:
+            FileNotFoundError: If ``path`` does not exist.
+            pydantic.ValidationError: If the YAML fails schema validation.
+
+        Example:
+            >>> # RobotDescription.from_yaml("robots/franka_panda/robot.yaml")
+        """
+        return _load_yaml_model(cls, path)
+
+    def validate_for_e2e_pipeline(self) -> None:
+        """Assert this manifest carries every field the e2e ROS graph needs.
+
+        The C++ safety kernel (``cpp/openral_safety_kernel``)
+        reads per-joint ``position_limits`` / ``velocity_limit`` /
+        ``effort_limit`` + the global ``safety:`` block. Per-joint
+        limit fields are *optional* on ``JointSpec`` for sim-only
+        robots, but they become mandatory the moment you ask
+        ``openral deploy sim`` to bring up the kernel against this robot.
+
+        This method makes the e2e contract explicit and fails loud
+        listing every missing field. Pair it with
+        ``openral_safety.envelope_loader.compute_intersection(robot,
+        skill=None)`` for the actual envelope synthesis — this method
+        only validates.
+
+        Raises:
+            ROSConfigError: If any actuated joint is missing
+                ``position_limits``, ``velocity_limit``, or
+                ``effort_limit``. The error lists every missing field
+                at once so the operator does not have to fix one,
+                re-run, fix the next.
+        """
+        missing: list[str] = []
+        for joint in self.joints:
+            if joint.joint_type not in (
+                JointType.REVOLUTE,
+                JointType.PRISMATIC,
+                JointType.CONTINUOUS,
+            ):
+                continue
+            if joint.position_limits is None:
+                missing.append(f"joints[{joint.name}].position_limits")
+            if joint.velocity_limit is None:
+                missing.append(f"joints[{joint.name}].velocity_limit")
+            if joint.effort_limit is None:
+                missing.append(f"joints[{joint.name}].effort_limit")
+        if missing:
+            raise ROSConfigError(
+                f"RobotDescription({self.name!r}) is missing fields required by "
+                f"the e2e safety kernel: {missing}. Set them on the matching "
+                "JointSpec(s) in robots/<robot_id>/robot.yaml."
+            )
+
+
+def extract_base_sim_joint_names(
+    description: RobotDescription,
+) -> tuple[str, str, str] | None:
+    """Return ``(forward, side, yaw)`` MJCF joint names from any mobile-base description.
+
+    Generic, robot-agnostic helper. Consumes
+    ``RobotDescription.base_joints`` + each referenced joint's
+    ``JointSpec.sim_joint_name`` override. Works for any robot whose
+    ``robot.yaml`` declares both:
+
+    * ``base_joints: [<forward>, <side>, <yaw>]`` at the top level.
+    * Each of the three referenced joints carries a
+      ``sim_joint_name: "..."`` mapping its URDF-shape ``name`` to the
+      MJCF/MuJoCo joint name the simulator emits (typically auto-prefixed
+      under a composed scene).
+
+    Returns ``None`` when the description has no ``base_joints`` block,
+    fewer than three entries (the schema permits arbitrary list length for
+    future non-planar bases — this helper specialises to the planar-base
+    case), or any referenced joint lacks ``sim_joint_name``. Callers should
+    treat ``None`` as "fall back to module defaults" — the sim-side
+    ray-cast helpers in ``openral_sim.backends.robocasa`` accept this.
+
+    Args:
+        description: The robot's manifest, loaded via
+            ``RobotDescription.from_yaml``.
+
+    Returns:
+        ``(forward, side, yaw)`` MJCF joint names, or ``None`` when
+        the description doesn't carry a complete mobile-base block.
+
+    Example:
+        >>> # See `robots/panda_mobile/robot.yaml` for a real fixture.
+        >>> desc = RobotDescription(
+        ...     name="ex",
+        ...     embodiment_kind=EmbodimentKind.MOBILE_MANIPULATOR,
+        ...     joints=[
+        ...         JointSpec(
+        ...             name="base_x",
+        ...             joint_type=JointType.PRISMATIC,
+        ...             parent_link="world",
+        ...             child_link="base_x_link",
+        ...             sim_joint_name="mobilebase0_joint_mobile_forward",
+        ...         ),
+        ...         JointSpec(
+        ...             name="base_y",
+        ...             joint_type=JointType.PRISMATIC,
+        ...             parent_link="base_x_link",
+        ...             child_link="base_y_link",
+        ...             sim_joint_name="mobilebase0_joint_mobile_side",
+        ...         ),
+        ...         JointSpec(
+        ...             name="base_yaw",
+        ...             joint_type=JointType.REVOLUTE,
+        ...             parent_link="base_y_link",
+        ...             child_link="base_link",
+        ...             sim_joint_name="mobilebase0_joint_mobile_yaw",
+        ...         ),
+        ...     ],
+        ...     capabilities=RobotCapabilities(embodiment_tags=["ex"]),
+        ...     safety=SafetyEnvelope(),
+        ...     base_joints=["base_x", "base_y", "base_yaw"],
+        ... )
+        >>> extract_base_sim_joint_names(desc)[0]
+        'mobilebase0_joint_mobile_forward'
+    """
+    # Planar mobile bases carry exactly three holonomic axes (forward,
+    # side, yaw); the schema doesn't constrain `base_joints` length so
+    # future non-planar bases can declare richer surfaces, but this
+    # helper specialises here.
+    planar_base_dof = 3
+    if description.base_joints is None or len(description.base_joints) < planar_base_dof:
+        return None
+    by_name = {j.name: j for j in description.joints}
+    sim_names: list[str | None] = []
+    for ref in description.base_joints[:planar_base_dof]:
+        spec = by_name.get(ref)
+        if spec is None:
+            return None
+        sim_names.append(spec.sim_joint_name)
+    if any(n is None for n in sim_names):
+        return None
+    forward, side, yaw = sim_names
+    # Narrow tuple[str | None, ...] → tuple[str, str, str] for type checkers.
+    assert isinstance(forward, str)
+    assert isinstance(side, str)
+    assert isinstance(yaw, str)
+    return (forward, side, yaw)
+
+
+# ─── World state ───────────────────────────────────────────────────────────────
+
+
+class JointState(BaseModel):
+    """Real-time joint state snapshot.
+
+    Attributes:
+        name: Ordered list of joint names.
+        position: Joint positions (rad or m).
+        velocity: Joint velocities (rad/s or m/s).
+        effort: Joint efforts (Nm or N).
+        stamp_ns: ROS 2 timestamp in nanoseconds.
+    """
+
+    name: list[str]
+    position: list[float]
+    velocity: list[float] = Field(default_factory=list)
+    effort: list[float] = Field(default_factory=list)
+    stamp_ns: int
+
+
+class Pose6D(BaseModel):
+    """6D pose: position + quaternion.
+
+    Attributes:
+        xyz: Position (x, y, z) in meters.
+        quat_xyzw: Quaternion (x, y, z, w).
+        frame_id: tf2 reference frame.
+    """
+
+    xyz: tuple[float, float, float]
+    quat_xyzw: tuple[float, float, float, float]
+    frame_id: str
+
+
+class DetectedObject(BaseModel):
+    """A detected object in the scene.
+
+    Attributes:
+        label: Semantic class label.
+        confidence: Detection confidence in [0, 1].
+        pose: 6D pose in the world or camera frame.
+        bbox_3d: 3D bounding box (x_min, y_min, z_min, x_max, y_max, z_max).
+        track_id: Persistent track ID across frames.
+    """
+
+    label: str
+    confidence: float
+    pose: Pose6D
+    bbox_3d: tuple[float, float, float, float, float, float] | None = None
+    track_id: int | None = None
+
+
+class WorldCollisionPrimitive(BaseModel):
+    """A placed convex obstacle volume in the world.
+
+    The world-frame analogue of ``LinkCollisionGeometry``: a convex
+    primitive plus the pose that places it. Populated by perception / SLAM and
+    consumed by the kernel's world-collision phase against the robot's link
+    capsules. A bounded, capped set is the kernel's world model (mesh
+    obstacles are out of scope for the allocation-free check).
+
+    Attributes:
+        shape: The convex primitive (capsule or sphere).
+        pose: Pose of the primitive's local origin in the world frame.
+        object_id: Optional stable identifier (e.g. a
+            ``DetectedObject.track_id`` rendered as text) surfaced in
+            ``CollisionEvidence.link_b_or_object``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    shape: CollisionShape
+    pose: Pose6D
+    object_id: str | None = None
+
+
+class AttachmentEvidenceKind(str, Enum):
+    """Evidence source that confirmed a robot/object attachment or its support.
+
+    ``SIM_CONTACT`` and ``SIM_GEOM_DISTANCE`` are both simulator ground truth,
+    and the distinction is load-bearing rather than cosmetic. A simulator's
+    *contact list* is not a proximity oracle: MuJoCo's ``contype`` /
+    ``conaffinity`` bitmasks suppress whole geom pairs, so an object flush on a
+    counter can generate no contact record at all. ``SIM_GEOM_DISTANCE`` names
+    the signed closest-distance probe (``mj_geomDistance``), which sees the
+    pairs the contact list hides. A consumer reading a witness must not infer
+    from ``SIM_CONTACT`` that a solver contact existed, nor from
+    ``SIM_GEOM_DISTANCE`` that one did not.
+    """
+
+    SIM_CONTACT = "sim_contact"
+    SIM_GEOM_DISTANCE = "sim_geom_distance"
+    GRIPPER_FORCE = "gripper_force"
+    PERCEPTION_TRACK = "perception_track"
+    OPERATOR = "operator"
+    # A ``kind: "segmenter"`` rSkill masked the payload in a wrist RGB-D frame
+    # and the masked depth passed the producer's geometric gates (containment
+    # between the jaws, payload volume, depth validity). The mask's own model
+    # score is never part of that decision — a confidently-wrong mask covering
+    # half the frame is rejected on volume, not on confidence.
+    VISION_SEGMENTATION = "vision_segmentation"
+    # ``mj_contactForce`` over MuJoCo's solver contact list (ADR-0100). It
+    # inherits that list's blind spot by construction — ``contype`` /
+    # ``conaffinity`` suppression can empty a pair that is demonstrably in
+    # contact — so absence of a force witness is never evidence of no contact.
+    SIM_CONTACT_FORCE = "sim_contact_force"
+
+
+class PlaceRegion(BaseModel):
+    """The bounded region of a declared place target (ADR-0097 amendment).
+
+    The volume inside which the declared payload's world-collision margin is
+    reduced by ``min(1.5 x voxel, 40 mm)`` (ADR-0097's Second Amendment,
+    2026-08-15 — 37.5 mm at sim's 25 mm cells, 40 mm rather than 75 mm at a
+    real 50 mm grid since the absolute ceiling still binds) so it can
+    physically reach the support contact the place witness is *earned by*.
+    Round-6 validation: without it the flagship counter->cabinet insertion
+    cannot complete even with a correct declaration — passing through an
+    enclosed target's opening means passing within margin distance of
+    voxel-quantised walls, and at 25 mm cells that quantisation closes the
+    opening's predicted clearance 22-30 mm before the payload arrives. A
+    witness earned by touching can never arm if the payload is stopped
+    before it can touch.
+
+    **Producer-supplied, producer-specific.** Sim computes it from the
+    declared body's MuJoCo model subtree; real hardware's perception seam is
+    **not yet implemented**, so no allowance applies on real hardware today
+    (the same posture real-hardware place-witness attestation is under). The
+    kernel is producer-agnostic: it consumes this box identically whoever
+    measured it, and never derives one itself.
+
+    The box is **oriented**, not axis-aligned — the axis-aligned hull of a
+    rotated receptacle is strictly larger, i.e. more permissive. Absent
+    (``PlaceDeclaration.region is None``) means no allowance at all — the
+    pre-amendment margins, unchanged. A degenerate or over-large region is
+    rejected here and again in the kernel, both times toward "no allowance".
+
+    Attributes:
+        frame_id: Frame ``pose`` is expressed in. Must be the robot base
+            frame — the frame ``OccupancyVoxels`` is published in. The kernel
+            refuses a region whose frame does not match the occupancy grid's,
+            because a region measured in one frame and applied in another is a
+            relaxation aimed at the wrong volume.
+        pose: Region box centre pose in ``frame_id``.
+        half_extents: Box half-extents along its own axes (m), each in
+            ``(0, MAX_HALF_EXTENT_M]``.
+        evidence_ref: What the producer measured the box from, for
+            attributability (HZ-0097-2/4). Free text, never parsed.
+        stamp_ns: Producer timestamp.
+        geometry: The declared target's own collision primitives, each posed in
+            ``frame_id`` (ADR-0098, survey Path B). Empty — the default, and
+            what every producer that cannot measure geometry publishes — leaves
+            the region behaving exactly as it did before ADR-0098. Supplying it
+            lets the kernel adjudicate a cell against the modelled surface
+            instead of against the 25 mm cube that quantised it, bounded so that
+            it can never be more permissive than the box alone: the kernel uses
+            the modelled distance only while it is within the blanket allowance
+            that cell would have been granted anyway.
+
+    Example:
+        >>> region = PlaceRegion(
+        ...     frame_id="base_link",
+        ...     pose=Pose6D(
+        ...         xyz=(0.6, 0.1, 1.1), quat_xyzw=(0.0, 0.0, 0.0, 1.0), frame_id="base_link"
+        ...     ),
+        ...     half_extents=(0.20, 0.18, 0.12),
+        ...     evidence_ref="mujoco_body_subtree:cab_1_left_group_main",
+        ... )
+        >>> round(region.volume_m3(), 5)
+        0.03456
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Ceiling on one half-extent. A declaration names ONE receptacle, so a
+    #: 3 m box is a producer error, not a target.
+    MAX_HALF_EXTENT_M: ClassVar[float] = 1.5
+    #: Ceiling on the box's volume — a 2 m cube. Same reasoning, applied to the
+    #: product rather than to any single side.
+    MAX_VOLUME_M3: ClassVar[float] = 8.0
+    #: Ceiling on ``geometry``, and the same number the safety kernel's own
+    #: ``kMaxPlaceTargetPrimitives`` enforces — one bound, declared twice, so a
+    #: region that validates here cannot overflow there. A producer whose
+    #: declared subtree carries more primitives than this publishes **no**
+    #: geometry and keeps the box, rather than publishing a truncated body: half
+    #: a receptacle is a worse model than none, because the missing half would
+    #: be adjudicated as if it were not there.
+    MAX_GEOMETRY_PRIMITIVES: ClassVar[int] = 64
+
+    frame_id: str = Field(min_length=1)
+    pose: Pose6D
+    half_extents: tuple[float, float, float]
+    evidence_ref: str = ""
+    stamp_ns: int = Field(default=0, ge=0)
+    geometry: tuple[AttachedCollisionPrimitive, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_region(self) -> PlaceRegion:
+        for axis, value in zip("xyz", self.half_extents, strict=True):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"PlaceRegion half-extent {axis}={value!r} must be finite and positive; "
+                    "a region with no interior licenses nothing."
+                )
+            if value > self.MAX_HALF_EXTENT_M:
+                raise ValueError(
+                    f"PlaceRegion half-extent {axis}={value!r} exceeds the "
+                    f"{self.MAX_HALF_EXTENT_M} m bound; a declaration names one receptacle."
+                )
+        if self.volume_m3() > self.MAX_VOLUME_M3:
+            raise ValueError(
+                f"PlaceRegion volume {self.volume_m3()!r} m^3 exceeds the "
+                f"{self.MAX_VOLUME_M3} m^3 bound; a declaration names one receptacle, not a room."
+            )
+        if len(self.geometry) > self.MAX_GEOMETRY_PRIMITIVES:
+            raise ValueError(
+                f"PlaceRegion.geometry carries {len(self.geometry)} primitives, past the "
+                f"{self.MAX_GEOMETRY_PRIMITIVES} the safety kernel will accept. Publish the "
+                "region with no geometry rather than a truncated body."
+            )
+        for primitive in self.geometry:
+            if primitive.pose_in_object.frame_id != self.frame_id:
+                raise ValueError(
+                    f"PlaceRegion.geometry primitive is posed in "
+                    f"{primitive.pose_in_object.frame_id!r}, not the region's own "
+                    f"{self.frame_id!r}. Target geometry is posed in the region frame, not "
+                    "relative to the region box."
+                )
+        return self
+
+    def volume_m3(self) -> float:
+        """Volume of the region box in cubic metres."""
+        hx, hy, hz = self.half_extents
+        return 8.0 * hx * hy * hz
+
+    @classmethod
+    def from_idl(cls, msg: object) -> Self:
+        """Decode the duck-typed OpenRAL ROS IDL message without importing ROS."""
+        pose = msg.pose  # type: ignore[attr-defined]
+        half = msg.half_extents  # type: ignore[attr-defined]
+        return cls(
+            frame_id=str(msg.frame_id),  # type: ignore[attr-defined]
+            pose=Pose6D(
+                xyz=(float(pose.position.x), float(pose.position.y), float(pose.position.z)),
+                quat_xyzw=(
+                    float(pose.orientation.x),
+                    float(pose.orientation.y),
+                    float(pose.orientation.z),
+                    float(pose.orientation.w),
+                ),
+                frame_id=str(msg.frame_id),  # type: ignore[attr-defined]
+            ),
+            half_extents=(float(half.x), float(half.y), float(half.z)),
+            evidence_ref=str(msg.evidence_ref),  # type: ignore[attr-defined]
+            stamp_ns=int(msg.stamp_ns),  # type: ignore[attr-defined]
+            geometry=tuple(
+                AttachedCollisionPrimitive.from_idl(item, object_id=str(msg.frame_id))  # type: ignore[attr-defined]
+                for item in msg.geometry  # type: ignore[attr-defined]
+            ),
+        )
+
+    def fill_idl(
+        self, msg: object, *, primitive_factory: Callable[[], object] | None = None
+    ) -> None:
+        """Populate a duck-typed OpenRAL ROS IDL message without importing ROS.
+
+        Args:
+            msg: A duck-typed ``openral_msgs/PlaceRegion`` to populate in place.
+            primitive_factory: Builds one empty ``AttachedCollisionPrimitive``
+                message. Required only when ``geometry`` is non-empty —
+                dispatch never measures geometry, so its publication path never
+                needs one.
+
+        Raises:
+            ROSConfigError: ``geometry`` is non-empty and no
+                ``primitive_factory`` was supplied. Dropping the geometry
+                silently would leave the kernel adjudicating a declared target
+                it was told nothing about, which reads on the wire exactly like
+                a producer that measured nothing.
+        """
+        msg.frame_id = self.frame_id  # type: ignore[attr-defined]
+        msg.pose.position.x = float(self.pose.xyz[0])  # type: ignore[attr-defined]
+        msg.pose.position.y = float(self.pose.xyz[1])  # type: ignore[attr-defined]
+        msg.pose.position.z = float(self.pose.xyz[2])  # type: ignore[attr-defined]
+        msg.pose.orientation.x = float(self.pose.quat_xyzw[0])  # type: ignore[attr-defined]
+        msg.pose.orientation.y = float(self.pose.quat_xyzw[1])  # type: ignore[attr-defined]
+        msg.pose.orientation.z = float(self.pose.quat_xyzw[2])  # type: ignore[attr-defined]
+        msg.pose.orientation.w = float(self.pose.quat_xyzw[3])  # type: ignore[attr-defined]
+        msg.half_extents.x = float(self.half_extents[0])  # type: ignore[attr-defined]
+        msg.half_extents.y = float(self.half_extents[1])  # type: ignore[attr-defined]
+        msg.half_extents.z = float(self.half_extents[2])  # type: ignore[attr-defined]
+        msg.evidence_ref = self.evidence_ref  # type: ignore[attr-defined]
+        msg.stamp_ns = int(self.stamp_ns)  # type: ignore[attr-defined]
+        msg.geometry = []  # type: ignore[attr-defined]
+        if self.geometry and primitive_factory is None:
+            raise ROSConfigError(
+                f"PlaceRegion for {self.frame_id!r} carries {len(self.geometry)} target "
+                "primitives but fill_idl was given no primitive_factory to encode them. "
+                "Publishing the region without its geometry is indistinguishable on the wire "
+                "from a producer that measured none."
+            )
+        for primitive in self.geometry:
+            item = primitive_factory()  # type: ignore[misc]  # reason: guarded above
+            primitive.fill_idl(item)
+            msg.geometry.append(item)  # type: ignore[attr-defined]
+
+
+class PlaceDeclaration(BaseModel):
+    """Dispatch's typed statement that a place phase is active for a payload.
+
+    The ADR-0097 distinction between "arrived at its declared destination"
+    and "grazed a wall" mid-carry — never inferred from motion or simulator
+    introspection. On its own it exempts nothing: it only lets a producer
+    attest a place-phase ``SupportContactWitness`` on the declared
+    target, which the kernel then exempts under the pick witness's own
+    bounds/hysteresis (ADR-0092 D6). Scoped to one goal execution; dies on
+    retraction, goal end/cancel, E-stop, or ``timeout_s`` after
+    ``stamp_ns``, whichever fires first (HZ-0097-3).
+
+    Attributes:
+        target_id: Identity of the declared place target, e.g.
+            ``"sim:cab_1_left_group_main"``; an attested ``support_id`` must
+            name it or a surface of it.
+        object_id: Payload the declaration scopes to
+            (``AttachedCollisionObject.object_id``); empty = whichever
+            payload is carried.
+        rskill_id: Dispatching skill, for attributability (HZ-0097-2).
+        trace_id: OTel trace id, for attributability (HZ-0097-2).
+        timeout_s: Backstop expiry window in seconds after ``stamp_ns``; capped
+            at ``MAX_TIMEOUT_S``.
+        stamp_ns: Dispatcher timestamp; with ``active`` this is the whole
+            liveness key.
+        active: ``False`` retracts the declaration.
+        contact_force_threshold_n: Per-declaration contact-force bound
+            (ADR-0100); ``0.0`` = no force gate. Never read from the
+            robot-wide ``SafetyEnvelope.contact_force_threshold_n``.
+        region: Producer-measured bounded region of the target (ADR-0097's
+            2026-08-14 amendment); ``None`` = no approach allowance
+            (pre-amendment margins). Dies with the declaration.
+
+    Example:
+        >>> declaration = PlaceDeclaration(
+        ...     target_id="sim:cab_1_left_group_main",
+        ...     rskill_id="openral/pi05-robocasa",
+        ...     timeout_s=60.0,
+        ...     stamp_ns=1_000_000_000,
+        ... )
+        >>> declaration.is_live(now_ns=31_000_000_000)
+        True
+        >>> declaration.is_live(now_ns=91_000_000_000)
+        False
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Ceiling on ``timeout_s``. The hazard the backstop bounds is a
+    #: declaration outliving *its own goal execution*, so the ceiling is set at
+    #: goal scale, not mission scale: strictly above the largest
+    #: ``latency_budget.max_execution_s`` any in-tree rSkill manifest declares
+    #: (420 s, ``rskills/lingbot-va-galaxea-a1-fruit-placement``), so no
+    #: legitimate goal can have its declaration expired early by the cap, and
+    #: far below anything that would span a mission.
+    MAX_TIMEOUT_S: ClassVar[float] = 600.0
+
+    #: Ceiling on ``contact_force_threshold_n`` (ADR-0100). A threshold is a
+    #: bound on permitted contact, so an absurd one is not merely useless — it
+    #: reads as a gate that is armed while being unreachable in practice. The
+    #: value is ISO/TS 15066 Table A.2's quasi-static limit for hands and
+    #: fingers (140 N), which is the most permissive body region in the table
+    #: and therefore the highest number any place declaration could honestly
+    #: justify. Mirrored in the kernel as ``kMaxContactForceThresholdN``: one
+    #: bound declared on both sides of the wire, so a schema-valid declaration
+    #: can never overflow the kernel.
+    MAX_CONTACT_FORCE_THRESHOLD_N: ClassVar[float] = 140.0
+
+    target_id: str = ""
+    object_id: str = ""
+    rskill_id: str = ""
+    trace_id: str = ""
+    timeout_s: float = Field(gt=0.0)
+    stamp_ns: int = Field(ge=0)
+    active: bool = True
+    region: PlaceRegion | None = None
+    contact_force_threshold_n: float = 0.0
+
+    @model_validator(mode="after")
+    def _validate_declaration(self) -> PlaceDeclaration:
+        if self.timeout_s > self.MAX_TIMEOUT_S:
+            raise ValueError(
+                f"PlaceDeclaration.timeout_s {self.timeout_s!r} exceeds the "
+                f"{self.MAX_TIMEOUT_S} s backstop ceiling."
+            )
+        if self.active and not self.target_id:
+            raise ValueError("An active PlaceDeclaration must name a target_id.")
+        if not math.isfinite(self.contact_force_threshold_n):
+            raise ValueError(
+                "PlaceDeclaration.contact_force_threshold_n must be finite; "
+                f"got {self.contact_force_threshold_n!r}."
+            )
+        if self.contact_force_threshold_n > self.MAX_CONTACT_FORCE_THRESHOLD_N:
+            raise ValueError(
+                f"PlaceDeclaration.contact_force_threshold_n "
+                f"{self.contact_force_threshold_n!r} exceeds the "
+                f"{self.MAX_CONTACT_FORCE_THRESHOLD_N} N ceiling."
+            )
+        return self
+
+    def is_live(self, *, now_ns: int) -> bool:
+        """Is this declaration still in force at ``now_ns``?
+
+        Fails toward dead: a retracted declaration, one past its backstop, and
+        one stamped in the future (a clock that jumped, which is not evidence
+        of anything) are all dead. A dead declaration permits no place-witness
+        attestation, which is the pre-ADR-0097 behaviour.
+
+        **Clock-domain contract.** ``now_ns`` and ``stamp_ns`` must be
+        readings of the *same* clock, and that clock is the publishing graph's
+        ROS clock: the dispatching rSkill runner stamps the declaration from
+        ``node.get_clock().now()``, the evidence producer re-stamps its
+        publications from the same clock, and the safety kernel compares against
+        its own. Under ``use_sim_time`` that domain is **simulator** time, whose
+        readings are small (order 1e9 ns) where wall time is order 1.79e18 ns.
+        A consumer that has no such reading of its own must use the newest stamp
+        observed on the message stream carrying the declaration — never
+        ``time.time_ns``, which reports a wall epoch that puts every sim-stamped
+        declaration ~57 years past its backstop and silently kills it.
+
+        Args:
+            now_ns: Consumer's current time, same clock as ``stamp_ns`` — see
+                the clock-domain contract above.
+
+        Returns:
+            ``True`` only while the declaration is active and inside its
+            backstop window.
+        """
+        if not self.active:
+            return False
+        elapsed_ns = now_ns - self.stamp_ns
+        return 0 <= elapsed_ns <= int(self.timeout_s * 1e9)
+
+    @classmethod
+    def from_idl(cls, msg: object) -> Self:
+        """Decode the duck-typed OpenRAL ROS IDL message without importing ROS."""
+        return cls(
+            target_id=str(msg.target_id),  # type: ignore[attr-defined]
+            object_id=str(msg.object_id),  # type: ignore[attr-defined]
+            rskill_id=str(msg.rskill_id),  # type: ignore[attr-defined]
+            trace_id=str(msg.trace_id),  # type: ignore[attr-defined]
+            timeout_s=float(msg.timeout_s),  # type: ignore[attr-defined]
+            stamp_ns=int(msg.stamp_ns),  # type: ignore[attr-defined]
+            active=bool(msg.active),  # type: ignore[attr-defined]
+            contact_force_threshold_n=float(getattr(msg, "contact_force_threshold_n", 0.0)),
+            region=(
+                PlaceRegion.from_idl(msg.region)  # type: ignore[attr-defined]
+                if bool(getattr(msg, "region_valid", False))
+                else None
+            ),
+        )
+
+    def fill_idl(
+        self, msg: object, *, primitive_factory: Callable[[], object] | None = None
+    ) -> None:
+        """Populate a duck-typed OpenRAL ROS IDL message without importing ROS.
+
+        Args:
+            msg: A duck-typed ``openral_msgs/PlaceDeclaration`` to populate.
+            primitive_factory: Forwarded to ``PlaceRegion.fill_idl``; needed
+                only when the region carries the declared target's own geometry
+                (ADR-0098). Dispatch never measures geometry, so its publication
+                path never needs one.
+        """
+        msg.target_id = self.target_id  # type: ignore[attr-defined]
+        msg.object_id = self.object_id  # type: ignore[attr-defined]
+        msg.rskill_id = self.rskill_id  # type: ignore[attr-defined]
+        msg.trace_id = self.trace_id  # type: ignore[attr-defined]
+        msg.timeout_s = float(self.timeout_s)  # type: ignore[attr-defined]
+        msg.stamp_ns = int(self.stamp_ns)  # type: ignore[attr-defined]
+        msg.active = bool(self.active)  # type: ignore[attr-defined]
+        msg.contact_force_threshold_n = float(  # type: ignore[attr-defined]
+            self.contact_force_threshold_n
+        )
+        msg.region_valid = self.region is not None  # type: ignore[attr-defined]
+        if self.region is not None:
+            self.region.fill_idl(
+                msg.region,  # type: ignore[attr-defined]
+                primitive_factory=primitive_factory,
+            )
+
+
+class SupportContactWitness(BaseModel):
+    """Bounded attestation that a payload rests on a named support surface.
+
+    Attachment says what the robot is carrying; it does not say the payload
+    is free of its environment (ADR-0092 D6). A grasped baguette still lies
+    on the counter while the gripper closes, and the safety kernel correctly
+    sees that as a payload-vs-world penetration. This witness is World
+    State's statement that one specific contact is legitimate — the kernel
+    exempts nothing else. Absent witness, absent exemption: the kernel stops.
+
+    Geometry is expressed in the **attached object's own frame**,
+    deliberately not the base frame and not voxel indices: indices
+    decorrelate as a mobile base drives and the occupancy lattice re-phases
+    underneath the robot, while the physical contact persists — the object
+    frame moves with the payload, so the attested plane keeps naming the
+    same physical support face.
+
+    ``max_penetration_m`` is a **physical** depth. A 25 mm occupancy lattice
+    reads a 1 mm physical contact as up to ~15 mm of penetration because the
+    surface cell's cube overshoots the true surface; the kernel accounts for
+    that discretisation separately and geometrically, so inflating this field
+    to cover it would license real penetration.
+
+    Attributes:
+        support_id: Identity of the supporting environment surface.
+        contact_point_in_object: A point on the support plane, object frame.
+        contact_normal_in_object: Unit outward support normal in the object
+            frame, pointing from the supporting solid toward the payload.
+        patch_radius_m: Lateral radius of the supported patch about the contact
+            point. Contact outside it is never exempt.
+        max_penetration_m: Attested bound on the physical penetration depth.
+        confidence: Witness confidence in ``[0, 1]``.
+        evidence_kind: Source that measured the support contact. The MuJoCo
+            producer attests ``SIM_GEOM_DISTANCE`` — a signed closest-distance
+            probe, not the solver's contact list, which ``contype`` /
+            ``conaffinity`` suppression can leave empty under a payload that is
+            demonstrably resting on a surface.
+        evidence_ref: Optional trace/contact reference.
+        stamp_ns: Producer timestamp. With ``support_id`` this keys the safety
+            kernel's re-arm check, so a witness that already died after
+            separation stays dead until a genuinely new one is attested.
+
+    Example:
+        >>> witness = SupportContactWitness(
+        ...     support_id="sim:counter_main",
+        ...     contact_point_in_object=(0.0, 0.0, -0.025),
+        ...     contact_normal_in_object=(0.0, 0.0, 1.0),
+        ...     patch_radius_m=0.1,
+        ...     max_penetration_m=0.00118,
+        ...     confidence=1.0,
+        ...     evidence_kind=AttachmentEvidenceKind.SIM_GEOM_DISTANCE,
+        ...     stamp_ns=1,
+        ... )
+        >>> witness.patch_radius_m
+        0.1
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    support_id: str = Field(min_length=1)
+    contact_point_in_object: tuple[float, float, float]
+    contact_normal_in_object: tuple[float, float, float]
+    patch_radius_m: float = Field(gt=0.0)
+    max_penetration_m: float = Field(ge=0.0)
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence_kind: AttachmentEvidenceKind
+    evidence_ref: str | None = None
+    stamp_ns: int = Field(ge=0)
+
+    _UNIT_NORMAL_TOLERANCE: ClassVar[float] = 1e-6
+
+    @model_validator(mode="after")
+    def _validate_witness(self) -> SupportContactWitness:
+        norm = math.sqrt(sum(component * component for component in self.contact_normal_in_object))
+        if not math.isfinite(norm) or abs(norm - 1.0) > self._UNIT_NORMAL_TOLERANCE:
+            raise ValueError(
+                "SupportContactWitness.contact_normal_in_object must be a unit vector "
+                f"(norm {norm!r})."
+            )
+        return self
+
+    @classmethod
+    def from_idl(cls, msg: object) -> Self:
+        """Decode the duck-typed OpenRAL ROS IDL message without importing ROS."""
+        point = msg.contact_point_in_object  # type: ignore[attr-defined]
+        normal = msg.contact_normal_in_object  # type: ignore[attr-defined]
+        return cls(
+            support_id=str(msg.support_id),  # type: ignore[attr-defined]
+            contact_point_in_object=(float(point.x), float(point.y), float(point.z)),
+            contact_normal_in_object=(float(normal.x), float(normal.y), float(normal.z)),
+            patch_radius_m=float(msg.patch_radius_m),  # type: ignore[attr-defined]
+            max_penetration_m=float(msg.max_penetration_m),  # type: ignore[attr-defined]
+            confidence=float(msg.confidence),  # type: ignore[attr-defined]
+            evidence_kind=AttachmentEvidenceKind(str(msg.evidence_kind)),  # type: ignore[attr-defined]
+            evidence_ref=str(msg.evidence_ref) or None,  # type: ignore[attr-defined]
+            stamp_ns=int(msg.stamp_ns),  # type: ignore[attr-defined]
+        )
+
+    def fill_idl(self, msg: object) -> None:
+        """Populate a duck-typed OpenRAL ROS IDL message without importing ROS."""
+        msg.support_id = self.support_id  # type: ignore[attr-defined]
+        point = msg.contact_point_in_object  # type: ignore[attr-defined]
+        point.x, point.y, point.z = self.contact_point_in_object
+        normal = msg.contact_normal_in_object  # type: ignore[attr-defined]
+        normal.x, normal.y, normal.z = self.contact_normal_in_object
+        msg.patch_radius_m = float(self.patch_radius_m)  # type: ignore[attr-defined]
+        msg.max_penetration_m = float(self.max_penetration_m)  # type: ignore[attr-defined]
+        msg.confidence = float(self.confidence)  # type: ignore[attr-defined]
+        msg.evidence_kind = self.evidence_kind.value  # type: ignore[attr-defined]
+        msg.evidence_ref = self.evidence_ref or ""  # type: ignore[attr-defined]
+        msg.stamp_ns = int(self.stamp_ns)  # type: ignore[attr-defined]
+
+
+class ContactForceWitness(BaseModel):
+    """Bounded attestation of a MEASURED contact force on the declared target.
+
+    The second observable on the place path (ADR-0100, Path C): force is what
+    distinguishes "set down" from "crush" once position clearance hits zero.
+    The gate this feeds only ever adds a refusal — never widens an ADR-0097
+    allowance or moves a margin. ``magnitude_n`` is Newtons only when
+    ``magnitude_calibrated`` (no published work validates MuJoCo contact
+    force against real F/T measurements; FORGE arXiv:2408.04587 re-tunes on
+    hardware); ``direction_in_object`` has no such caveat (arXiv:2602.14174).
+    Absence of a witness is never evidence of no contact — ``contype``/
+    ``conaffinity`` suppression can empty the solver's contact list under a
+    payload demonstrably in contact.
+
+    Attributes:
+        target_id: Surface the measured contact is against; the gate arms
+            only when this names the live declaration's target or a surface of it.
+        direction_in_object: Unit contact-force direction in the attached
+            object's frame (not base frame — decorrelates as a mobile base drives).
+        magnitude_n: Contact force magnitude; Newtons only when
+            ``magnitude_calibrated``, else an ignored uncalibrated number.
+        magnitude_calibrated: ``False`` (default, uncalibrated) means the force gate does not arm.
+        calibration_ref: Names the calibration ``magnitude_n`` was produced
+            under; required when ``magnitude_calibrated``.
+        confidence: Witness confidence in ``[0, 1]``.
+        evidence_kind: Source that measured the force; the MuJoCo producer
+            attests ``AttachmentEvidenceKind.SIM_CONTACT_FORCE``.
+        evidence_ref: Optional trace / producer reference.
+        stamp_ns: Producer timestamp; with ``target_id`` keys the kernel's re-arm check.
+
+    Example:
+        >>> witness = ContactForceWitness(
+        ...     target_id="sim:cab_1_left_group_main",
+        ...     direction_in_object=(0.0, 0.0, 1.0),
+        ...     magnitude_n=4.5,
+        ...     magnitude_calibrated=False,
+        ...     confidence=1.0,
+        ...     evidence_kind=AttachmentEvidenceKind.SIM_CONTACT_FORCE,
+        ...     stamp_ns=1,
+        ... )
+        >>> witness.magnitude_calibrated
+        False
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_id: str = Field(min_length=1)
+    direction_in_object: tuple[float, float, float]
+    magnitude_n: float = Field(ge=0.0)
+    magnitude_calibrated: bool = False
+    calibration_ref: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence_kind: AttachmentEvidenceKind
+    evidence_ref: str | None = None
+    stamp_ns: int = Field(ge=0)
+
+    _UNIT_DIRECTION_TOLERANCE: ClassVar[float] = 1e-6
+
+    @model_validator(mode="after")
+    def _validate_witness(self) -> ContactForceWitness:
+        norm = math.sqrt(sum(component * component for component in self.direction_in_object))
+        if not math.isfinite(norm) or abs(norm - 1.0) > self._UNIT_DIRECTION_TOLERANCE:
+            raise ValueError(
+                f"ContactForceWitness.direction_in_object must be a unit vector (norm {norm!r})."
+            )
+        if not math.isfinite(self.magnitude_n):
+            raise ValueError("ContactForceWitness.magnitude_n must be finite.")
+        # A calibrated magnitude that cannot name its calibration is exactly the
+        # claim CLAUDE.md 1.2 forbids: it asserts Newtons with no way to check
+        # what produced them. Refuse it at the schema rather than let the kernel
+        # decline it silently later.
+        if self.magnitude_calibrated and not (self.calibration_ref or "").strip():
+            raise ValueError(
+                "ContactForceWitness.calibration_ref is required when magnitude_calibrated is true."
+            )
+        return self
+
+    @classmethod
+    def from_idl(cls, msg: object) -> Self:
+        """Decode the duck-typed OpenRAL ROS IDL message without importing ROS."""
+        direction = msg.direction_in_object  # type: ignore[attr-defined]
+        return cls(
+            target_id=str(msg.target_id),  # type: ignore[attr-defined]
+            direction_in_object=(
+                float(direction.x),
+                float(direction.y),
+                float(direction.z),
+            ),
+            magnitude_n=float(msg.magnitude_n),  # type: ignore[attr-defined]
+            magnitude_calibrated=bool(msg.magnitude_calibrated),  # type: ignore[attr-defined]
+            calibration_ref=str(msg.calibration_ref) or None,  # type: ignore[attr-defined]
+            confidence=float(msg.confidence),  # type: ignore[attr-defined]
+            evidence_kind=AttachmentEvidenceKind(str(msg.evidence_kind)),  # type: ignore[attr-defined]
+            evidence_ref=str(msg.evidence_ref) or None,  # type: ignore[attr-defined]
+            stamp_ns=int(msg.stamp_ns),  # type: ignore[attr-defined]
+        )
+
+    def fill_idl(self, msg: object) -> None:
+        """Populate a duck-typed OpenRAL ROS IDL message without importing ROS."""
+        msg.target_id = self.target_id  # type: ignore[attr-defined]
+        direction = msg.direction_in_object  # type: ignore[attr-defined]
+        direction.x, direction.y, direction.z = self.direction_in_object
+        msg.magnitude_n = float(self.magnitude_n)  # type: ignore[attr-defined]
+        msg.magnitude_calibrated = bool(self.magnitude_calibrated)  # type: ignore[attr-defined]
+        msg.calibration_ref = self.calibration_ref or ""  # type: ignore[attr-defined]
+        msg.confidence = float(self.confidence)  # type: ignore[attr-defined]
+        msg.evidence_kind = self.evidence_kind.value  # type: ignore[attr-defined]
+        msg.evidence_ref = self.evidence_ref or ""  # type: ignore[attr-defined]
+        msg.stamp_ns = int(self.stamp_ns)  # type: ignore[attr-defined]
+
+
+def _tight_geometry_from_idl(msg: object) -> TightCollisionGeometry | None:
+    """Decode a duck-typed primitive's optional stage-2 refinement.
+
+    ``None`` whenever the wire carries no usable refinement: the pre-#266
+    message, every primitive whose sim geom lowered exactly and has nothing to
+    refine, **and** anything malformed.
+
+    Malformed **fails down**, and that is the whole design of this function.
+    The kernel's ``ingest_attached_objects`` drops a refinement it cannot prove
+    and keeps the payload as its box; if this raised instead, one bad producer
+    message would keep the kernel running while killing the world-state
+    subscriber callback that decodes the very same bytes
+    (``openral_world_state_ros.lifecycle_node``,
+    ``openral_hal.sim_sensor_bridge``). Two behaviours for one wire condition
+    is the defect — not which of them is stricter.
+
+    The refinement is dropped whole, never half-kept: the slabs and the hull
+    are one containment chain, and half of one is not a bound. An over-budget
+    or ragged hull drops the **vertices only** and keeps the slabs, which is
+    stage 1 — the same thing the kernel does with it, and the same thing the
+    producer emits for the same condition.
+    """
+    dop_lo = [float(value) for value in getattr(msg, "tight_dop_lo", ())]
+    dop_hi = [float(value) for value in getattr(msg, "tight_dop_hi", ())]
+    flat = [float(value) for value in getattr(msg, "tight_hull_vertices", ())]
+    if len(dop_lo) != len(DOP_AXES) or len(dop_hi) != len(DOP_AXES):
+        return None  # absent, or a half-filled pair of slab arrays
+    if len(flat) % 3 != 0 or len(flat) // 3 > MAX_TIGHT_HULL_VERTICES:
+        flat = []  # unusable hull; the slabs still bound the payload
+    return TightCollisionGeometry(
+        dop_lo_m=tuple(dop_lo),
+        dop_hi_m=tuple(dop_hi),
+        hull_vertices_m=tuple((flat[i], flat[i + 1], flat[i + 2]) for i in range(0, len(flat), 3)),
+    )
+
+
+class AttachedCollisionPrimitive(BaseModel):
+    """One bounded payload primitive positioned in its object frame.
+
+    Attributes:
+        shape: The convex primitive (capsule, sphere, or box).
+        pose_in_object: Pose of the primitive in the owning object's frame.
+        tight_geometry: Optional tighter convex geometry the safety kernel uses
+            *in place of* ``shape`` in the payload-vs-world-voxel check — the
+            same staged 26-DOP → exact-hull narrow phase a robot link gets from
+            ``LinkCollisionGeometry.tight_geometry``, and the same containment
+            rule: only valid on a ``BoxShape``, and only when it fits inside
+            it. ``shape`` stays the broad-phase bound and the geometry every
+            other check uses.
+
+            ``None`` is not a defect — a sphere/box/capsule sim geom lowers
+            *exactly* and has nothing to refine. It is only a mesh geom, whose
+            lowering is its local AABB, that leaves a real gap: measured across
+            the 2026-09-10 resolution A/B (424 samples, 4 scenes) a carried
+            payload's box corners stand a median 50.78 mm proud of the mesh,
+            2.3-3.9x the entire world-voxel quantisation term, and 97 % of
+            15 mm-arm stops were payload-vs-world (issue #266).
+
+    Example:
+        >>> p = AttachedCollisionPrimitive(
+        ...     shape=BoxShape(half_extents_m=(0.03, 0.03, 0.09)),
+        ...     pose_in_object=Pose6D(
+        ...         xyz=(0.0, 0.0, 0.0),
+        ...         quat_xyzw=(0.0, 0.0, 0.0, 1.0),
+        ...         frame_id="sim:obj_main",
+        ...     ),
+        ... )
+        >>> p.tight_geometry is None
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    shape: CollisionShape
+    pose_in_object: Pose6D
+    tight_geometry: TightCollisionGeometry | None = None
+
+    @model_validator(mode="after")
+    def _tight_geometry_fits_inside_the_box(self) -> Self:
+        """Prove the refinement is inside the box, at the producer boundary."""
+        if self.tight_geometry is not None:
+            check_tight_geometry_fits_box(
+                self.shape, self.tight_geometry, "attached collision primitive"
+            )
+        return self
+
+    @classmethod
+    def from_idl(cls, msg: object, *, object_id: str) -> Self:
+        """Decode one duck-typed attached primitive without importing ROS."""
+        dimensions = [float(value) for value in msg.shape_dimensions]  # type: ignore[attr-defined]
+        shape_type = int(msg.shape_type)  # type: ignore[attr-defined]
+        if shape_type == int(msg.SHAPE_SPHERE):  # type: ignore[attr-defined]
+            if len(dimensions) != 1:
+                raise ValueError("Attached sphere requires one shape dimension.")
+            shape: CollisionShape = SphereShape(radius_m=dimensions[0])
+        elif shape_type == int(msg.SHAPE_CAPSULE):  # type: ignore[attr-defined]
+            if len(dimensions) != 2:  # noqa: PLR2004
+                raise ValueError("Attached capsule requires two shape dimensions.")
+            shape = CapsuleShape(radius_m=dimensions[0], length_m=dimensions[1])
+        elif shape_type == int(msg.SHAPE_BOX):  # type: ignore[attr-defined]
+            if len(dimensions) != 3:  # noqa: PLR2004
+                raise ValueError("Attached box requires three shape dimensions.")
+            shape = BoxShape(half_extents_m=(dimensions[0], dimensions[1], dimensions[2]))
+        else:
+            raise ValueError(f"Unknown attached collision shape type: {shape_type}")
+        pose = msg.pose_in_object  # type: ignore[attr-defined]
+        return cls(
+            shape=shape,
+            pose_in_object=Pose6D(
+                xyz=(
+                    float(pose.position.x),
+                    float(pose.position.y),
+                    float(pose.position.z),
+                ),
+                quat_xyzw=(
+                    float(pose.orientation.x),
+                    float(pose.orientation.y),
+                    float(pose.orientation.z),
+                    float(pose.orientation.w),
+                ),
+                frame_id=object_id,
+            ),
+            tight_geometry=_tight_geometry_from_idl(msg),
+        )
+
+    def fill_idl(self, msg: object) -> None:
+        """Populate one duck-typed attached primitive without importing ROS.
+
+        Args:
+            msg: A duck-typed ``openral_msgs/AttachedCollisionPrimitive`` to
+                populate in place.
+
+        Raises:
+            ROSConfigError: The primitive is none of the three shapes the IDL
+                can carry.
+
+        Fail-closed: an unrepresentable shape raises here rather than
+        publishing ``shape_type=0`` (the IDL default, indistinguishable from
+        "no shape"). Mirrors the fail-closed pattern in
+        ``openral_cli.collision.collision_primitive_envelope`` and this
+        class's own ``from_idl``, which already refuses an unknown
+        ``shape_type``.
+        """
+        if isinstance(self.shape, SphereShape):
+            msg.shape_type = msg.SHAPE_SPHERE  # type: ignore[attr-defined]
+            msg.shape_dimensions = [float(self.shape.radius_m)]  # type: ignore[attr-defined]
+        elif isinstance(self.shape, CapsuleShape):
+            msg.shape_type = msg.SHAPE_CAPSULE  # type: ignore[attr-defined]
+            msg.shape_dimensions = [  # type: ignore[attr-defined]
+                float(self.shape.radius_m),
+                float(self.shape.length_m),
+            ]
+        elif isinstance(self.shape, BoxShape):
+            msg.shape_type = msg.SHAPE_BOX  # type: ignore[attr-defined]
+            msg.shape_dimensions = [  # type: ignore[attr-defined]
+                float(value) for value in self.shape.half_extents_m
+            ]
+        else:
+            raise ROSConfigError(
+                f"attached collision primitive {self.shape.shape!r} has no "
+                "openral_msgs/AttachedCollisionPrimitive encoding. Add a SHAPE_* "
+                "constant and a branch here (and in from_idl) before carrying it "
+                "on a payload — it must never be published as an unset shape."
+            )
+        pose = msg.pose_in_object  # type: ignore[attr-defined]
+        pose.position.x, pose.position.y, pose.position.z = self.pose_in_object.xyz
+        (
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        ) = self.pose_in_object.quat_xyzw
+        tight = self.tight_geometry
+        msg.tight_dop_lo = [] if tight is None else list(tight.dop_lo_m)  # type: ignore[attr-defined]
+        msg.tight_dop_hi = [] if tight is None else list(tight.dop_hi_m)  # type: ignore[attr-defined]
+        msg.tight_hull_vertices = (  # type: ignore[attr-defined]
+            []
+            if tight is None
+            else [coordinate for vertex in tight.hull_vertices_m for coordinate in vertex]
+        )
+
+
+class AttachedCollisionObject(BaseModel):
+    """Collision geometry rigidly attached to a robot link.
+
+    The object is removed from world occupancy only when the same geometry is
+    present here, so collision checking never loses the carried payload. The
+    removal itself is the occupancy bridge's (``openral_octomap_bridge`` clears
+    the payload's own cells out of ``/openral/world_voxels`` while it appears
+    here); the kernel keeps checking the payload as robot geometry.
+
+    Attributes:
+        object_id: Stable perception/world identity.
+        attach_link: Robot link that owns the link-relative pose.
+        touch_links: Explicit robot links allowed to contact the object.
+        primitives: Bounded collision geometry in the object frame.
+        pose_in_link: Object pose whose ``frame_id`` equals ``attach_link``.
+        mass_kg: Optional payload mass for real controller integration.
+        center_of_mass_m: Optional payload CoG in the attached-object frame.
+        inertia_kg_m2: Optional row-major 3x3 inertia matrix.
+        confidence: Attachment confidence in ``[0, 1]``.
+        evidence_kind: Source that confirmed the attachment.
+        evidence_ref: Optional trace/contact/track reference.
+        stamp_ns: Confirmation timestamp.
+        contact_force: Optional attestation of a measured contact force on the
+            declared place target (ADR-0100). ``None`` — the default, and what
+            every producer that cannot measure force publishes — means the
+            declaration-scoped force gate never arms and geometry decides
+            alone. The gate it feeds only ever adds a refusal; it never
+            licenses a contact the geometry refuses.
+        support_contact: Optional attestation that this payload is in bounded
+            support contact with a named environment surface (ADR-0092 D6).
+            ``None`` — the honest value for any producer that cannot measure
+            support contact, including the vision attachment producer — means
+            the safety kernel exempts no payload-vs-world contact at all.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    object_id: str = Field(min_length=1)
+    attach_link: str = Field(min_length=1)
+    touch_links: list[str] = Field(min_length=1)
+    primitives: list[AttachedCollisionPrimitive] = Field(min_length=1, max_length=16)
+    pose_in_link: Pose6D
+    mass_kg: float | None = Field(default=None, ge=0.0)
+    center_of_mass_m: tuple[float, float, float] | None = None
+    inertia_kg_m2: tuple[float, ...] | None = Field(default=None, min_length=9, max_length=9)
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence_kind: AttachmentEvidenceKind
+    evidence_ref: str | None = None
+    stamp_ns: int = Field(ge=0)
+    support_contact: SupportContactWitness | None = None
+    contact_force: ContactForceWitness | None = None
+
+    @model_validator(mode="after")
+    def _validate_attachment(self) -> AttachedCollisionObject:
+        if self.pose_in_link.frame_id != self.attach_link:
+            raise ValueError(
+                "AttachedCollisionObject.pose_in_link.frame_id must equal attach_link "
+                f"({self.pose_in_link.frame_id!r} != {self.attach_link!r})."
+            )
+        if len(set(self.touch_links)) != len(self.touch_links):
+            raise ValueError("AttachedCollisionObject.touch_links must be unique.")
+        for primitive in self.primitives:
+            if primitive.pose_in_object.frame_id != self.object_id:
+                raise ValueError(
+                    "AttachedCollisionPrimitive.pose_in_object.frame_id must equal "
+                    f"object_id ({primitive.pose_in_object.frame_id!r} != {self.object_id!r})."
+                )
+        if self.mass_kg is None and (
+            self.center_of_mass_m is not None or self.inertia_kg_m2 is not None
+        ):
+            raise ValueError("AttachedCollisionObject payload CoG/inertia requires mass_kg.")
+        return self
+
+    @classmethod
+    def from_idl(cls, msg: object) -> Self:
+        """Decode the duck-typed OpenRAL ROS IDL message without importing ROS."""
+        center_of_mass = None
+        if bool(msg.center_of_mass_valid):  # type: ignore[attr-defined]
+            center = msg.center_of_mass_m  # type: ignore[attr-defined]
+            center_of_mass = (float(center.x), float(center.y), float(center.z))
+        inertia = (
+            tuple(float(value) for value in msg.inertia_kg_m2)  # type: ignore[attr-defined]
+            if bool(msg.inertia_valid)  # type: ignore[attr-defined]
+            else None
+        )
+        pose = msg.pose_in_link  # type: ignore[attr-defined]
+        attach_link = str(msg.attach_link)  # type: ignore[attr-defined]
+        return cls(
+            object_id=str(msg.object_id),  # type: ignore[attr-defined]
+            attach_link=attach_link,
+            touch_links=list(msg.touch_links),  # type: ignore[attr-defined]
+            primitives=[
+                AttachedCollisionPrimitive.from_idl(item, object_id=str(msg.object_id))  # type: ignore[attr-defined]
+                for item in msg.primitives  # type: ignore[attr-defined]
+            ],
+            pose_in_link=Pose6D(
+                xyz=(
+                    float(pose.position.x),
+                    float(pose.position.y),
+                    float(pose.position.z),
+                ),
+                quat_xyzw=(
+                    float(pose.orientation.x),
+                    float(pose.orientation.y),
+                    float(pose.orientation.z),
+                    float(pose.orientation.w),
+                ),
+                frame_id=attach_link,
+            ),
+            mass_kg=(
+                float(msg.mass_kg)  # type: ignore[attr-defined]
+                if bool(msg.mass_valid)  # type: ignore[attr-defined]
+                else None
+            ),
+            center_of_mass_m=center_of_mass,
+            inertia_kg_m2=inertia,
+            confidence=float(msg.confidence),  # type: ignore[attr-defined]
+            evidence_kind=AttachmentEvidenceKind(str(msg.evidence_kind)),  # type: ignore[attr-defined]
+            evidence_ref=str(msg.evidence_ref) or None,  # type: ignore[attr-defined]
+            stamp_ns=int(msg.stamp_ns),  # type: ignore[attr-defined]
+            contact_force=(
+                ContactForceWitness.from_idl(msg.contact_force)  # type: ignore[attr-defined]
+                if bool(getattr(msg, "contact_force_valid", False))
+                else None
+            ),
+            support_contact=(
+                SupportContactWitness.from_idl(msg.support_contact)  # type: ignore[attr-defined]
+                if bool(msg.support_contact_valid)  # type: ignore[attr-defined]
+                else None
+            ),
+        )
+
+    def fill_idl(self, msg: object, *, primitive_factory: Callable[[], object]) -> None:
+        """Populate a duck-typed OpenRAL ROS IDL message without importing ROS."""
+        msg.object_id = self.object_id  # type: ignore[attr-defined]
+        msg.attach_link = self.attach_link  # type: ignore[attr-defined]
+        msg.touch_links = list(self.touch_links)  # type: ignore[attr-defined]
+        msg.primitives = []  # type: ignore[attr-defined]
+        for primitive in self.primitives:
+            item = primitive_factory()
+            primitive.fill_idl(item)
+            msg.primitives.append(item)  # type: ignore[attr-defined]
+        pose = msg.pose_in_link  # type: ignore[attr-defined]
+        pose.position.x, pose.position.y, pose.position.z = self.pose_in_link.xyz
+        (
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        ) = self.pose_in_link.quat_xyzw
+        msg.mass_valid = self.mass_kg is not None  # type: ignore[attr-defined]
+        msg.mass_kg = float(self.mass_kg or 0.0)  # type: ignore[attr-defined]
+        msg.center_of_mass_valid = self.center_of_mass_m is not None  # type: ignore[attr-defined]
+        if self.center_of_mass_m is not None:
+            center = msg.center_of_mass_m  # type: ignore[attr-defined]
+            center.x, center.y, center.z = self.center_of_mass_m
+        msg.inertia_valid = self.inertia_kg_m2 is not None  # type: ignore[attr-defined]
+        msg.inertia_kg_m2 = (  # type: ignore[attr-defined]
+            [float(value) for value in self.inertia_kg_m2]
+            if self.inertia_kg_m2 is not None
+            else [0.0] * 9
+        )
+        msg.confidence = float(self.confidence)  # type: ignore[attr-defined]
+        msg.evidence_kind = self.evidence_kind.value  # type: ignore[attr-defined]
+        msg.evidence_ref = self.evidence_ref or ""  # type: ignore[attr-defined]
+        msg.stamp_ns = int(self.stamp_ns)  # type: ignore[attr-defined]
+        msg.support_contact_valid = self.support_contact is not None  # type: ignore[attr-defined]
+        if self.support_contact is not None:
+            self.support_contact.fill_idl(msg.support_contact)  # type: ignore[attr-defined]
+        msg.contact_force_valid = self.contact_force is not None  # type: ignore[attr-defined]
+        if self.contact_force is not None:
+            self.contact_force.fill_idl(msg.contact_force)  # type: ignore[attr-defined]
+
+
+class OccupancyGridRef(BaseModel):
+    """Reference to a 2D occupancy grid for mobile-base world-collision.
+
+    Mirrors the ``nav_msgs/OccupancyGrid`` metadata that
+    ``openral_runner.slam_bridge`` already decodes. The kernel consumes a
+    bounded, fixed-capacity copy; a grid exceeding the configured capacity or
+    older than the staleness deadline is treated as unavailable
+    (fail-closed). The occupancy bytes are referenced by topic, not inlined.
+
+    Attributes:
+        frame_id: tf2 frame the grid origin is expressed in (e.g. ``"map"``).
+        resolution_m: Edge length of one cell, in metres.
+        width: Grid width in cells.
+        height: Grid height in cells.
+        origin: Pose of cell ``(0, 0)``'s lower-left corner.
+        data_topic: ROS 2 topic carrying the ``nav_msgs/OccupancyGrid``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    frame_id: str
+    resolution_m: float = Field(gt=0.0)
+    width: int = Field(ge=0)
+    height: int = Field(ge=0)
+    origin: Pose6D
+    data_topic: str
+
+
+class FrameEncoding(str, Enum):
+    """How the bytes inside a ``SensorFrame`` are interpreted.
+
+    The first four values are raw per-pixel layouts. ``JPEG`` / ``PNG`` are
+    compressed forms; the runner decodes lazily. ``CUDA_NV12`` /
+    ``CUDA_RGBA`` and ``RAW`` mark frames whose payload is an opaque handle
+    (NVMM pointer, DMA-BUF fd) — the ``data`` field is empty and the consumer
+    must read via ``handle``. ``CUDA_NV12`` is the Tegra NVMM default;
+    ``CUDA_RGBA`` is the x86 DeepStream NVMM layout.
+    """
+
+    BGR8 = "bgr8"
+    RGB8 = "rgb8"
+    MONO8 = "mono8"
+    DEPTH16 = "depth16"
+    JPEG = "jpeg"
+    PNG = "png"
+    CUDA_NV12 = "cuda_nv12"
+    CUDA_RGBA = "cuda_rgba"
+    RAW = "raw"
+
+
+class SensorFrame(BaseModel):
+    """A single sensor frame — metadata plus an optional inline payload.
+
+    A ``SensorFrame`` is the carrier passed from a ``SensorReader`` into
+    ``WorldState.image_frames``. Exactly one of ``data``,
+    ``topic``, or ``handle`` is populated:
+
+    * ``data`` carries the pixel bytes for in-process delivery and for trace
+      capture. JSON-serialized as base64 by Pydantic, so payloads round-trip
+      through ``model_dump_json`` / ``model_validate_json``.
+    * ``topic`` points at a ROS 2 topic — the bytes live on the ROS 2 bus and
+      the consumer subscribes for them, which is what ``WorldState.images``
+      carries. ``Ros2ImageSensorReader`` does NOT return this shape: it
+      subscribes on the caller's behalf and inlines the decoded pixels as
+      ``data``, because every ``read_latest`` consumer (the VLA observation
+      builder, trace capture, the republishing sensor leg) needs the bytes,
+      not a second subscription.
+    * ``handle`` is an opaque integer (e.g. CUDA NVMM pointer, DMA-BUF file
+      descriptor) — in-process only, never serialized. Set by the
+      ``GStreamerSensorReader`` when frames stay on the GPU.
+
+    Attributes:
+        sensor_id: Sensor name; matches ``SensorSpec.name``.
+        stamp_monotonic_ns: Capture-time monotonic timestamp in nanoseconds.
+        stamp_wall_ns: Capture-time wall-clock timestamp in nanoseconds.
+        encoding: How to interpret the bytes.
+        width: Image width in pixels.
+        height: Image height in pixels.
+        channels: Number of channels (3 for RGB/BGR, 1 for MONO/DEPTH).
+        data: Optional inline pixel payload (or compressed bytes for
+            ``JPEG`` / ``PNG``). Mutually exclusive with ``topic`` /
+            ``handle``.
+        topic: Optional ROS 2 topic reference. Mutually exclusive with
+            ``data`` / ``handle``.
+        handle: Optional opaque in-process handle (NVMM / DMA-BUF). Mutually
+            exclusive with ``data`` / ``topic``.
+        metadata: Free-form per-frame metadata (gain, exposure, …).
+
+    Example:
+        >>> SensorFrame(
+        ...     sensor_id="wrist_rgb",
+        ...     stamp_monotonic_ns=1,
+        ...     stamp_wall_ns=2,
+        ...     encoding=FrameEncoding.RGB8,
+        ...     width=640,
+        ...     height=480,
+        ...     topic="/cameras/wrist_rgb/image_raw",
+        ... ).channels
+        3
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sensor_id: str
+    stamp_monotonic_ns: int = Field(ge=0)
+    stamp_wall_ns: int = Field(ge=0)
+    encoding: FrameEncoding
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    channels: int = Field(default=3, gt=0)
+    data: bytes | None = None
+    topic: str | None = None
+    handle: int | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def _decode_data(cls, value: Any) -> bytes | None:  # noqa: ANN401  # reason: Pydantic field_validator passes raw input
+        """Accept raw ``bytes`` or a base64-encoded ``str`` (from JSON)."""
+        if value is None or isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            try:
+                return base64.b64decode(value, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise ValueError(
+                    f"SensorFrame.data string must be valid base64; got {value!r}"
+                ) from exc
+        raise TypeError(
+            f"SensorFrame.data must be bytes or a base64 string; got {type(value).__name__}"
+        )
+
+    @field_serializer("data", when_used="json")
+    def _encode_data(self, value: bytes | None) -> str | None:
+        """JSON-serialize the binary payload as base64 (preserves arbitrary bytes)."""
+        return None if value is None else base64.b64encode(value).decode("ascii")
+
+    def model_post_init(self, _context: object) -> None:
+        """Exactly one of (data, topic, handle) must be set."""
+        populated = [bool(self.data), self.topic is not None, self.handle is not None]
+        n = sum(populated)
+        if n != 1:
+            raise ValueError(
+                f"SensorFrame({self.sensor_id!r}): exactly one of "
+                f"(data, topic, handle) must be set; got {n}."
+            )
+
+
+class WorldState(BaseModel):
+    """Snapshot consumed by Reasoner and Skills.
+
+    Attributes:
+        stamp_ns: Snapshot timestamp in nanoseconds.
+        joint_state: Current joint state.
+        base_pose: Base link pose (mobile robots).
+        base_twist: Base link twist (vx, vy, vz, wx, wy, wz).
+        policy_state: Optional simulator-native proprioception vector for a
+            checkpoint whose state includes more than joint positions/velocities.
+            Populated through a typed HAL -> WorldState topic; never inferred.
+        ee_poses: End-effector poses keyed by EE name.
+        contact_forces: Contact forces keyed by contact name.
+        images: Sensor name → ROS 2 topic reference (not the raw image).
+        image_frames: Optional per-sensor ``SensorFrame`` snapshot for
+            no-ROS / in-process deployments. When ``None`` the
+            consumer reads frames via ``images`` topic refs as before.
+        point_clouds: Sensor name → ROS 2 topic reference.
+        tactile: Sensor name → ROS 2 topic reference.
+        detected_objects: List of detected objects.
+        battery_pct: Battery percentage in [0, 100].
+        diagnostics: Per-component diagnostic status.
+        collision_primitives: Bounded set of placed convex obstacle volumes
+            the kernel checks robot links against (world-collision). Empty
+            until a perception / SLAM source populates it.
+        attached_objects: Collision objects carried by robot links. These are
+            absent from world occupancy and remain collision-active as payloads.
+        attachment_revision: Monotonic producer revision for atomic snapshots.
+        attachment_stamp_ns: Timestamp of the last accepted attachment update.
+        place_declaration: The place-phase declaration in force for the carried
+            payload as the evidence producer resolved it (ADR-0097 and its
+            2026-08-14 amendment), including the producer-measured
+            ``PlaceRegion``. ``None`` means no place phase is declared,
+            which is no place witness and no approach allowance. It rides here
+            rather than on a channel of its own because the amendment extends the
+            payload already crossing the dispatch → HAL → World State boundary,
+            and because the kernel must apply the region and the attachment set
+            it is scoped to from one and the same snapshot.
+        occupancy_grid: Optional 2D occupancy grid reference for mobile-base
+            footprint checks. ``None`` until populated; an absent or stale
+            grid is treated as unavailable (fail-closed).
+    """
+
+    stamp_ns: int
+    joint_state: JointState
+    base_pose: Pose6D | None = None
+    base_twist: tuple[float, float, float, float, float, float] | None = None
+    policy_state: list[float] | None = None
+    ee_poses: dict[str, Pose6D] = Field(default_factory=dict)
+    contact_forces: dict[str, tuple[float, ...]] = Field(default_factory=dict)
+    images: dict[str, str] = Field(default_factory=dict)
+    image_frames: dict[str, SensorFrame] | None = None
+    point_clouds: dict[str, str] = Field(default_factory=dict)
+    tactile: dict[str, str] = Field(default_factory=dict)
+    detected_objects: list[DetectedObject] = Field(default_factory=list)
+    battery_pct: float | None = None
+    diagnostics: dict[str, Literal["ok", "warn", "error", "stale"]] = Field(default_factory=dict)
+    # Bounded world surface for kernel world-collision checking.
+    collision_primitives: list[WorldCollisionPrimitive] = Field(default_factory=list)
+    attached_objects: list[AttachedCollisionObject] = Field(default_factory=list)
+    attachment_revision: int = Field(default=0, ge=0)
+    attachment_stamp_ns: int = Field(default=0, ge=0)
+    place_declaration: PlaceDeclaration | None = None
+    occupancy_grid: OccupancyGridRef | None = None
+
+
+# ─── Spatial memory — persistent scene graph ──────────────────────────
+
+
+class SpatialNodeKind(str, Enum):
+    """Kind of node in the persistent scene-graph spatial memory.
+
+    ``OBJECT`` is the foundation (an accumulated ``DetectedObject``);
+    ``PLACE`` is a standable navigation waypoint; ``ROOM`` is a semantic area
+    grouping places/objects; ``AGENT`` is a person or robot with a pose — the
+    requester of a task is an ``AGENT`` so "bring it back to me" resolves to a
+    concrete goal.
+    """
+
+    OBJECT = "object"
+    PLACE = "place"
+    ROOM = "room"
+    AGENT = "agent"
+
+
+class SpatialRelationKind(str, Enum):
+    """Kind of directed edge between scene-graph nodes.
+
+    ``CONTAINS`` links a room/container to what is inside it (a fridge
+    ``CONTAINS`` a wine bottle); ``AT_PLACE`` links an object/agent to the
+    waypoint to stand at to reach it; ``TRAVERSABLE_TO`` is the topological
+    navigation graph between places/rooms; ``ON`` / ``NEAR`` are incidental
+    object-to-object spatial relations.
+    """
+
+    CONTAINS = "contains"
+    AT_PLACE = "at_place"
+    TRAVERSABLE_TO = "traversable_to"
+    ON = "on"
+    NEAR = "near"
+
+
+class SpatialNode(BaseModel):
+    """A persistent, typed node in the scene-graph spatial memory.
+
+    A superset of ``DetectedObject`` for ``kind == OBJECT``; also used for
+    places, rooms, and agents. The pose is anchored in a durable, drift-corrected
+    frame (typically the tf2 ``map`` frame); consumers resolve it to the live
+    base frame at query time via tf2 — the node never stores a raw transform.
+
+    This is **advisory** world-model state consumed by the S2 Reasoner. It is
+    never a safety input (CLAUDE.md §1.1): the safety kernel gates
+    only on the live, bounded geometric world.
+
+    Attributes:
+        node_id: Stable identifier, unique within a ``SceneGraph``.
+        kind: Node kind (object / place / room / agent).
+        pose: 6D pose, anchored in the durable map frame.
+        label: Semantic label or name (e.g. ``"fridge"``, ``"kitchen"``).
+        confidence: Confidence in [0, 1] for a perceived node.
+        bbox_3d: Optional 3D bounding box
+            (x_min, y_min, z_min, x_max, y_max, z_max).
+        embedding_ref: Optional handle into the vector store for
+            open-vocabulary matching; ``None`` → label-only.
+        is_container: Whether the node can hold other nodes (fridge, cabinet).
+        occludes_contents: Whether contents are unobservable until the
+            container is opened. Requires ``is_container``.
+        first_seen_ns: Timestamp of first observation, in nanoseconds.
+        last_seen_ns: Timestamp of the most recent observation, in nanoseconds;
+            must be ``>= first_seen_ns``.
+        observation_count: Number of times this node has been observed.
+
+    Example:
+        >>> node = SpatialNode(
+        ...     node_id="fridge",
+        ...     kind=SpatialNodeKind.OBJECT,
+        ...     pose=Pose6D(xyz=(3.0, 1.0, 0.9), quat_xyzw=(0.0, 0.0, 0.0, 1.0), frame_id="map"),
+        ...     label="fridge",
+        ...     is_container=True,
+        ...     occludes_contents=True,
+        ...     first_seen_ns=1,
+        ...     last_seen_ns=2,
+        ... )
+        >>> node.is_container
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(min_length=1)
+    kind: SpatialNodeKind
+    pose: Pose6D
+    label: str = ""
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    bbox_3d: tuple[float, float, float, float, float, float] | None = None
+    embedding_ref: str | None = None
+    is_container: bool = False
+    occludes_contents: bool = False
+    first_seen_ns: int = Field(ge=0)
+    last_seen_ns: int = Field(ge=0)
+    observation_count: int = Field(default=1, ge=1)
+
+    @model_validator(mode="after")
+    def _check_node_invariants(self) -> SpatialNode:
+        """Enforce temporal ordering and the container/occlusion relationship."""
+        if self.last_seen_ns < self.first_seen_ns:
+            raise ValueError(
+                f"SpatialNode({self.node_id!r}): last_seen_ns ({self.last_seen_ns}) "
+                f"must be >= first_seen_ns ({self.first_seen_ns})."
+            )
+        if self.occludes_contents and not self.is_container:
+            raise ValueError(
+                f"SpatialNode({self.node_id!r}): occludes_contents requires is_container."
+            )
+        return self
+
+
+class SpatialEdge(BaseModel):
+    """A directed relation between two scene-graph nodes.
+
+    Attributes:
+        src: ``node_id`` of the source node.
+        dst: ``node_id`` of the destination node.
+        kind: Relation kind.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    src: str = Field(min_length=1)
+    dst: str = Field(min_length=1)
+    kind: SpatialRelationKind
+
+
+class SceneGraph(BaseModel):
+    """Persistent hierarchical scene-graph spatial memory.
+
+    The durable, queryable world model the S2 Reasoner consults to recall where
+    objects/places/agents are and how to navigate to them. Distinct from the
+    ephemeral collision grid and **advisory only** — never a safety
+    input (CLAUDE.md §1.1).
+
+    Invariants (enforced): node ids are unique; every edge references existing
+    nodes.
+
+    Attributes:
+        schema_version: On-disk schema version (``"0.1"``; no
+            backward-incompatible change yet). Now the repo is published it
+            is versioned for real (CLAUDE.md §1.6): an incompatible change
+            bumps it and ships a migrator.
+        nodes: All scene-graph nodes.
+        edges: All directed relations between nodes.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["0.1"] = "0.1"
+    nodes: list[SpatialNode] = Field(default_factory=list)
+    edges: list[SpatialEdge] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_graph_integrity(self) -> SceneGraph:
+        """Node ids are unique and every edge references existing nodes."""
+        ids = [node.node_id for node in self.nodes]
+        known = set(ids)
+        if len(ids) != len(known):
+            raise ValueError("SceneGraph node_id values must be unique.")
+        for edge in self.edges:
+            if edge.src not in known:
+                raise ValueError(f"SceneGraph edge references unknown src node: {edge.src!r}")
+            if edge.dst not in known:
+                raise ValueError(f"SceneGraph edge references unknown dst node: {edge.dst!r}")
+        return self
+
+
+class RecallObjectQuery(BaseModel):
+    """Read-only query to recall a remembered object.
+
+    At least one of ``text`` / ``label`` must be non-empty. ``text`` is matched
+    against node embeddings when an embedder is configured,
+    otherwise matching falls back to ``label``.
+
+    Attributes:
+        text: Free-text query (open-vocabulary match).
+        label: Exact label match.
+        near: Optional pose to bias results toward (proximity).
+        max_age_ns: Optional recency filter — drop nodes whose ``last_seen_ns``
+            is older than this many nanoseconds before "now".
+        limit: Maximum number of matches to return.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = ""
+    label: str = ""
+    near: Pose6D | None = None
+    max_age_ns: int | None = Field(default=None, ge=0)
+    limit: int = Field(default=5, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def _require_query_term(self) -> RecallObjectQuery:
+        """Reject an empty query — a recall must name what it is looking for."""
+        if not self.text and not self.label:
+            raise ValueError("RecallObjectQuery requires a non-empty text or label.")
+        return self
+
+
+class ApproachViewpoint(BaseModel):
+    """A camera-facing standoff pose for viewing/manipulating an object.
+
+    Attributes:
+        pose: Base/EE goal pose (map frame) at a standoff from the object,
+            oriented so the gripper-mounted camera faces it.
+        standoff_m: Standoff distance from the object, in metres.
+        camera_frame_id: tf2 frame of the camera the viewpoint orients toward.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    pose: Pose6D
+    standoff_m: float = Field(gt=0.0)
+    camera_frame_id: str = Field(min_length=1)
+
+
+class RecallObjectMatch(BaseModel):
+    """One ranked match from a ``RecallObjectQuery``.
+
+    Attributes:
+        node_id: The matched node's id.
+        label: The matched node's label.
+        pose: The object's recalled pose (map frame).
+        score: Match score in [0, 1].
+        last_seen_ns: When the object was last observed, in nanoseconds.
+        approach: Optional computed camera-facing approach viewpoint.
+        inside_container_id: Set when the object is inside an occluding container
+            that must be opened first; ``None`` otherwise.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(min_length=1)
+    label: str = ""
+    pose: Pose6D
+    score: float = Field(ge=0.0, le=1.0)
+    last_seen_ns: int = Field(ge=0)
+    approach: ApproachViewpoint | None = None
+    inside_container_id: str | None = None
+
+
+class RecallObjectResult(BaseModel):
+    """Result of a ``RecallObjectQuery``.
+
+    Attributes:
+        matches: Ranked matches (possibly empty — an empty result is how the
+            query reports "unknown"; callers raise / handle
+            ``ROSObjectNotInMemory`` rather than
+            fabricating a pose).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    matches: list[RecallObjectMatch] = Field(default_factory=list)
+
+
+class ResolvePlaceQuery(BaseModel):
+    """Read-only query to resolve a place/room/agent reference to a goal.
+
+    Attributes:
+        reference: Free-text, id, or label of the target (e.g. ``"kitchen"``,
+            ``"where I was standing"``, a node id).
+        kind: Optional node-kind filter (room / place / agent).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reference: str = Field(min_length=1)
+    kind: SpatialNodeKind | None = None
+
+
+class ResolvePlaceResult(BaseModel):
+    """Result of a ``ResolvePlaceQuery``.
+
+    Attributes:
+        node_id: The resolved node's id.
+        goal: Navigation goal pose (map frame).
+        path_node_ids: Ordered ``traversable_to`` path of node ids from the
+            robot's current place to the goal (empty when no path is needed or
+            known).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(min_length=1)
+    goal: Pose6D
+    path_node_ids: list[str] = Field(default_factory=list)
+
+
+# ─── Action ────────────────────────────────────────────────────────────────────
+
+
+class Action(BaseModel):
+    """A single action step or chunk produced by a Skill.
+
+    Attributes:
+        control_mode: Target action space.
+        horizon: Number of steps (1 = single step, H = chunk).
+        joint_targets: Joint position targets, shape ``(H, N)``.
+        joint_velocities: Joint velocity targets, shape ``(H, N)``.
+        joint_torques: Joint torque targets, shape ``(H, N)``.
+        cartesian_pose: EE pose targets.
+        cartesian_delta: EE pose deltas.
+        cartesian_twist: EE velocity targets.
+        body_twist: Base twist targets.
+        foot_placements: Discrete footstep targets.
+        gripper: Gripper commands in [0, 1].
+        dex_hand_joints: Dexterous hand joint targets.
+        confidence: rSkill confidence in [0, 1].
+        stamp_ns: Action timestamp in nanoseconds.
+        ee_name: Target end-effector name.
+        frame_id: Reference frame for Cartesian actions.
+        cartesian_delta_scale: Per-axis physical range for a native normalized
+            Cartesian-delta controller. Predictive safety applies
+            ``clip(raw, -1, 1) * scale``; the raw delta remains unchanged for
+            the HAL. ``None`` means the policy already emits physical units.
+        joint_names: Robot joint names this action's rows target, in the
+            emitting slot's order (ADR-0102). ``None`` = a whole-vector action in
+            ``RobotDescription.joints`` order. Set for JOINT_* slots, which are
+            zero-padded to full dof and so cannot otherwise say which joints they
+            own; authoritative over slot arrival order when present.
+        tick_index: Shared 1-based inference tick for every slot emitted by one
+            policy step. Preserved across the ROS safety wire so a simulation HAL
+            can commit a multi-surface action atomically after every slot passes.
+        tick_group_size: Number of non-discard slots emitted for this inference
+            tick. ``1`` keeps single-surface actions unchanged.
+        safety_overrides: Operator-approved safety override tokens.
+    """
+
+    control_mode: ControlMode
+    horizon: int = 1
+    # one of the following is populated:
+    joint_targets: list[list[float]] | None = None
+    joint_velocities: list[list[float]] | None = None
+    joint_torques: list[list[float]] | None = None
+    cartesian_pose: list[Pose6D] | None = None
+    cartesian_delta: list[tuple[float, ...]] | None = None
+    cartesian_twist: list[tuple[float, ...]] | None = None
+    body_twist: list[tuple[float, float, float, float, float, float]] | None = None
+    foot_placements: list[dict[str, object]] | None = None
+    gripper: list[float] | None = None
+    dex_hand_joints: list[list[float]] | None = None
+    # Sim-only robosuite-composite multiplexer flag, 1-D
+    # value per horizon step in [-1, +1].
+    composite_mode: list[float] | None = None
+    # metadata
+    confidence: float = 1.0
+    stamp_ns: int = 0
+    ee_name: str | None = None
+    frame_id: str | None = None
+    cartesian_delta_scale: tuple[float, ...] | None = None
+    # ADR-0102. Robot joint names this action's rows target, in the emitting
+    # slot's own order. ``None`` = a whole-vector action in
+    # ``RobotDescription.joints`` order (every single-slot skill, and every
+    # pre-0102 producer). Set by ``_dispatch_slots`` for JOINT_* slots, whose
+    # payload is zero-padded to full dof and therefore cannot say which joints
+    # it owns — 0.0 is a legal target, so no amount of introspection recovers
+    # it. ``ee_name`` already plays this role for gripper / Cartesian slots.
+    # When set, this is AUTHORITATIVE over slot arrival order.
+    joint_names: list[str] | None = None
+    tick_index: int = Field(default=0, ge=0)
+    tick_group_size: int = Field(default=1, ge=1)
+    safety_overrides: dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_cartesian_delta_scale(self) -> Action:
+        scale = self.cartesian_delta_scale
+        if scale is None:
+            return self
+        if self.control_mode is not ControlMode.CARTESIAN_DELTA:
+            raise ValueError(
+                "Action.cartesian_delta_scale is allowed only for CARTESIAN_DELTA actions"
+            )
+        if not self.cartesian_delta:
+            raise ValueError(
+                "Action.cartesian_delta_scale requires a non-empty cartesian_delta payload"
+            )
+        widths = {len(row) for row in self.cartesian_delta}
+        if widths != {len(scale)}:
+            raise ValueError(
+                "Action.cartesian_delta_scale length must match every Cartesian row; "
+                f"scale={len(scale)}, row_widths={sorted(widths)}"
+            )
+        if any(not math.isfinite(value) or value <= 0.0 for value in scale):
+            raise ValueError("Action.cartesian_delta_scale values must be finite and > 0")
+        return self
+
+
+# ─── Compute / Quantization ────────────────────────────────────────────────────
+
+
+class QuantizationDtype(str, Enum):
+    """Numeric format used to represent model weights and activations.
+
+    Attributes:
+        FP32: 32-bit float (full precision, reference).
+        FP16: 16-bit float (GPU-native, common default).
+        BF16: Brain-float16 (Ampere+ GPUs, TPUs; better dynamic range than FP16).
+        INT8: 8-bit integer (CPU/GPU; good accuracy/speed trade-off).
+        FP8: 8-bit float, E4M3 (Ada/Hopper+; keeps floating-point dynamic
+            range at INT8's memory cost, which matters for transformer
+            activations that INT8's fixed scale clips). Carried in a TensorRT
+            engine as explicit ``QuantizeLinear``/``DequantizeLinear`` node
+            pairs in the ONNX graph, not as a builder precision flag.
+        INT4: 4-bit integer (edge / memory-constrained; some accuracy loss).
+        FP4_NVFP4: NVIDIA FP4 format (Blackwell; highest throughput). Block
+            size 16 with an FP32/FP16/BF16 scale — distinct from the MX
+            formats, which scale per 32 elements with an E8M0 exponent.
+
+    Example:
+        >>> QuantizationDtype.INT8.value
+        'int8'
+        >>> QuantizationDtype.FP8.value
+        'fp8'
+    """
+
+    FP32 = "fp32"
+    FP16 = "fp16"
+    BF16 = "bf16"
+    INT8 = "int8"
+    FP8 = "fp8"
+    INT4 = "int4"
+    FP4_NVFP4 = "fp4_nvfp4"
+
+
+class QuantizationBackend(str, Enum):
+    """Inference backend that will execute the quantized model.
+
+    Attributes:
+        PYTORCH: ``torch.quantization`` / ``bitsandbytes`` / ``torchao``.
+        ONNX: ``onnxruntime`` with quantization pre-applied at export.
+        TENSORRT: NVIDIA TensorRT engine (INT8 / FP8 calibrated).
+        GGUF: llama.cpp / ggml GGUF format (CPU and Metal).
+        MLX: Apple MLX framework (Apple Silicon only).
+
+    Example:
+        >>> QuantizationBackend.PYTORCH.value
+        'pytorch'
+    """
+
+    PYTORCH = "pytorch"
+    ONNX = "onnx"
+    TENSORRT = "tensorrt"
+    GGUF = "gguf"
+    MLX = "mlx"
+
+
+class QuantizationConfig(BaseModel):
+    """Full specification of how to quantize a skill's model weights.
+
+    Attributes:
+        dtype: Target numeric format.
+        backend: Inference backend that will execute the model.
+        per_channel: Use per-channel (vs per-tensor) quantization.
+        calibration_dataset: HuggingFace dataset ID or local path used for
+            post-training calibration (INT8 / TensorRT only).
+        extra: Backend-specific overrides (e.g. ``{"calibration_steps": 128}``).
+
+    Example:
+        >>> cfg = QuantizationConfig(dtype=QuantizationDtype.INT8)
+        >>> cfg.backend
+        <QuantizationBackend.PYTORCH: 'pytorch'>
+    """
+
+    dtype: QuantizationDtype = QuantizationDtype.FP32
+    backend: QuantizationBackend = QuantizationBackend.PYTORCH
+    per_channel: bool = False
+    calibration_dataset: str | None = None
+    extra: dict[str, object] = Field(default_factory=dict)
+
+
+class DeviceInfo(BaseModel):
+    """Snapshot of the host compute capabilities used for runtime selection.
+
+    Attributes:
+        device_str: PyTorch-style device string (``"cpu"``, ``"cuda:0"``, ``"mps"``).
+        gpu_memory_bytes: Total GPU VRAM in bytes (0 if CPU-only).
+        cuda_compute_capability: CUDA compute capability major/minor pair.
+        cpu_count: Logical CPU count.
+        arch: CPU architecture string.
+
+    Example:
+        >>> info = DeviceInfo(device_str="cpu")
+        >>> info.gpu_memory_bytes
+        0
+    """
+
+    device_str: str = "cpu"
+    gpu_memory_bytes: int = 0
+    cuda_compute_capability: tuple[int, int] | None = None
+    cpu_count: int = 1
+    arch: str = "x86_64"
+
+
+# ─── Skill lifecycle ────────────────────────────────────────────────────────────
+
+
+class RSkillState(str, Enum):
+    """Primary lifecycle states for a Skill node.
+
+    Matches the ROS 2 Managed Node state machine with openral extensions.
+
+    States
+    ------
+    ``unconfigured``
+        Initial state.  Weights are not loaded.
+    ``inactive``
+        Configured and weights loaded; not yet warmed up.  Accepts no actions.
+    ``active``
+        Ready to execute.  ``step()`` may be called.
+    ``finalized``
+        Terminal state after ``shutdown()``.  Cannot transition further.
+    ``error``
+        Unrecoverable failure.  Requires external intervention.
+    """
+
+    UNCONFIGURED = "unconfigured"
+    INACTIVE = "inactive"
+    ACTIVE = "active"
+    FINALIZED = "finalized"
+    ERROR = "error"
+
+
+class RSkillInfo(BaseModel):
+    """Snapshot of a Skill's runtime state — published on ``/skill/<name>/info``.
+
+    Attributes:
+        name: rSkill name (e.g. ``"noop_skill"``).
+        version: SemVer string.
+        state: Current primary lifecycle state.
+        weights_loaded: Whether model weights have been loaded into memory.
+        quantized: Whether weights have been quantized for the target runtime.
+        warmed_up: Whether the model has been warmed up (first inference run).
+        embodiment_tags: Embodiment tags from the skill manifest.
+        role: rSkill role: ``"s0"`` (cerebellar), ``"s1"`` (fast policy),
+            ``"s2"`` (slow reasoning).
+        latency_budget_ms: Maximum allowed inference latency in milliseconds.
+        last_inference_ms: Actual latency of the most recent ``step()`` call.
+        error_msg: Human-readable error description when ``state == "error"``.
+        stamp_ns: Timestamp of this snapshot in nanoseconds.
+
+    Example:
+        >>> info = RSkillInfo(name="hello", version="0.1.0", state=RSkillState.UNCONFIGURED)
+        >>> info.weights_loaded
+        False
+        >>> info.state
+        <RSkillState.UNCONFIGURED: 'unconfigured'>
+    """
+
+    name: str
+    version: str = "0.1.0"
+    state: RSkillState = RSkillState.UNCONFIGURED
+    weights_loaded: bool = False
+    quantized: bool = False
+    warmed_up: bool = False
+    embodiment_tags: list[str] = Field(default_factory=list)
+    role: Literal["s0", "s1", "s2"] = "s1"
+    latency_budget_ms: float | None = None
+    last_inference_ms: float | None = None
+    error_msg: str | None = None
+    stamp_ns: int = 0
+
+
+# ─── rSkill package manifest ──────────────────────────────────────────────────
+#
+# An ``rSkill`` is the *packaged, signed, capability-tagged distribution
+# format* for a robot skill (CLAUDE.md §6.4 / RFC §1.4, §8.7).  One HF Hub
+# repo per rSkill, containing weights + ``rskill.yaml`` + optional engine
+# files + ``README.md`` with a runnable example.
+#
+# This is **distinct from** the runtime ``Skill`` ABC (see
+# ``openral_rskill.Skill``) and the ``RSkillInfo`` runtime snapshot above:
+#   - ``Skill``         : in-process lifecycle node (S0/S1/S2 ABC).
+#   - ``RSkillInfo``     : runtime state snapshot of a live ``Skill``.
+#   - ``RSkillManifest``: on-disk / Hub-side package descriptor.
+
+
+class RSkillLicensePosture(str, Enum):
+    """License posture surfaced at install time (CLAUDE.md §7.4)."""
+
+    APACHE_2_0 = "apache-2.0"
+    MIT = "mit"
+    BSD = "bsd"
+    PERMISSIVE_RESEARCH = "permissive_research"  # e.g. pi0 weights
+    NVIDIA_NON_COMMERCIAL = "nvidia_non_commercial"  # GR00T N1 / N1.5 / N1.6 weights
+    NVIDIA_OPEN_MODEL = "nvidia_open_model"  # GR00T N1.7+ — Open Model License, commercial OK
+    RLWRLD_NON_COMMERCIAL = "rlwrld_non_commercial"  # RLDX-1 weights
+    CC_BY_NC_SA_4_0 = "cc-by-nc-sa-4.0"  # InternVLA-N1 weights (InternRobotics)
+    PROPRIETARY = "proprietary"  # Helix, Skild, Gemini Robotics
+    UNKNOWN = "unknown"
+
+
+class RSkillRuntime(str, Enum):
+    """Inference runtime hint declared in the manifest (RFC §7.3)."""
+
+    PYTORCH = "pytorch"
+    ONNX = "onnx"
+    TENSORRT = "tensorrt"
+    TRT_LLM = "trt_llm"
+    VLLM = "vllm"
+    GGUF = "gguf"
+    MLX = "mlx"
+    JAX = "jax"
+
+
+class RSkillLatencyBudget(BaseModel):
+    """Per-stage latency budget declared in ``rskill.yaml``.
+
+    Attributes:
+        per_chunk_ms: End-to-end ``step()`` budget.  CI fails if exceeded on
+            the reference host (CLAUDE.md §7.4).
+        warmup_ms: Maximum allowed warm-up time during ``activate()``.
+        load_ms: Maximum allowed weight-load time during ``configure()``.
+        max_execution_s: Total wall-clock budget for a single ``execute_rskill``
+            goal (one task attempt). A VLA policy never self-terminates (only
+            wrapped-ROS skills raise ``ROSRskillGoalSatisfied``), so a deploy
+            dispatch with ``deadline_s=0`` (the LLM's "use the manifest default"
+            sentinel) would otherwise run forever. The skill_runner resolves
+            ``deadline_s<=0`` to this value (or a global default) and aborts the
+            goal when it lapses so the reasoner re-evaluates the outcome —
+            CLAUDE.md §3 "Deadline fallback mandatory". ``None`` = fall back to
+            the runner's global default.
+    """
+
+    per_chunk_ms: float = Field(gt=0)
+    warmup_ms: float | None = Field(default=None, gt=0)
+    load_ms: float | None = Field(default=None, gt=0)
+    max_execution_s: float | None = Field(default=None, gt=0)
+
+
+class SensorRequirement(BaseModel):
+    """One sensor an rSkill needs the robot to provide.
+
+    Used by ``RSkillManifest.sensors_required`` to declare the inputs
+    the policy expects. The compatibility check resolves each entry against
+    a ``RobotDescription``'s ``sensors`` list and rejects the pairing
+    if no robot sensor satisfies the requirement.
+
+    Resolution rules (in order):
+
+    1. If ``vla_feature_key`` is set, the robot MUST expose exactly one
+       sensor with that ``vla_feature_key``. The check then verifies
+       ``modality`` matches and (if specified) the sensor's intrinsics meet
+       ``min_width`` / ``min_height``.
+    2. Otherwise, the robot must expose at least ``count`` sensors of the
+       requested ``modality`` (each meeting any specified resolution
+       minimum).
+
+    Attributes:
+        modality: Required physical modality (``rgb``, ``depth``, ``imu``…).
+        vla_feature_key: Optional exact key the VLA expects, e.g.
+            ``"observation.images.camera1"``. When set, the robot's matching
+            ``SensorSpec.vla_feature_key`` must be identical.
+        min_width: Minimum image width in pixels (RGB/depth/IR/stereo only).
+        min_height: Minimum image height in pixels.
+        count: Number of robot sensors of this modality required when
+            ``vla_feature_key`` is unset. Ignored when ``vla_feature_key``
+            is provided (a key uniquely identifies one sensor).
+
+    Example:
+        >>> SensorRequirement(
+        ...     modality=SensorModality.RGB,
+        ...     vla_feature_key="observation.images.camera1",
+        ...     min_width=224,
+        ...     min_height=224,
+        ... )  # doctest: +ELLIPSIS
+        SensorRequirement(modality=<SensorModality.RGB: 'rgb'>, ...)
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    modality: SensorModality
+    vla_feature_key: str | None = None
+    min_width: int | None = Field(default=None, gt=0)
+    min_height: int | None = Field(default=None, gt=0)
+    count: int = Field(default=1, ge=1)
+
+
+class ImagePreprocessing(BaseModel):
+    """Per-rSkill image preprocessing contract.
+
+    Properties of how the *checkpoint* was trained against image frames,
+    surfaced on the manifest so the sim adapter does not have to learn
+    them from a YAML override. ``vla.extra`` overrides on the eval
+    config still win — see ``openral_rskill._vla_core.resolve_image_preprocessing``.
+
+    Attributes:
+        flip_180: Apply ``torch.flip(t, dims=[1, 2])`` (H+W reversal) to
+            every camera frame before the policy forward. SmolVLA / pi05
+            LIBERO checkpoints want this on; the RoboCasa checkpoints
+            published by RoMALab / DAVIAN-Robotics want it off.
+        flip_vertical: Apply ``img[::-1, :, :]`` (vertical-only, H-axis
+            reversal) BEFORE any 180° rotation. Mirrors
+            ``robocasa.wrappers.gym_wrapper.RoboCasaGymEnv.process_img``,
+            which the canonical openpi-robocasa eval applies before
+            feeding frames to the policy. Required for
+            ``robocasa/robocasa365_checkpoints/pi05_pretrain_human300``
+            and its lerobot-converted siblings; the RoMALab MG_300
+            checkpoint does NOT want this flip.
+        input_template: Format string used to name image tensors in the
+            policy input batch — for example ``"observation.images.{cam}"``
+            for SmolVLA / pi05 RoMALab vs ``"observation.image.{cam}"``
+            for ruiname/pi05-robocasa-10tasks-200k.
+        aliases: Per-checkpoint rename map from the *scene* / *robot* raw
+            camera key (e.g. robosuite's ``robot0_agentview_left_image``)
+            to the *model*'s expected input feature name (e.g.
+            ``agentview``). Empty means pass through unchanged. SmolVLA
+            LIBERO usually wants ``{"camera1": "image", "camera2": "image2"}``.
+        norm_tag: Normalization statistics tag for policies that use
+            multiple checkpoints or training distributions (e.g. MolmoAct2
+            with ``norm_tag="so100_so101_molmoact2"`` for SO-100/101
+            finetuned weights). Optional; ``None`` means the adapter's
+            default tag applies. Used by ``predict_action`` methods to
+            select the right norm_stats entry at inference time.
+        image_max_crops: Cap on the number of image tiles a multi-crop
+            image processor (Molmo / MolmoAct2 family) produces per camera
+            frame. Each extra 378px crop adds ~182 pooled image tokens and
+            attention cost is quadratic in the token count, so this is the
+            primary *activation*-memory lever (the NF4 weights are fixed at
+            ~3.5 GiB; what overflows an 8 GiB card is the crop activations).
+            Optional; ``None`` keeps the checkpoint's own default (8 for
+            MolmoAct2). A per-rollout ``vla.extra["image_max_crops"]`` (or
+            the ``OPENRAL_MOLMOACT2_MAX_CROPS`` env) still overrides this
+            per-checkpoint default. Must be ``>= 1`` when set.
+        resize_width: Exact checkpoint input width. When set with
+            ``resize_height``, adapters resize the source frame before
+            policy inference. This lets a high-resolution detector feed coexist
+            with a policy trained at a lower native render size.
+        resize_height: Exact checkpoint input height; must be set together
+            with ``resize_width``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    flip_180: bool = False
+    flip_vertical: bool = False
+    input_template: str = "observation.images.{cam}"
+    aliases: dict[str, str] = Field(default_factory=dict)
+    norm_tag: str | None = None
+    image_max_crops: int | None = Field(default=None, ge=1)
+    resize_width: int | None = Field(default=None, gt=0)
+    resize_height: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_resize_pair(self) -> ImagePreprocessing:
+        if (self.resize_width is None) != (self.resize_height is None):
+            raise ValueError(
+                "ImagePreprocessing.resize_width and resize_height must be set together"
+            )
+        return self
+
+
+StateLayout: TypeAlias = Literal[
+    "smolvla_9d",
+    "human300_16d",
+    "gr1",
+    "rc365",
+    # RLDX-1 SimplerEnv layouts.
+    # ``simpler_widowx`` matches RLWRLD/RLDX-1-FT-SIMPLER-WIDOWX's
+    # ``bridge_orig`` modality config (8 scalar state keys, single
+    # ``video.image_0`` camera, Bridge-data orientation rotation).
+    # ``simpler_google`` matches RLWRLD/RLDX-1-FT-SIMPLER-GOOGLE's
+    # ``fractal20220817_data`` modality config (8 scalar state keys
+    # including a 4-D quaternion in ``state.r{x,y,z,w}``, single
+    # ``video.image`` camera, sticky-gripper postprocessing).
+    "simpler_widowx",
+    "simpler_google",
+    # LIBERO 8-D task-space proprio. ``eef_pos(3) ‖
+    # eef_axisangle(3) ‖ gripper_qpos(2)`` in the world frame — what the
+    # lerobot/smolvla_libero, pi05-libero and xvla-libero checkpoints were
+    # trained on. The benchmark (``openral sim run``) supplies it directly;
+    # deploy assembles it from live TF (EE pose) + JointState (gripper) via the
+    # ``libero_eef8d`` assembler. Without it the runner would feed raw
+    # joint-space state to a task-space policy.
+    "libero_eef8d",
+]
+"""Closed set of per-checkpoint proprioception layouts.
+
+A layout names the SHAPE the checkpoint was trained on — field order,
+frame convention, gripper encoding, quaternion handedness. The per-robot
+SOURCE bindings (which TF frame is "the EE", which joint names are "the
+gripper") live on ``StateContractBindings``. The
+``openral_state_adapter`` registry maps each literal to an assembler
+function that joins shape + bindings + live JointState + live TF.
+"""
+
+
+WRAPPED_TASK_SPACE_LAYOUTS: frozenset[StateLayout] = frozenset(
+    {"rc365", "human300_16d", "libero_eef8d"},
+)
+"""Layouts that are TASK-space composites (Cartesian poses + gripper widths),
+NOT one-scalar-per-joint. These layouts REQUIRE
+``StateContract.bindings`` to name the source TF frames + JointState
+entries — the cross-validator on ``StateContract`` enforces this at
+manifest load. The remaining layouts (``smolvla_9d``, ``gr1``,
+``simpler_*``) are joint-space slices (potentially across multiple
+controller groups, as in GR1's 29-D waist+arms+hands composite) that the
+runner serves verbatim from ``observation.joint_state.position``; a
+robot.yaml with the matching joint count dispatches them without an
+assembler.
+"""
+
+
+class StateContractBindings(BaseModel):
+    """Per-robot source bindings for an rSkill's `state_contract.layout`.
+
+    Symmetric to ``ControlModeSemantics`` on the action side
+    (``joint_order`` + ``reference_frame`` + ``gripper_convention``):
+    the rSkill manifest names the *shape* via ``StateContract.layout``;
+    these bindings name the *sources* on the deploying robot. The
+    layout-adapter registry (``openral_state_adapter``) joins shape +
+    bindings + live ``sensor_msgs/JointState`` + live ``/tf`` into
+    the per-checkpoint state vector.
+
+    Bindings are required for layouts in ``WRAPPED_TASK_SPACE_LAYOUTS``
+    and forbidden otherwise (the joint-space layouts have no source to
+    parameterise).
+
+    Attributes:
+        eef_frame: tf2 link name of the end effector
+            (e.g. ``"panda_hand"``). Required for any layout reading
+            EE position / orientation.
+        base_frame: tf2 link name of the mobile base
+            (e.g. ``"base_link"``). Required for any layout reading
+            base position / orientation OR base-relative EE poses.
+        world_frame: tf2 root frame the base pose is expressed in
+            (default ``"map"`` — slam_toolbox publishes ``map → odom →
+            base_link``). Set to ``"odom"`` for deployments without SLAM.
+        gripper_qpos_joints: ``JointState.name`` entries whose positions
+            populate the gripper-width slot(s) of the layout, in the
+            order the policy expects (e.g. ``["panda_finger_joint1",
+            "panda_finger_joint2"]``). Empty for grasper-less robots
+            or layouts without a gripper slot.
+        quaternion_convention: Component order of any quaternion in the
+            assembled vector. ROS / TF2 default is ``"xyzw"`` (the
+            ``geometry_msgs/Quaternion`` field order). Some upstream
+            checkpoints expect ``"wxyz"`` — declare it here so the
+            assembler permutes once, at the boundary.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    eef_frame: str | None = None
+    base_frame: str | None = None
+    world_frame: str | None = "map"
+    gripper_qpos_joints: list[str] = Field(default_factory=list)
+    quaternion_convention: Literal["xyzw", "wxyz"] = "xyzw"
+
+
+class StateContract(BaseModel):
+    """Per-rSkill state-vector contract.
+
+    Surfaces the proprioception layout the *checkpoint* was trained
+    against so the runtime adapter does not have to learn it from a
+    YAML override.
+
+    Attributes:
+        layout: Named proprioception layout — see ``StateLayout``.
+            LIBERO / MetaWorld / pusht / aloha leave this ``None`` and
+            consume the raw joint-position vector directly.
+        dim: Explicit state dimension override. The runtime adapter
+            clips or pads the env state vector to this width before
+            handing it to the policy.
+        bindings: Per-robot source bindings — TF frame names + JointState
+            entries the runtime adapter pulls values from. REQUIRED when
+            ``layout`` is in ``WRAPPED_TASK_SPACE_LAYOUTS``,
+            FORBIDDEN otherwise (joint-space layouts have no source to
+            parameterise).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    layout: StateLayout | None = None
+    dim: int | None = Field(default=None, gt=0)
+    bindings: StateContractBindings | None = None
+
+    @model_validator(mode="after")
+    def _validate_bindings(self) -> StateContract:
+        if self.layout in WRAPPED_TASK_SPACE_LAYOUTS:
+            if self.bindings is None:
+                raise ValueError(
+                    f"StateContract.layout={self.layout!r} is a wrapped task-space "
+                    "layout and REQUIRES `bindings` to name the per-robot TF "
+                    "frames + JointState entries.",
+                )
+            # Layout-specific binding requirements (the registry's
+            # assemblers read these; if absent the assembler would raise
+            # at runtime — surface the missing-field at manifest load).
+            if self.layout in {"human300_16d", "rc365"}:
+                missing = [
+                    name
+                    for name in ("eef_frame", "base_frame")
+                    if getattr(self.bindings, name) is None
+                ]
+                if missing:
+                    raise ValueError(
+                        f"StateContract.layout={self.layout!r} requires "
+                        f"bindings.{', bindings.'.join(missing)} — these "
+                        f"layouts include EE and base poses.",
+                    )
+            elif self.layout == "libero_eef8d":
+                # Absolute world-frame EE pose + gripper — needs eef_frame and
+                # at least one gripper joint; base_frame is irrelevant (the
+                # franka is fixed-base, the pose is taken in the world frame).
+                if self.bindings.eef_frame is None:
+                    raise ValueError(
+                        "StateContract.layout='libero_eef8d' requires "
+                        "bindings.eef_frame — it reads the world-frame EE pose.",
+                    )
+                if not self.bindings.gripper_qpos_joints:
+                    raise ValueError(
+                        "StateContract.layout='libero_eef8d' requires "
+                        "bindings.gripper_qpos_joints (1 parallel-gripper joint "
+                        "or 2 per-finger joints) for the gripper slot.",
+                    )
+        elif self.bindings is not None:
+            raise ValueError(
+                f"StateContract.layout={self.layout!r} is a joint-space "
+                "layout; `bindings` must be omitted (it would have no effect).",
+            )
+        return self
+
+
+class ActionSlot(BaseModel):
+    """One contiguous slice of an rSkill's action vector.
+
+    The skill_runner reads ``ActionContract.slots`` and emits one
+    typed ``Action`` per non-discard slot per step. All actions
+    inherit the parent step's ``trace_id`` so the safety supervisor
+    and downstream telemetry can join them post-hoc.
+
+    Attributes:
+        range: Inclusive ``[start, end]`` indices into the flat policy
+            action vector. ``range[0]`` must be ≤ ``range[1]``; both
+            must fall within ``[0, ActionContract.dim)``.
+        control_mode: The ``ControlMode`` the slice is routed to.
+            The HAL whitelist on the target robot must include this
+            mode (the palette filter rejects the rSkill at install
+            time otherwise). ``None`` only when ``discard`` is
+            ``True``.
+        discard: When ``True`` the slice is dropped silently — used
+            for dataset artefacts like RoboCasa365's torso
+            placeholder dim or paired gripper channels. The slot
+            still occupies its range so coverage validation works;
+            no ``Action`` is emitted.
+        ee: End-effector name from the robot's
+            ``RobotDescription.end_effectors`` /
+            ``RobotDescription.joints``. REQUIRED for
+            ``CARTESIAN_*`` modes (the pose is computed in the named
+            EE's frame) and for ``GRIPPER_*`` modes (names the
+            actuator). FORBIDDEN for ``BODY_TWIST`` and
+            ``JOINT_POSITION``.
+        frame: tf2 frame name. REQUIRED for cartesian + body-twist
+            modes (the slice's bytes are expressed in this frame).
+            FORBIDDEN for joint-position and gripper modes.
+        joint_names: Robot joint names this slice targets, in slot
+            order. REQUIRED for ``JOINT_POSITION`` / ``JOINT_VELOCITY``
+            / ``JOINT_TORQUE`` when the slot covers fewer than all
+            robot joints; FORBIDDEN for non-joint modes. Length must
+            equal ``range[1] - range[0] + 1``.
+        input_bounds: Optional inclusive controller-input bounds. The
+            skill runner clips this slot before safety and HAL dispatch,
+            matching native controllers that clip normalized policy
+            outputs before applying physical scaling.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    range: tuple[int, int]
+    control_mode: ControlMode | None = None
+    discard: bool = False
+    ee: str | None = None
+    frame: str | None = None
+    joint_names: list[str] = Field(default_factory=list)
+    input_bounds: tuple[float, float] | None = None
+
+    @model_validator(mode="after")
+    def _validate_slot(self) -> ActionSlot:  # noqa: PLR0912, PLR0915  # reason: validates each control-mode slot's field requirements; one branch per mode family
+        lo, hi = self.range
+        if lo > hi:
+            raise ValueError(f"ActionSlot.range must satisfy start <= end; got [{lo}, {hi}]")
+        if lo < 0:
+            raise ValueError(f"ActionSlot.range start must be >= 0; got {lo}")
+        if self.discard:
+            if self.control_mode is not None:
+                raise ValueError(
+                    "ActionSlot: discard=True is mutually exclusive with control_mode "
+                    f"(got {self.control_mode!r})"
+                )
+            if (
+                self.ee is not None
+                or self.frame is not None
+                or self.joint_names
+                or self.input_bounds is not None
+            ):
+                raise ValueError(
+                    "ActionSlot: discard=True forbids ee / frame / joint_names / input_bounds "
+                    "(no routing target needed for a discarded slice)"
+                )
+            return self
+        if self.control_mode is None:
+            raise ValueError("ActionSlot: control_mode is required when discard is False")
+        if self.input_bounds is not None:
+            input_min, input_max = self.input_bounds
+            if not math.isfinite(input_min) or not math.isfinite(input_max):
+                raise ValueError("ActionSlot.input_bounds values must be finite")
+            if input_min >= input_max:
+                raise ValueError(
+                    "ActionSlot.input_bounds must satisfy min < max; "
+                    f"got [{input_min}, {input_max}]"
+                )
+        # Per-mode field requirements.
+        mode = self.control_mode
+        width = hi - lo + 1
+        if mode in _JOINT_MODES:
+            if self.ee is not None:
+                raise ValueError(f"ActionSlot[{mode.value}]: ee is forbidden")
+            if self.frame is not None:
+                raise ValueError(f"ActionSlot[{mode.value}]: frame is forbidden")
+            if self.joint_names and len(self.joint_names) != width:
+                raise ValueError(
+                    f"ActionSlot[{mode.value}]: joint_names length "
+                    f"({len(self.joint_names)}) must equal slot width ({width})"
+                )
+        elif mode in _CARTESIAN_MODES:
+            if self.ee is None:
+                raise ValueError(f"ActionSlot[{mode.value}]: ee is required")
+            if self.frame is None:
+                raise ValueError(f"ActionSlot[{mode.value}]: frame is required")
+            if self.joint_names:
+                raise ValueError(f"ActionSlot[{mode.value}]: joint_names is forbidden")
+        elif mode is ControlMode.BODY_TWIST:
+            if self.ee is not None:
+                raise ValueError("ActionSlot[body_twist]: ee is forbidden")
+            if self.frame is None:
+                raise ValueError("ActionSlot[body_twist]: frame is required")
+            if self.joint_names:
+                raise ValueError("ActionSlot[body_twist]: joint_names is forbidden")
+        elif mode in _GRIPPER_MODES:
+            if self.ee is None:
+                raise ValueError(f"ActionSlot[{mode.value}]: ee is required")
+            if self.frame is not None:
+                raise ValueError(f"ActionSlot[{mode.value}]: frame is forbidden")
+            if self.joint_names:
+                raise ValueError(f"ActionSlot[{mode.value}]: joint_names is forbidden")
+        elif mode is ControlMode.COMPOSITE_MODE:
+            # Sim-only multiplexer flag, 1-D, no ee/frame/joints.
+            if width != 1:
+                raise ValueError(f"ActionSlot[composite_mode]: slot width must be 1; got {width}")
+            if self.ee is not None:
+                raise ValueError("ActionSlot[composite_mode]: ee is forbidden")
+            if self.frame is not None:
+                raise ValueError("ActionSlot[composite_mode]: frame is forbidden")
+            if self.joint_names:
+                raise ValueError("ActionSlot[composite_mode]: joint_names is forbidden")
+        return self
+
+
+_JOINT_MODES: frozenset[ControlMode] = frozenset(
+    {ControlMode.JOINT_POSITION, ControlMode.JOINT_VELOCITY, ControlMode.JOINT_TORQUE}
+)
+_CARTESIAN_MODES: frozenset[ControlMode] = frozenset(
+    {ControlMode.CARTESIAN_POSE, ControlMode.CARTESIAN_DELTA, ControlMode.CARTESIAN_TWIST}
+)
+_GRIPPER_MODES: frozenset[ControlMode] = frozenset(
+    {ControlMode.GRIPPER_BINARY, ControlMode.GRIPPER_POSITION}
+)
+
+
+class ActionContract(BaseModel):
+    """Per-rSkill action-vector contract.
+
+    Mirrors ``StateContract`` for the action side. Carries the
+    output dimensionality the checkpoint emits so the dataset bridge
+    (and any downstream consumer) can bind the LeRobot v3 ``action``
+    feature shape without consulting the sim or hardware adapter.
+
+    The sim-specific action contract belongs on the
+    per-checkpoint rSkill manifest, not on the physical
+    ``RobotDescription`` (the same Franka emits 7-D delta-EEF on
+    LIBERO vs 8-D joint pos on a hardware deploy).
+
+    Attributes:
+        dim: Dimensionality of the action vector emitted by
+            ``Skill.step()`` / ``PolicyAdapter.step()``. Required when
+            this contract is set.
+        representation: Optional named representation (mirrors
+            ``ActionSpec.representation``). When set, downstream
+            consumers can map between equivalent representations
+            (e.g. ``joint_positions`` → ``delta_ee_6d_plus_gripper``).
+        slots: Declarative slot layout. When set, every
+            index in ``[0, dim)`` must be covered by exactly one
+            ``ActionSlot`` (no gaps, no overlaps). The
+            skill_runner reads this to dispatch slices of the policy
+            vector onto typed ``Action`` objects. When ``None``,
+            the runner falls back to the legacy single-Action path
+            (one implicit ``JOINT_POSITION`` slot covering the whole
+            vector). Manifests carrying ``slots`` are exempt from the
+            ``dim <= len(robot.joints)`` invariant because
+            the slot decoder gives a typed contract per slice instead.
+        cartesian_delta_scale: Per-axis physical range for a normalized
+            Cartesian controller. Predictive safety applies
+            ``clip(raw, -1, 1) * scale``. ``None`` means identity (the policy
+            already emits physical units).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dim: int = Field(gt=0)
+    representation: ActionRepresentation | None = None
+    slots: list[ActionSlot] | None = None
+    cartesian_delta_scale: tuple[float, ...] | None = None
+    # Angular convention the checkpoint's joint state/action are in. openral's
+    # Action/JointState contract is radians, so the skill_runner converts
+    # deg↔rad at the policy boundary when this is DEGREES. When None the runner
+    # falls back to a fragile stats-magnitude heuristic — declare it explicitly
+    # for joint-position checkpoints (a wrong guess sends ~57x commands and the
+    # arm slams its limits). Governs BOTH the state fed in and the action out.
+    joint_units: JointUnits | None = None
+
+    @model_validator(mode="after")
+    def _validate_slots_cover_dim(self) -> ActionContract:
+        if self.slots is not None:
+            if not self.slots:
+                raise ValueError(
+                    "ActionContract.slots: must be omitted (None) or a non-empty list; "
+                    "empty lists silently lose the whole policy vector"
+                )
+            # Range bounds vs dim.
+            for slot in self.slots:
+                lo, hi = slot.range
+                if hi >= self.dim:
+                    raise ValueError(
+                        f"ActionContract.slots: slot range [{lo}, {hi}] exceeds "
+                        f"action_contract.dim={self.dim}"
+                    )
+            # Coverage: every index in [0, dim) appears in exactly one slot.
+            covered: list[int] = [0] * self.dim
+            for slot in self.slots:
+                lo, hi = slot.range
+                for i in range(lo, hi + 1):
+                    covered[i] += 1
+            missing = [i for i, n in enumerate(covered) if n == 0]
+            overlapping = [i for i, n in enumerate(covered) if n > 1]
+            if missing:
+                raise ValueError(
+                    f"ActionContract.slots: indices {missing!r} are not covered by any "
+                    f"slot (dim={self.dim}). Declare a discard slot for unused channels."
+                )
+            if overlapping:
+                raise ValueError(
+                    f"ActionContract.slots: indices {overlapping!r} are covered by "
+                    "multiple slots; ranges must be disjoint."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cartesian_delta_scale(self) -> ActionContract:
+        scale = self.cartesian_delta_scale
+        if scale is None:
+            return self
+        if any(not math.isfinite(value) or value <= 0.0 for value in scale):
+            raise ValueError("ActionContract.cartesian_delta_scale values must be finite and > 0")
+        widths: list[int] = []
+        if self.slots is not None:
+            widths = [
+                slot.range[1] - slot.range[0] + 1
+                for slot in self.slots
+                if slot.control_mode is ControlMode.CARTESIAN_DELTA
+            ]
+        elif self.representation in (
+            ActionRepresentation.DELTA_EE_6D,
+            ActionRepresentation.DELTA_EE_6D_PLUS_GRIPPER,
+        ):
+            widths = [_EE_6D_WIDTH]
+        elif self.representation is ActionRepresentation.DELTA_EE_3D_PLUS_GRIPPER:
+            widths = [_EE_3D_WIDTH]
+        if not widths:
+            raise ValueError(
+                "ActionContract.cartesian_delta_scale requires a CARTESIAN_DELTA "
+                "slot or delta-EE representation"
+            )
+        if any(width != len(scale) for width in widths):
+            raise ValueError(
+                "ActionContract.cartesian_delta_scale length must match every "
+                f"CARTESIAN_DELTA slot; scale={len(scale)}, slot_widths={widths}"
+            )
+        return self
+
+
+# Representation → ControlMode + canonical slot layout. The
+# single source of truth shared by the skill_runner (action dispatch)
+# and the reasoner (deploy-path palette gate): given a VLA's declared
+# ``ActionRepresentation`` we derive (a) which ``ControlMode`` s the
+# target robot must advertise, and (b) the typed ``ActionSlot`` layout
+# the runner dispatches the flat policy vector through.
+_EE_6D_WIDTH = 6  # (dx, dy, dz, drx, dry, drz) — 6-DoF cartesian slice.
+_EE_3D_WIDTH = 3  # (dx, dy, dz) — translation-only cartesian slice (MetaWorld-style).
+
+
+def control_modes_for_representation(rep: ActionRepresentation) -> set[ControlMode]:
+    """Map an ``ActionRepresentation`` to the ``ControlMode`` s it drives.
+
+    Used by the reasoner's deploy-path palette gate: a skill is
+    only offered when the target robot advertises *every* mode in the
+    returned set.
+
+    Args:
+        rep: The VLA's declared action-vector representation.
+
+    Returns:
+        The set of ``ControlMode`` s the representation maps onto.
+
+    Example:
+        >>> control_modes_for_representation(ActionRepresentation.DELTA_EE_6D_PLUS_GRIPPER) == {
+        ...     ControlMode.CARTESIAN_DELTA,
+        ...     ControlMode.GRIPPER_POSITION,
+        ... }
+        True
+    """
+    if rep is ActionRepresentation.JOINT_POSITIONS:
+        return {ControlMode.JOINT_POSITION}
+    if rep is ActionRepresentation.JOINT_VELOCITIES:
+        return {ControlMode.JOINT_VELOCITY}
+    if rep is ActionRepresentation.DELTA_EE_6D:
+        return {ControlMode.CARTESIAN_DELTA}
+    if rep in (
+        ActionRepresentation.DELTA_EE_6D_PLUS_GRIPPER,
+        ActionRepresentation.DELTA_EE_3D_PLUS_GRIPPER,
+    ):
+        return {ControlMode.CARTESIAN_DELTA, ControlMode.GRIPPER_POSITION}
+    # CARTESIAN_POSE — the only remaining enum member.
+    return {ControlMode.CARTESIAN_POSE}
+
+
+# The canonical set of ControlModes the
+# DEFAULT sim HAL action-packers can actually execute, the single source
+# of truth for the reasoner's ``hal_mode="sim"`` palette gate (see
+# ``openral_reasoner_ros.reasoner_node._action_executable``).
+#
+# This is the *default-sim-packer contract*. The packers in
+# ``python/hal/src/openral_hal/sim_attached.py`` are pinned to this exact
+# set — every member here is handled by at least one packer path, and no
+# packer handles a mode that is not here. The lockstep is enforced (both
+# directions) by ``tests/unit/test_sim_executable_modes_match_packers.py``.
+#
+# Provenance of each member:
+#   * JOINT_POSITION  — ``pack_action_for_env`` + ``_pack_with_composite_split``.
+#   * JOINT_VELOCITY  — ``_pack_with_composite_split`` (HybridMobileBase base part).
+#   * CARTESIAN_DELTA — both packers (robosuite OSC arm slot).
+#   * GRIPPER_POSITION— both packers (gripper slot).
+#   * COMPOSITE_MODE  — ``_pack_with_composite_split`` (HybridMobileBase multiplexer flag).
+#   * BODY_TWIST      — intercepted in ``SimAttachedHAL.send_action`` and applied
+#                       via ``_apply_body_twist_to_qpos`` (direct base-qpos write,
+#                       NOT through a packer else-branch).
+#
+# Modes deliberately EXCLUDED (no sim packer path → would E-stop mid-run):
+# JOINT_TORQUE, JOINT_TRAJECTORY, GRIPPER_BINARY (decoded by
+# ``openral_hal.lifecycle.decode_action_chunk`` but never pack-executed);
+# CARTESIAN_POSE (not even decoded — ``decode_action_chunk`` returns None for
+# it, as it carries a Pose6D rather than a flat row); and CARTESIAN_TWIST,
+# FOOT_PLACEMENT, DEX_HAND_JOINT (no sim controller at all).
+SIM_EXECUTABLE_CONTROL_MODES: frozenset[ControlMode] = frozenset(
+    {
+        ControlMode.JOINT_POSITION,
+        ControlMode.JOINT_VELOCITY,
+        ControlMode.CARTESIAN_DELTA,
+        ControlMode.GRIPPER_POSITION,
+        ControlMode.BODY_TWIST,
+        ControlMode.COMPOSITE_MODE,
+    }
+)
+
+
+def canonical_slots_for_representation(
+    rep: ActionRepresentation,
+    *,
+    dim: int,
+    description: RobotDescription,
+) -> list[ActionSlot] | None:
+    """Build the canonical ``ActionSlot`` layout for a representation.
+
+    The skill_runner calls this to expand a skill that declares
+    only ``ActionContract.representation`` (no explicit ``slots``) into a
+    typed slot layout it can dispatch. Joint representations return
+    ``None`` so the caller keeps the legacy whole-vector ``JOINT_POSITION``
+    path; cartesian / gripper representations get one slot per control
+    mode, addressed at the robot's primary end-effector
+    (``description.end_effectors[0]``).
+
+    ``EndEffectorSpec`` carries no explicit tf-frame field, so the
+    end-effector's ``name`` is used as the slot ``frame`` (the EE name is
+    the tf frame the cartesian pose/delta is expressed in for the
+    canonical embodiments).
+
+    Args:
+        rep: The VLA's declared action-vector representation.
+        dim: Dimensionality of the policy's flat action vector.
+        description: The target robot — its primary end-effector names
+            the cartesian/gripper slots.
+
+    Returns:
+        For joint representations: ``None`` (caller keeps the legacy
+        whole-vector ``JOINT_POSITION`` path). Otherwise a list of typed
+        ``ActionSlot`` s that satisfy the per-slot validators.
+
+    Raises:
+        ROSConfigError: If the representation needs an end-effector but
+            ``description.end_effectors`` is empty, or if ``dim`` is too
+            small for the layout (``DELTA_EE_6D`` / ``CARTESIAN_POSE``
+            need ``dim >= 6``; ``DELTA_EE_6D_PLUS_GRIPPER`` needs
+            ``dim >= 7``).
+
+    Example:
+        >>> desc = RobotDescription(
+        ...     name="ex_robot",
+        ...     embodiment_kind=EmbodimentKind.MANIPULATOR,
+        ...     joints=[
+        ...         JointSpec(
+        ...             name="j1",
+        ...             joint_type=JointType.REVOLUTE,
+        ...             parent_link="base_link",
+        ...             child_link="link_1",
+        ...         )
+        ...     ],
+        ...     end_effectors=[EndEffectorSpec(name="ee0", kind="parallel_gripper")],
+        ...     capabilities=RobotCapabilities(),
+        ...     safety=SafetyEnvelope(),
+        ... )
+        >>> slots = canonical_slots_for_representation(
+        ...     ActionRepresentation.DELTA_EE_6D, dim=6, description=desc
+        ... )
+        >>> slots[0].control_mode is ControlMode.CARTESIAN_DELTA
+        True
+    """
+    if rep in (ActionRepresentation.JOINT_POSITIONS, ActionRepresentation.JOINT_VELOCITIES):
+        # Legacy whole-vector JOINT path — the caller emits one implicit
+        # JOINT_POSITION / JOINT_VELOCITY slot covering the whole vector.
+        return None
+
+    if not description.end_effectors:
+        raise ROSConfigError(
+            f"canonical_slots_for_representation: representation {rep.value!r} addresses "
+            "an end-effector but the robot description declares no end_effectors; "
+            "cannot build a cartesian/gripper slot layout."
+        )
+    primary = description.end_effectors[0]
+    ee_name = primary.name
+    # EndEffectorSpec has no explicit tf-frame field; the EE name is the
+    # tf frame the cartesian pose/delta is expressed in.
+    ee_frame = ee_name
+
+    has_gripper = rep in (
+        ActionRepresentation.DELTA_EE_6D_PLUS_GRIPPER,
+        ActionRepresentation.DELTA_EE_3D_PLUS_GRIPPER,
+    )
+    # Translation-only representations carry a 3-wide cartesian slice; all
+    # others (6-DoF delta / cartesian pose) carry the full 6-wide slice.
+    cart_width = (
+        _EE_3D_WIDTH if rep is ActionRepresentation.DELTA_EE_3D_PLUS_GRIPPER else _EE_6D_WIDTH
+    )
+    min_dim = cart_width + 1 if has_gripper else cart_width
+    if dim < min_dim:
+        raise ROSConfigError(
+            f"canonical_slots_for_representation: representation {rep.value!r} requires "
+            f"dim >= {min_dim} but action_contract.dim={dim} is too small for the layout."
+        )
+
+    cart_mode = (
+        ControlMode.CARTESIAN_POSE
+        if rep is ActionRepresentation.CARTESIAN_POSE
+        else ControlMode.CARTESIAN_DELTA
+    )
+    slots: list[ActionSlot] = [
+        ActionSlot(
+            range=(0, cart_width - 1),
+            control_mode=cart_mode,
+            ee=ee_name,
+            frame=ee_frame,
+        )
+    ]
+    if has_gripper:
+        slots.append(
+            ActionSlot(
+                range=(cart_width, dim - 1),
+                control_mode=ControlMode.GRIPPER_POSITION,
+                ee=ee_name,
+            )
+        )
+    return slots
+
+
+# ─── TaskSpace — layer-neutral action-space view ─────────────
+
+
+class TaskSpaceFamily(str, Enum):
+    """Coarse classification of a ``ControlMode`` for task-space views.
+
+    Redundant with ``ControlMode`` (derivable via
+    ``_FAMILY_FOR_MODE``) but stored on ``TaskSpaceSegment`` so the
+    object reads cleanly in logs / dashboards and so family↔mode consistency is
+    validated once at construction.
+    """
+
+    JOINT = "joint"  # joint_position / joint_velocity / joint_torque / joint_trajectory
+    CARTESIAN = "cartesian"  # cartesian_pose / cartesian_delta / cartesian_twist
+    GRIPPER = "gripper"  # gripper_binary / gripper_position
+    BASE = "base"  # body_twist / foot_placement
+    DEX_HAND = "dex_hand"  # dex_hand_joint
+    COMPOSITE = "composite"  # composite_mode multiplexer flag
+
+
+# Single source of truth mapping every ControlMode to its TaskSpaceFamily. Keyed
+# exhaustively over the enum so a new ControlMode without a family entry trips
+# the lockstep test (tests/unit/test_task_space.py::test_every_mode_has_family).
+_FAMILY_FOR_MODE: dict[ControlMode, TaskSpaceFamily] = {
+    ControlMode.JOINT_POSITION: TaskSpaceFamily.JOINT,
+    ControlMode.JOINT_VELOCITY: TaskSpaceFamily.JOINT,
+    ControlMode.JOINT_TORQUE: TaskSpaceFamily.JOINT,
+    ControlMode.JOINT_TRAJECTORY: TaskSpaceFamily.JOINT,
+    ControlMode.CARTESIAN_POSE: TaskSpaceFamily.CARTESIAN,
+    ControlMode.CARTESIAN_DELTA: TaskSpaceFamily.CARTESIAN,
+    ControlMode.CARTESIAN_TWIST: TaskSpaceFamily.CARTESIAN,
+    ControlMode.BODY_TWIST: TaskSpaceFamily.BASE,
+    ControlMode.FOOT_PLACEMENT: TaskSpaceFamily.BASE,
+    ControlMode.GRIPPER_BINARY: TaskSpaceFamily.GRIPPER,
+    ControlMode.GRIPPER_POSITION: TaskSpaceFamily.GRIPPER,
+    ControlMode.DEX_HAND_JOINT: TaskSpaceFamily.DEX_HAND,
+    ControlMode.COMPOSITE_MODE: TaskSpaceFamily.COMPOSITE,
+}
+
+
+class TaskSpaceSegment(BaseModel):
+    """One typed slice of an action vector, layer-neutral.
+
+    The normalized form of an ``ActionSlot`` (rSkill side) or a robot's
+    advertised control mode (robot side), stripped of the slot's absolute
+    ``[start, end]`` indices so robot capabilities and scene expectations — which
+    are not policy vectors — can be expressed in the same vocabulary.
+
+    Attributes:
+        family: Coarse classification, derived from ``control_mode`` and
+            validated to match ``_FAMILY_FOR_MODE``.
+        control_mode: The ``ControlMode`` this slice routes to.
+        width: Number of scalar dimensions the slice occupies (> 0). For the
+            gripper this is the audit's "is the gripper a dimension?" answered
+            structurally — a 1-D ``GRIPPER_*`` segment.
+        target: End-effector name for ``CARTESIAN_*`` / ``GRIPPER_*`` /
+            ``DEX_HAND_JOINT`` modes (the frame / actuator the slice drives);
+            ``None`` for joint / base / composite modes. May be ``None`` even for
+            EE modes when the producer could not resolve an end-effector (e.g. a
+            representation-expanded skill on a robot with no declared EE) — the
+            matcher reports that as a reason rather than failing construction.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    family: TaskSpaceFamily
+    control_mode: ControlMode
+    width: int = Field(gt=0)
+    target: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_family(self) -> TaskSpaceSegment:
+        expected = _FAMILY_FOR_MODE[self.control_mode]
+        if self.family is not expected:
+            raise ValueError(
+                f"TaskSpaceSegment: family={self.family.value!r} does not match "
+                f"control_mode={self.control_mode.value!r} (expected "
+                f"family={expected.value!r})"
+            )
+        return self
+
+
+class TaskSpaceMatch(BaseModel):
+    """Result of ``task_space_compatible``.
+
+    Attributes:
+        ok: ``True`` when every skill segment is executable on the robot.
+        reasons: Human-readable explanation of each incompatibility; empty when
+            ``ok`` is ``True``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    reasons: list[str] = Field(default_factory=list)
+
+
+class TaskSpace(BaseModel):
+    """Layer-neutral view of an action interface as ordered typed segments.
+
+    Produced from an rSkill's ``ActionContract`` (and, in a later
+    phase, declared by a scene) so the three asset layers — robots, rSkills,
+    scenes — share one comparable object instead of three implicit encodings
+    (a flat ``supported_control_modes`` set, an ``ActionContract``, and a
+    runtime-probed ``action_dim``). It is *derived*, never a hand-authored
+    manifest field, so it cannot drift from the primitives it is built on.
+
+    Attributes:
+        segments: Ordered, non-empty list of ``TaskSpaceSegment``. Order
+            matches the flat action-vector layout for skill-derived spaces.
+        representation: The source ``ActionRepresentation`` when known
+            (carried through from ``ActionContract``), for diagnostics.
+
+    Example:
+        >>> ts = TaskSpace(
+        ...     segments=[
+        ...         TaskSpaceSegment(
+        ...             family=TaskSpaceFamily.CARTESIAN,
+        ...             control_mode=ControlMode.CARTESIAN_DELTA,
+        ...             width=6,
+        ...             target="panda_hand",
+        ...         ),
+        ...         TaskSpaceSegment(
+        ...             family=TaskSpaceFamily.GRIPPER,
+        ...             control_mode=ControlMode.GRIPPER_POSITION,
+        ...             width=1,
+        ...             target="panda_hand",
+        ...         ),
+        ...     ],
+        ... )
+        >>> ts.total_dim
+        7
+        >>> sorted(m.value for m in ts.control_modes) == ["cartesian_delta", "gripper_position"]
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    segments: list[TaskSpaceSegment]
+    representation: ActionRepresentation | None = None
+
+    @model_validator(mode="after")
+    def _validate_nonempty(self) -> TaskSpace:
+        if not self.segments:
+            raise ValueError("TaskSpace.segments must be a non-empty list")
+        return self
+
+    @property
+    def total_dim(self) -> int:
+        """Sum of segment widths — the flat action-vector dimensionality."""
+        return sum(seg.width for seg in self.segments)
+
+    @property
+    def control_modes(self) -> set[ControlMode]:
+        """The distinct ``ControlMode`` s this space drives."""
+        return {seg.control_mode for seg in self.segments}
+
+    @classmethod
+    def from_action_contract(cls, action: ActionContract, robot: RobotDescription) -> TaskSpace:
+        """Build the task space an rSkill emits, expanding slots / representation.
+
+        Resolution order:
+
+        1. ``action.slots`` set → one segment per non-discard slot.
+        2. else ``action.representation`` set → expand via
+           ``canonical_slots_for_representation`` (returns ``None`` for joint
+           representations, falling through to step 3).
+        3. else → a single whole-vector ``JOINT_POSITION`` segment (legacy path).
+
+        Args:
+            action: The rSkill's per-checkpoint action contract.
+            robot: The robot the skill is being matched against — used by the
+                representation expander to resolve the primary end-effector.
+
+        Returns:
+            The normalized ``TaskSpace`` the checkpoint's action vector
+            occupies.
+
+        Example:
+            >>> from openral_core.schemas import (
+            ...     ActionSlot,
+            ...     EmbodimentKind,
+            ...     EndEffectorSpec,
+            ...     JointSpec,
+            ...     JointType,
+            ...     RobotCapabilities,
+            ...     SafetyEnvelope,
+            ... )
+            >>> robot = RobotDescription(
+            ...     name="franka_panda",
+            ...     embodiment_kind=EmbodimentKind.MANIPULATOR,
+            ...     joints=[
+            ...         JointSpec(
+            ...             name="j1",
+            ...             joint_type=JointType.REVOLUTE,
+            ...             parent_link="base_link",
+            ...             child_link="link_1",
+            ...         )
+            ...     ],
+            ...     end_effectors=[EndEffectorSpec(name="panda_hand", kind="parallel_gripper")],
+            ...     capabilities=RobotCapabilities(
+            ...         supported_control_modes=[ControlMode.JOINT_POSITION],
+            ...         embodiment_tags=["franka_panda"],
+            ...     ),
+            ...     safety=SafetyEnvelope(),
+            ... )
+            >>> ac = ActionContract(
+            ...     dim=7,
+            ...     slots=[
+            ...         ActionSlot(
+            ...             range=(0, 5),
+            ...             control_mode=ControlMode.CARTESIAN_DELTA,
+            ...             ee="panda_hand",
+            ...             frame="panda_hand",
+            ...         ),
+            ...         ActionSlot(
+            ...             range=(6, 6), control_mode=ControlMode.GRIPPER_POSITION, ee="panda_hand"
+            ...         ),
+            ...     ],
+            ... )
+            >>> ts = TaskSpace.from_action_contract(ac, robot)
+            >>> ts.total_dim
+            7
+            >>> [seg.family.value for seg in ts.segments] == ["cartesian", "gripper"]
+            True
+        """
+        slots = action.slots
+        if slots is None and action.representation is not None:
+            slots = canonical_slots_for_representation(
+                action.representation, dim=action.dim, description=robot
+            )
+        if slots is None:
+            # Legacy whole-vector path: an undeclared layout is joint-position.
+            return cls(
+                segments=[
+                    TaskSpaceSegment(
+                        family=TaskSpaceFamily.JOINT,
+                        control_mode=ControlMode.JOINT_POSITION,
+                        width=action.dim,
+                    )
+                ],
+                representation=action.representation,
+            )
+        segments: list[TaskSpaceSegment] = []
+        for slot in slots:
+            mode = slot.control_mode
+            if mode is None:  # discard slot — occupies range, emits no Action.
+                continue
+            lo, hi = slot.range
+            segments.append(
+                TaskSpaceSegment(
+                    family=_FAMILY_FOR_MODE[mode],
+                    control_mode=mode,
+                    width=hi - lo + 1,
+                    target=slot.ee,
+                )
+            )
+        return cls(segments=segments, representation=action.representation)
+
+
+def task_space_compatible(
+    skill_space: TaskSpace,
+    robot: RobotDescription,
+    *,
+    hal_mode: Literal["sim", "real"] = "real",
+) -> TaskSpaceMatch:
+    """Check an rSkill's ``TaskSpace`` is executable on a robot.
+
+    The single cross-layer gate replacing implicit ``embodiment_tags``/dim
+    matching. Compatible when every segment's ``control_mode`` is executable
+    for ``hal_mode`` (``"sim"``: ``SIM_EXECUTABLE_CONTROL_MODES``;
+    ``"real"``: the robot's ``capabilities.supported_control_modes``), every
+    ``CARTESIAN_*``/``GRIPPER_*``/``DEX_HAND_JOINT`` segment names a real
+    end-effector, and the total joint-segment width fits the robot's joint count.
+
+    Args:
+        skill_space: The task space the rSkill emits (``TaskSpace.from_action_contract``).
+        robot: The target robot description.
+        hal_mode: ``"sim"`` (default-sim OSC packers) or ``"real"`` (hardware controllers).
+
+    Returns:
+        A ``TaskSpaceMatch`` — ``ok`` plus a reason per incompatibility.
+
+    Example:
+        >>> from openral_core.schemas import (
+        ...     EmbodimentKind,
+        ...     EndEffectorSpec,
+        ...     JointSpec,
+        ...     JointType,
+        ...     RobotCapabilities,
+        ...     SafetyEnvelope,
+        ... )
+        >>> robot = RobotDescription(
+        ...     name="franka_panda",
+        ...     embodiment_kind=EmbodimentKind.MANIPULATOR,
+        ...     joints=[
+        ...         JointSpec(
+        ...             name="j1",
+        ...             joint_type=JointType.REVOLUTE,
+        ...             parent_link="base_link",
+        ...             child_link="link_1",
+        ...         )
+        ...     ],
+        ...     end_effectors=[EndEffectorSpec(name="panda_hand", kind="parallel_gripper")],
+        ...     capabilities=RobotCapabilities(
+        ...         supported_control_modes=[ControlMode.JOINT_POSITION],
+        ...         embodiment_tags=["franka_panda"],
+        ...     ),
+        ...     safety=SafetyEnvelope(),
+        ... )
+        >>> space = TaskSpace(
+        ...     segments=[
+        ...         TaskSpaceSegment(
+        ...             family=TaskSpaceFamily.CARTESIAN,
+        ...             control_mode=ControlMode.CARTESIAN_DELTA,
+        ...             width=6,
+        ...             target="panda_hand",
+        ...         )
+        ...     ]
+        ... )
+        >>> # Real hardware needs a cartesian controller the Franka does not declare:
+        >>> task_space_compatible(space, robot, hal_mode="real").ok
+        False
+        >>> # In sim the robosuite OSC packer synthesises it from joint commands:
+        >>> task_space_compatible(space, robot, hal_mode="sim").ok
+        True
+    """
+    reasons: list[str] = []
+    if hal_mode == "sim":
+        executable: set[ControlMode] = set(SIM_EXECUTABLE_CONTROL_MODES)
+    else:
+        executable = {ControlMode(m) for m in robot.capabilities.supported_control_modes}
+    ee_names = {ee.name for ee in robot.end_effectors}
+    n_joints = len(robot.joints)
+
+    joint_width = 0
+    for seg in skill_space.segments:
+        if seg.control_mode not in executable:
+            reasons.append(
+                f"control_mode {seg.control_mode.value!r} not executable in "
+                f"hal_mode={hal_mode!r} (segment family={seg.family.value!r}, "
+                f"width={seg.width})"
+            )
+        if seg.family in (
+            TaskSpaceFamily.CARTESIAN,
+            TaskSpaceFamily.GRIPPER,
+            TaskSpaceFamily.DEX_HAND,
+        ):
+            if seg.target is None:
+                reasons.append(
+                    f"{seg.family.value} segment ({seg.control_mode.value}) has no "
+                    "target end-effector to address"
+                )
+            elif seg.target not in ee_names:
+                reasons.append(
+                    f"{seg.family.value} segment targets end-effector "
+                    f"{seg.target!r}, not declared on robot {robot.name!r} "
+                    f"(have: {sorted(ee_names)})"
+                )
+        if seg.family is TaskSpaceFamily.JOINT:
+            joint_width += seg.width
+
+    if joint_width > n_joints:
+        reasons.append(
+            f"joint-segment width {joint_width} exceeds robot joint count "
+            f"{n_joints} on {robot.name!r}"
+        )
+
+    return TaskSpaceMatch(ok=not reasons, reasons=reasons)
+
+
+# ─── Scene side of the task space — the third layer ─────────
+
+
+class SceneTaskSpace(BaseModel):
+    """The action interface a scene-adapter family executes.
+
+    The scene leg of the cross-layer task-space contract. A scene picks a
+    *backend adapter* (LIBERO OSC, RoboCasa composite, gym-aloha joints, the
+    RLBench PyRep sidecar, …) and that adapter — not the coarse
+    ``PhysicsBackend`` and not the individual scene instance — fixes which
+    ``ControlMode`` s the policy's flat action vector is interpreted as.
+    Many scenes share one adapter (the four LIBERO suites, RoboCasa's ~100
+    prebuilt PnP tasks), so the executed task space is declared once per
+    *family* and keyed by the same vocabulary rSkills already use in
+    ``RSkillManifest.evaluated_tasks`` (the leading token before any
+    ``"/"``: ``"libero_spatial"``, ``"rlbench"``, ``"robocasa"``, …).
+
+    Attributes:
+        modes: The ``ControlMode`` s the adapter executes. An rSkill is
+            scene-compatible when its ``TaskSpace`` control modes are a
+            subset of this set.
+        action_dim: The flat action-vector width the adapter steps, when fixed
+            (LIBERO 7, MetaWorld 4, ALOHA 14). ``None`` when it varies by task
+            or robot composition (RoboCasa 11-vs-12 base skew, ManiSkill
+            per-task), in which case only ``modes`` is checked.
+        runs_via_default_packers: ``True`` when every mode is in
+            ``SIM_EXECUTABLE_CONTROL_MODES`` (the deploy-sim default packers
+            could also drive it). ``False`` for adapters that drive a dedicated
+            controller path outside the default packers — RLBench's
+            ``CARTESIAN_POSE`` motion planner, RoboCasa-GR1's whole-body BASIC
+            composite — mirroring ``KNOWN_SIM_GAPS`` in the sweep.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    modes: frozenset[ControlMode]
+    action_dim: int | None = Field(default=None, gt=0)
+    runs_via_default_packers: bool = True
+
+
+def scene_family(task_id: str) -> str:
+    """Reduce an ``evaluated_tasks`` entry to its scene-family key.
+
+    The family is the leading token before any ``"/"`` — ``"rlbench/open_drawer"``
+    → ``"rlbench"``, ``"libero_spatial"`` → ``"libero_spatial"``.
+
+    Example:
+        >>> scene_family("rlbench/open_drawer")
+        'rlbench'
+        >>> scene_family("metaworld")
+        'metaworld'
+    """
+    return task_id.split("/", 1)[0]
+
+
+# Single source of truth for the control interface each scene-adapter family
+# executes. Keyed by ``scene_family(evaluated_task)``. Adding an rSkill that
+# declares a new task family with no entry here trips the scene sweep
+# (tests/unit/test_task_space_sweep.py::test_scene_families_are_declared), so a
+# new backend must record what it actually drives — the same lockstep discipline
+# SIM_EXECUTABLE_CONTROL_MODES has with the packers.
+SCENE_FAMILY_TASK_SPACE: dict[str, SceneTaskSpace] = {
+    # LIBERO robosuite OSC: 7-D [xyz_delta(3) | axis_angle_delta(3) | gripper(1)].
+    "libero_spatial": SceneTaskSpace(
+        modes=frozenset({ControlMode.CARTESIAN_DELTA, ControlMode.GRIPPER_POSITION}),
+        action_dim=7,
+    ),
+    "libero_object": SceneTaskSpace(
+        modes=frozenset({ControlMode.CARTESIAN_DELTA, ControlMode.GRIPPER_POSITION}),
+        action_dim=7,
+    ),
+    "libero_goal": SceneTaskSpace(
+        modes=frozenset({ControlMode.CARTESIAN_DELTA, ControlMode.GRIPPER_POSITION}),
+        action_dim=7,
+    ),
+    "libero_10": SceneTaskSpace(
+        modes=frozenset({ControlMode.CARTESIAN_DELTA, ControlMode.GRIPPER_POSITION}),
+        action_dim=7,
+    ),
+    # MetaWorld mocap: 4-D [xyz_delta(3) | gripper(1)] — translation only.
+    "metaworld": SceneTaskSpace(
+        modes=frozenset({ControlMode.CARTESIAN_DELTA, ControlMode.GRIPPER_POSITION}),
+        action_dim=4,
+    ),
+    # SimplerEnv WidowX bridge OSC: 7-D [xyz_delta(3) | rpy_delta(3) | gripper(1)].
+    "simpler_env": SceneTaskSpace(
+        modes=frozenset({ControlMode.CARTESIAN_DELTA, ControlMode.GRIPPER_POSITION}),
+        action_dim=7,
+    ),
+    # VLABench Franka Panda EE control: 7-D [pos_delta(3) | euler_delta(3) | gripper(1)],
+    # in-process on lerobot 0.6.0. Same interface as the LIBERO/SimplerEnv
+    # OSC families — drivable by the default sim packers.
+    "vlabench": SceneTaskSpace(
+        modes=frozenset({ControlMode.CARTESIAN_DELTA, ControlMode.GRIPPER_POSITION}),
+        action_dim=7,
+    ),
+    # gym-aloha bimanual joints: 14-D [2 x (6 arm + 1 gripper)].
+    "aloha_transfer_cube": SceneTaskSpace(
+        modes=frozenset({ControlMode.JOINT_POSITION}), action_dim=14
+    ),
+    "aloha_insertion": SceneTaskSpace(modes=frozenset({ControlMode.JOINT_POSITION}), action_dim=14),
+    # RoboTwin SAPIEN dual-arm joints: 14-D, via the out-of-process sidecar.
+    "robotwin": SceneTaskSpace(modes=frozenset({ControlMode.JOINT_POSITION}), action_dim=14),
+    # ManiSkill3 pd_joint_pos: width is per-task (LiftCube 8) — left unfixed.
+    "maniskill3": SceneTaskSpace(modes=frozenset({ControlMode.JOINT_POSITION}), action_dim=None),
+    # PushT pymunk: 2-D absolute pusher position, driven as the robot's two
+    # prismatic tip_x/tip_y joints (robot mode aligned).
+    "pusht": SceneTaskSpace(modes=frozenset({ControlMode.JOINT_POSITION}), action_dim=2),
+    # RoboCasa panda_mobile BASIC/HybridMobileBase composite: arm OSC delta +
+    # gripper + base joint-velocity + the composite multiplexer flag. Width is
+    # 11 (BASIC) or 12 (HybridMobileBase) — left unfixed.
+    "robocasa": SceneTaskSpace(
+        modes=frozenset(
+            {
+                ControlMode.CARTESIAN_DELTA,
+                ControlMode.GRIPPER_POSITION,
+                ControlMode.JOINT_VELOCITY,
+                ControlMode.COMPOSITE_MODE,
+            }
+        ),
+        action_dim=None,
+    ),
+    # RLBench CoppeliaSim/PyRep: 8-D [pos(3) | quat(4) | gripper(1)] absolute
+    # keypose, executed by a motion planner — NOT the default sim packers.
+    "rlbench": SceneTaskSpace(
+        modes=frozenset({ControlMode.CARTESIAN_POSE, ControlMode.GRIPPER_POSITION}),
+        action_dim=8,
+        runs_via_default_packers=False,
+    ),
+    # BEHAVIOR-1K OmniGibson R1 Pro mixed 23-D: base body_twist(3) + torso+arms
+    # joint_position(4+7+7) + grippers(1+1), committed atomically as one
+    # official evaluator step.
+    "behavior": SceneTaskSpace(
+        modes=frozenset(
+            {
+                ControlMode.BODY_TWIST,
+                ControlMode.JOINT_POSITION,
+                ControlMode.GRIPPER_POSITION,
+            }
+        ),
+        action_dim=23,
+    ),
+}
+
+
+def scene_task_space_compatible(family: str, skill_space: TaskSpace) -> TaskSpaceMatch:
+    """Check an rSkill's ``TaskSpace`` is executable by a scene family.
+
+    The third leg of the cross-layer gate: a skill fits a
+    scene when every ``ControlMode`` it emits is in the scene family's
+    executed set, and — when the family fixes a width — its total dimensionality
+    matches. Pairs with ``task_space_compatible`` (rSkill x robot); together
+    they close the rSkill x robot x scene triangle the audit found unconnected.
+
+    Args:
+        family: The scene-family key (see ``scene_family``).
+        skill_space: The task space the rSkill emits
+            (``TaskSpace.from_action_contract``).
+
+    Returns:
+        A ``TaskSpaceMatch`` — ``ok`` plus a reason per incompatibility.
+        An unknown ``family`` is reported as a single reason (not an exception)
+        so a sweep can collect every gap in one pass.
+
+    Example:
+        >>> space = TaskSpace(
+        ...     segments=[
+        ...         TaskSpaceSegment(
+        ...             family=TaskSpaceFamily.JOINT,
+        ...             control_mode=ControlMode.JOINT_POSITION,
+        ...             width=14,
+        ...         )
+        ...     ]
+        ... )
+        >>> scene_task_space_compatible("robotwin", space).ok
+        True
+    """
+    spec = SCENE_FAMILY_TASK_SPACE.get(family)
+    if spec is None:
+        return TaskSpaceMatch(
+            ok=False,
+            reasons=[
+                f"scene family {family!r} has no declared task space in SCENE_FAMILY_TASK_SPACE"
+            ],
+        )
+    reasons: list[str] = []
+    extra = skill_space.control_modes - spec.modes
+    if extra:
+        reasons.append(
+            f"control mode(s) {sorted(m.value for m in extra)} not executable by "
+            f"scene family {family!r} (executes {sorted(m.value for m in spec.modes)})"
+        )
+    if spec.action_dim is not None and skill_space.total_dim != spec.action_dim:
+        reasons.append(
+            f"action dim {skill_space.total_dim} != scene family {family!r} "
+            f"expected dim {spec.action_dim}"
+        )
+    return TaskSpaceMatch(ok=not reasons, reasons=reasons)
+
+
+GripperConvention: TypeAlias = Literal[
+    "normalized_open_unit",
+    "normalized_open_symmetric",
+    "binary_close_one",
+    "raw_joint_rad",
+    "width_meters",
+]
+"""Per-skill gripper action encoding (Gap 2 of the rSkill self-containment audit).
+
+Required on ``ControlModeSemantics`` whenever the parent
+``ActuatorRequirement.kind`` is ``ControlMode.GRIPPER_BINARY`` or
+``ControlMode.GRIPPER_POSITION`` — silently mis-encoding the gripper
+slot between scenes / robots is a top observed mis-actuation failure.
+
+Conventions:
+
+* ``normalized_open_unit`` — ``0.0 = fully closed``, ``1.0 = fully open``.
+  Most lerobot / SmolVLA / pi0.5 LIBERO checkpoints.
+* ``normalized_open_symmetric`` — ``-1.0 = fully closed``, ``+1.0 = fully open``.
+  Some MetaWorld checkpoints.
+* ``binary_close_one`` — ``0.0 = open``, ``1.0 = close`` (single bit, RoboCasa-style).
+* ``raw_joint_rad`` — raw per-finger joint angle in radians (Fourier dexhands,
+  some humanoid skills).
+* ``width_meters`` — physical gripper width in metres (Franka FCI native).
+"""
+
+
+class ControlModeSemantics(BaseModel):
+    """Action-space semantics declared on each ``ActuatorRequirement``.
+
+    Closes Gap 2 of the rSkill self-containment audit: ``kind`` alone
+    ("joint_position") doesn't say whether the policy emits absolute targets
+    or per-step deltas, in which joint order, in which reference frame, or
+    how it encodes the gripper. Today these are assumed at the adapter
+    level and silently broken when porting a skill between embodiments.
+
+    The block is REQUIRED on every actuator entry of a manifest. For
+    the canonical embodiments the loader still auto-fills ``n_dof`` /
+    ``vla_action_key`` from the robot YAML; semantics must be declared
+    explicitly on the manifest because they are a property of the *trained
+    checkpoint*, not the robot.
+
+    Attributes:
+        mode: Whether the action vector represents absolute targets
+            (joint positions, end-effector pose) or deltas from the current
+            state. Required.
+        gripper_convention: Encoding of the gripper slot in the action
+            vector. Required when the parent ``ActuatorRequirement.kind``
+            is ``ControlMode.GRIPPER_BINARY`` or
+            ``ControlMode.GRIPPER_POSITION``; forbidden otherwise.
+        joint_order: Ordered list of joint names matching the channels
+            the policy emits. Optional for canonical embodiments
+            (the robot YAML's ``ActionSpec.joint_names`` is the
+            source of truth); REQUIRED for ``"custom"`` embodiments.
+        reference_frame: tf2 frame the action is expressed in. Required
+            when the parent ``ActuatorRequirement.kind`` is one of
+            ``ControlMode.CARTESIAN_POSE``,
+            ``ControlMode.CARTESIAN_DELTA``, or
+            ``ControlMode.CARTESIAN_TWIST``; forbidden otherwise.
+
+    Example:
+        >>> sem = ControlModeSemantics(mode="absolute")
+        >>> sem.mode
+        'absolute'
+        >>> sem.gripper_convention is None and sem.reference_frame is None
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["absolute", "delta"]
+    gripper_convention: GripperConvention | None = None
+    joint_order: list[str] | None = None
+    reference_frame: str | None = None
+
+
+_GRIPPER_KINDS: frozenset[ControlMode] = frozenset(
+    {ControlMode.GRIPPER_BINARY, ControlMode.GRIPPER_POSITION}
+)
+_CARTESIAN_KINDS: frozenset[ControlMode] = frozenset(
+    {ControlMode.CARTESIAN_POSE, ControlMode.CARTESIAN_DELTA, ControlMode.CARTESIAN_TWIST}
+)
+
+
+class ActuatorRequirement(BaseModel):
+    """One actuator slot an rSkill emits actions for.
+
+    Symmetric with ``SensorRequirement`` on the action side.
+    The compatibility check resolves each entry against a
+    ``RobotDescription``'s ``action_spec`` and rejects pairings
+    whose declared ``ControlMode`` is not advertised by the robot.
+
+    For predefined embodiments (one of the 9 canonical
+    ``robots/<id>/robot.yaml`` slugs), ``n_dof`` and ``vla_action_key``
+    are optional — the loader auto-fills them from the robot YAML at
+    compatibility-check time. For the ``"custom"`` embodiment escape
+    hatch they MUST be set on the manifest; the
+    ``RSkillManifest`` cross-validator enforces this.
+
+    Attributes:
+        kind: The action interface the skill emits (e.g.
+            ``ControlMode.JOINT_POSITION``,
+            ``ControlMode.CARTESIAN_DELTA``). Reuses the canonical
+            ``ControlMode`` enum so the manifest, the safety kernel,
+            ``Action.control_mode``, and ``RobotDescription.action_spec``
+            all share one source of truth.
+        n_dof: Optional degrees of freedom the skill emits. Auto-filled
+            from the robot YAML for predefined embodiments; REQUIRED on
+            the manifest when ``"custom"`` is in
+            ``RSkillManifest.embodiment_tags``.
+        vla_action_key: Optional slot name the policy emits, e.g.
+            ``"action.joints.arm_left"``. Auto-filled for predefined
+            embodiments; REQUIRED on the manifest when ``"custom"`` is
+            in ``RSkillManifest.embodiment_tags``.
+        control_mode_semantics: Action-space semantics for this slot.
+            REQUIRED — closes Gap 2 of the rSkill self-containment audit.
+            Cross-validators enforce: gripper kinds require
+            ``gripper_convention``; cartesian kinds require
+            ``reference_frame``; other kinds forbid both.
+
+    Example:
+        >>> a = ActuatorRequirement(
+        ...     kind=ControlMode.JOINT_POSITION,
+        ...     control_mode_semantics=ControlModeSemantics(mode="absolute"),
+        ... )
+        >>> a.kind is ControlMode.JOINT_POSITION
+        True
+        >>> a.n_dof is None and a.vla_action_key is None
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: ControlMode
+    n_dof: int | None = Field(default=None, gt=0)
+    vla_action_key: str | None = None
+    control_mode_semantics: ControlModeSemantics
+
+    @model_validator(mode="after")
+    def _check_semantics_per_kind(self) -> ActuatorRequirement:
+        """Enforce per-kind semantics rules (Gap 2).
+
+        Three rules:
+
+        1. Gripper kinds (``GRIPPER_BINARY`` / ``GRIPPER_POSITION``) require
+           ``gripper_convention`` to be set; non-gripper kinds forbid it.
+        2. Cartesian kinds (``CARTESIAN_POSE`` / ``CARTESIAN_DELTA`` /
+           ``CARTESIAN_TWIST``) require ``reference_frame``; non-cartesian
+           kinds forbid it.
+        3. ``mode`` itself is always required (enforced by typing).
+        """
+        sem = self.control_mode_semantics
+        is_gripper = self.kind in _GRIPPER_KINDS
+        is_cartesian = self.kind in _CARTESIAN_KINDS
+
+        if is_gripper and sem.gripper_convention is None:
+            raise ValueError(
+                f"ActuatorRequirement(kind={self.kind.value!r}) requires "
+                "control_mode_semantics.gripper_convention to be set "
+                "(gripper kinds need an explicit encoding declaration)."
+            )
+        if not is_gripper and sem.gripper_convention is not None:
+            raise ValueError(
+                f"ActuatorRequirement(kind={self.kind.value!r}) must not declare "
+                "control_mode_semantics.gripper_convention — only GRIPPER_* "
+                "kinds carry a gripper encoding."
+            )
+        if is_cartesian and sem.reference_frame is None:
+            raise ValueError(
+                f"ActuatorRequirement(kind={self.kind.value!r}) requires "
+                "control_mode_semantics.reference_frame to be set "
+                "(cartesian kinds need an explicit tf2 frame)."
+            )
+        if not is_cartesian and sem.reference_frame is not None:
+            raise ValueError(
+                f"ActuatorRequirement(kind={self.kind.value!r}) must not declare "
+                "control_mode_semantics.reference_frame — only CARTESIAN_* "
+                "kinds carry a reference frame."
+            )
+        return self
+
+
+class EmbodimentExtra(BaseModel):
+    """Sensor + actuator surface for a ``"custom"`` embodiment.
+
+    Required when ``"custom"`` appears in
+    ``RSkillManifest.embodiment_tags``; forbidden otherwise. This
+    is the explicit "I know what I'm doing" hatch for skill manifests
+    targeting embodiments that do not have a canonical
+    ``robots/<id>/robot.yaml`` in tree.
+
+    Reuses ``SensorRequirement`` and ``ActuatorRequirement``
+    on the assumption that the natural shape of "what this embodiment
+    offers" mirrors "what the skill needs" — the loader just runs the
+    same compat check it would run against a real robot YAML.
+
+    Attributes:
+        sensors: Sensor slots this custom embodiment exposes (≥1).
+        actuators: Actuator slots this custom embodiment exposes (≥1).
+
+    Example:
+        >>> from openral_core import SensorModality, ControlMode
+        >>> EmbodimentExtra(
+        ...     sensors=[SensorRequirement(modality=SensorModality.RGB)],
+        ...     actuators=[
+        ...         ActuatorRequirement(
+        ...             kind=ControlMode.JOINT_POSITION,
+        ...             n_dof=6,
+        ...             vla_action_key="action.joints.arm",
+        ...             control_mode_semantics=ControlModeSemantics(mode="absolute"),
+        ...         )
+        ...     ],
+        ... )  # doctest: +ELLIPSIS
+        EmbodimentExtra(sensors=[...], actuators=[...])
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sensors: list[SensorRequirement] = Field(min_length=1)
+    actuators: list[ActuatorRequirement] = Field(min_length=1)
+
+
+# ─── rSkill V1 enumerated sets ──────────────────────────────────────────────
+#
+# Closed Literals enforced by RSkillManifest. Adding a new robot HAL,
+# benchmark suite, or VLA family requires editing the matching alias here
+# (and shipping the supporting code in the same PR per CLAUDE.md §1.6).
+
+EmbodimentTag: TypeAlias = Literal[
+    "aloha",
+    "aloha_agilex",
+    "any",
+    "custom",
+    "franka_panda",
+    "g1",
+    "galaxea_a1",
+    "google_robot",
+    "gr1",
+    "h1",
+    "lunar_bot",
+    "mobile_base",
+    "multi",
+    "openarm",
+    "panda_mobile",
+    "pusht",
+    "rizon4",
+    "r1pro",
+    "rm75",
+    "sawyer",
+    "so100_follower",
+    "so101_follower",
+    "ur10e",
+    "ur5e",
+    "widowx",
+]
+"""Canonical embodiment tags — one per ``robots/<id>/robot.yaml`` shipped in tree,
+plus ``"custom"`` as the explicit "I know what I'm doing" escape hatch and
+``"any"`` as the explicit **embodiment-agnostic wildcard**.
+
+``"multi"`` is a repo-name aggregate token (CLAUDE.md §3 rSkill packaging): the
+``<robot>`` segment a skill declaring >1 concrete robot uses (e.g. the
+``moveit-*`` ROS wrappers). It is a member of the Literal so the name validator
+can accept it; a manifest normally lists the specific robots in
+``embodiment_tags`` rather than the aggregate.
+
+``"any"`` is the *declared* way to say "this rSkill runs on every embodiment":
+perception kinds (``detector`` / ``vlm`` / ``reward``) and ``playbook``
+decision procedures use ``embodiment_tags: ["any"]``. An empty ``embodiment_tags``
+is rejected by ``RSkillManifest._check_embodiment_tags_present`` — agnosticism
+must be declared, never derived from an empty list (CLAUDE.md §1.4). The rSkill↔robot
+gate (``openral_rskill.loader.rSkill.check_embodiment_tags``) treats ``"any"`` in a
+skill's tags as match-any; a robot never declares ``"any"``.
+
+``"mobile_base"`` is a CLASS tag (not a specific robot): any robot with a planar
+base + ``body_twist`` actuator declares it so base-only rSkills (Nav2
+NavigateToPose, etc.) can target the whole class without naming each specific
+mobile platform. Robot-specific tags (e.g. ``"panda_mobile"``) coexist on the
+same ``RobotDescription`` for skills that DO depend on the specific composition.
+
+``"rm75"`` is likewise a CLASS tag: any robot carrying a RealMan RM-75 7-DoF
+arm declares it (today: ``lunar_bot``) so the generic ``rskill-moveit-*``
+family (§8.3 item 6, ``robots/lunar_bot/robot.yaml``) can target the arm
+without a robot-specific manifest, the same way ``franka_panda``/``ur5e``/etc.
+already do for their respective arms in that same manifest's
+``embodiment_tags``. The MoveIt config (URDF/SRDF/kinematics) lives in
+``packages/rm_description/`` + ``packages/rm_75_config/`` — vendored from
+RealMan's own ``ros2_rm_robot`` (license and provenance in their NOTICE.md).
+
+The ``RSkillManifest.embodiment_tags`` field is restricted to this set so a
+typo or framework hint (``lerobot``, ``libero``) cannot land in a manifest
+where the loader's compat check would silently never match. When
+``"custom"`` is used, the manifest MUST also populate
+``embodiment_extra`` (see ``EmbodimentExtra``); the cross-validator
+on ``RSkillManifest`` enforces this.
+"""
+
+BenchmarkName: TypeAlias = Literal[
+    "aloha",
+    "aloha_insertion",
+    "aloha_transfer_cube",
+    "behavior",
+    "gr1_tabletop",
+    "libero_10",
+    "libero_goal",
+    "libero_object",
+    "libero_spatial",
+    "maniskill3_panda",
+    "metaworld_mt10",
+    "metaworld_mt50",
+    "pusht",
+    "rlbench",
+    "robocasa_pnp",
+    "robotwin",
+    "simpler_env_widowx",
+]
+"""Canonical benchmark ids — one per ``benchmarks/<id>.yaml`` suite in tree.
+
+Used as keys in ``RSkillManifest.benchmarks``. Each value is the headline
+success rate ``[0.0, 1.0]`` the skill achieves on that suite. The full
+breakdown lives in the matching ``rskills/<id>/eval/<key>.json``.
+
+``aloha_insertion`` / ``aloha_transfer_cube`` are retained as task-level ids
+(the act-aloha* manifests cite their per-task paper numbers) even though the
+two single-task suites were unified into ``aloha.yaml`` — the unified suite
+auto-filters per rSkill so a single run scores one ACT checkpoint's one task.
+"""
+
+ModelFamily: TypeAlias = Literal[
+    "smolvla",
+    "pi05",
+    "xvla",
+    "xr1",
+    "act",
+    "diffusion",
+    "rldx",
+    "molmoact2",
+    "gr00t",
+    "diffuser_actor",
+    "openvla",
+    "lingbot_vla2",
+    "lingbot_vla",
+    "lingbot_va_a1",
+    "internvla_n1",
+]
+"""VLA / policy family the skill belongs to.
+
+Used by the eval / runner adapters to dispatch to the right
+``openral_sim.adapters.<family>`` policy adapter without
+string-matching the skill name. Adding a family here means landing the
+matching adapter under ``python/sim/src/openral_sim/adapters/``.
+
+``xr1`` (Xiaomi Robotics XR-1 / ``MiBoTForActionGeneration``) runs
+out-of-process because its released checkpoints pin transformers 4.57.1
+and FlashAttention 2.8.3 (the sidecar installs torch 2.9.1 rather than
+upstream's 2.8.0, which publishes no linux-aarch64 wheel). The adapter consumes the
+three public benchmark checkpoints; the bare 5B ``model_states.pt`` is
+a post-training seed, not an executable policy.
+
+``gr00t`` (NVIDIA Isaac GR00T N1.x / N2) runs out-of-process via a ZMQ
+sidecar in an isolated Python 3.10 venv, sharing the architecture of the
+``rldx`` adapter (RLDX-1 is itself a GR00T-N1.5 finetune).
+
+``lingbot_vla2`` (Robbyant LingBot-VLA 2.0, Qwen3-VL-4B backbone + sparse-MoE
+flow-matching action expert, Apache-2.0 code + weights) runs out-of-process
+via a ZMQ sidecar in its own Python 3.12 + torch-2.9.1 venv — the upstream
+``lingbotvla`` package pins ``torch==2.8.0`` / ``transformers==4.57.3`` +
+custom Triton MoE kernels, incompatible with the workspace transformers>=5
+(the torch half of that pin set is overridden to 2.9.1 because 2.8.0 has no
+linux-aarch64 wheel; adapter: ``openral_sim.policies.lingbot_vla2``).
+
+``lingbot_vla`` (Robbyant LingBot-VLA 1.0, 4B Qwen2.5-VL-3B backbone + a *dense*
+Qwen2 flow-matching action expert; paper "A Pragmatic VLA Foundation Model",
+arXiv 2601.18692) is the RoboTwin post-train checkpoint. It shares the v2
+sidecar transport + adapter but loads from the separate V1 upstream repo
+(``github.com/robbyant/lingbot-vla``) in its own ``transformers==4.51.3`` /
+``lerobot==0.4.2`` venv, driven by ``tools/_lingbot_vla2_server.py --variant v1``
+(adapter: ``openral_sim.policies.lingbot_vla2`` id ``lingbot_vla``).
+
+``lingbot_va_a1`` is the Galaxea A1 EEF deployment adapter for the LingBot-VA
+checkpoint. It connects to versioned local Camera Bridge and policy-gateway
+services owned by the separately maintained A1 Runtime, without importing its
+checkout. Runtime owns the exact model configuration, EEF transforms, cache
+semantics, and IK; OpenRAL validates the gateway identity and returns its
+joint/gripper proposals through the normal safety and HAL path.
+
+``openvla`` (OpenVLA / OpenVLA-OFT) is a transformers *custom-code* model
+loaded in-process (``trust_remote_code``, gated by
+``OPENRAL_ALLOW_REMOTE_CODE=1``); the adapter de-normalizes the policy's
+discrete action tokens with the checkpoint's embedded ``unnorm_key`` stats
+and replays the action chunk closed-loop.
+
+``internvla_n1`` (InternRobotics InternVLA-N1 / DualVLN, arXiv:2512.08186) is
+a dual-system vision-language NAVIGATION policy (Qwen2.5-VL-7B System-2 +
+NavDP DiT System-1). Upstream InternNav pins ``transformers==4.51.0`` —
+incompatible with the workspace — so it runs out-of-process via the same ZMQ
+sidecar architecture as ``rldx``. The adapter consumes RGB-D + instruction
+and emits a 6-D ``BODY_TWIST`` velocity command for a mobile base.
+"""
+
+# Regexes pinned at module scope so error messages stay consistent and
+# the patterns stay greppable.
+_HF_HUB_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+$"
+_SEMVER_PATTERN = r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+_WEIGHTS_URI_PATTERN = (
+    r"^(?:hf:\/\/[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+(?:@[A-Za-z0-9._-]+)?"
+    r"|local:\/\/[A-Za-z0-9._\/-]+)$"
+)
+_HF_DATASET_URI_PATTERN = (
+    r"^hf:\/\/[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+(?:@[A-Za-z0-9._-]+)?$"
+)
+_HTTPS_URL_PATTERN = r"^https?:\/\/[^\s]+$"
+
+# Unresolved-scaffold sentinels. ``rskills/template/rskill.yaml`` ships
+# ``name: "TEMPLATE_ORG/rskill-TEMPLATE_ID"`` and ``hf://TEMPLATE_ORG/TEMPLATE_ID``
+# placeholders that ``openral rskill new`` (``_rskill_scaffolder``) rewrites. The
+# publish gate (``_rskill_doc_validator`` / ``rskill_publisher``) rejects manifests
+# that still carry them, and the reasoner palette refuses to offer them as
+# dispatchable skills (``RSkillManifest.is_scaffold_placeholder``). Canonical
+# here so every consumer shares one definition. These never appear in a real,
+# published manifest.
+RSKILL_TEMPLATE_SENTINELS: tuple[str, ...] = ("TEMPLATE_ORG", "TEMPLATE_ID")
+
+
+def contains_rskill_template_sentinel(text: str | None) -> bool:
+    """True when ``text`` carries an unresolved rSkill scaffold sentinel.
+
+    Example:
+        >>> contains_rskill_template_sentinel("TEMPLATE_ORG/rskill-TEMPLATE_ID")
+        True
+        >>> contains_rskill_template_sentinel("OpenRAL/rskill-qwen35_4b-any-general-nf4")
+        False
+        >>> contains_rskill_template_sentinel(None)
+        False
+    """
+    if not text:
+        return False
+    return any(s in text for s in RSKILL_TEMPLATE_SENTINELS)
+
+
+# Per-file URI pattern accepted by ``RSkillProcessors``. Requires a
+# file tail (``/path/to/file.ext``) so the implicit-snapshot shape
+# ``hf://owner/repo`` is rejected. The whole point of the processors
+# block is to name the artefact, not the repo.
+_PROCESSOR_URI_PATTERN = (
+    r"^hf:\/\/[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+(?:@[A-Za-z0-9._-]+)?"
+    r"\/[A-Za-z0-9._\/-]+\.[A-Za-z0-9]+$"
+)
+
+_LICENSES_ALLOWING_COMMERCIAL: frozenset[RSkillLicensePosture] = frozenset(
+    {
+        RSkillLicensePosture.APACHE_2_0,
+        RSkillLicensePosture.MIT,
+        RSkillLicensePosture.BSD,
+        # NVIDIA Open Model License (GR00T N1.7+) permits commercial use,
+        # unlike the OneWay Noncommercial License on N1 / N1.5 / N1.6.
+        RSkillLicensePosture.NVIDIA_OPEN_MODEL,
+    }
+)
+
+# Model families whose adapters consume the modern lerobot
+# ``PolicyProcessorPipeline``. Manifests of these families MUST declare a
+# ``RSkillProcessors`` block; ``act`` may omit it to use the legacy
+# norm-stats-in-safetensors path (e.g. ``rskills/act-aloha``).
+_MODERN_PROCESSOR_FAMILIES: frozenset[str] = frozenset(
+    {"smolvla", "pi05", "xvla", "diffusion", "rldx", "molmoact2"}
+)
+
+
+class RSkillProcessors(BaseModel):
+    """Explicit lerobot ``PolicyProcessorPipeline`` artefact pointers.
+
+    Closes Gap 1 + Gap 3 of the rSkill self-containment audit. Replaces the
+    implicit ``snapshot_download(repo_id)`` →
+    ``make_pre_post_processors(pretrained_path=...)`` fetch path used today
+    by the SmolVLA / pi05 / xVLA / Diffusion / modern-ACT adapters. Two
+    files are required because lerobot's pipeline ships them as a pair: a
+    preprocessor that normalises the policy input batch and a
+    postprocessor that un-normalises the action chunk.
+
+    Each URI must point at a specific file (the implicit-snapshot shape
+    ``hf://owner/repo`` with no file tail is rejected). Two URI schemes
+    accepted:
+
+    * ``hf://owner/repo[@rev]/path/to/file.json`` — file inside an HF Hub
+      repo, revision-pinnable.
+
+    Attributes:
+        preprocessor_uri: Per-file URI to the policy preprocessor JSON.
+        postprocessor_uri: Per-file URI to the policy postprocessor JSON.
+
+    Example:
+        >>> RSkillProcessors(
+        ...     preprocessor_uri="hf://lerobot/smolvla_libero/policy_preprocessor.json",
+        ...     postprocessor_uri="hf://lerobot/smolvla_libero/policy_postprocessor.json",
+        ... )  # doctest: +ELLIPSIS
+        RSkillProcessors(preprocessor_uri='hf://...preprocessor.json', postprocessor_uri='hf://...postprocessor.json')
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    preprocessor_uri: str = Field(pattern=_PROCESSOR_URI_PATTERN)
+    postprocessor_uri: str = Field(pattern=_PROCESSOR_URI_PATTERN)
+
+    @model_validator(mode="after")
+    def _check_distinct(self) -> RSkillProcessors:
+        """Reject when both URIs point at the same file."""
+        if self.preprocessor_uri == self.postprocessor_uri:
+            raise ValueError(
+                "RSkillProcessors: preprocessor_uri and postprocessor_uri "
+                "must point to different files (got "
+                f"{self.preprocessor_uri!r} twice)."
+            )
+        return self
+
+
+RSkillKind: TypeAlias = Literal[
+    "vla",
+    "wam",
+    "ros_action",
+    "ros_service",
+    "procedural",
+    "detector",
+    "segmenter",
+    "vlm",
+    "reward",
+    "playbook",
+]
+"""Discriminator selecting how an rSkill is instantiated at the loader.
+
+* ``"vla"`` — learnable Vision-Language-Action policy. Requires
+  ``RSkillManifest.model_family`` and ``RSkillManifest.weights_uri``;
+  resolved by the policy adapter dispatch in ``openral_rskill`` (the
+  pre-existing path used by every in-tree rSkill prior to this discriminator
+  landing).
+* ``"wam"`` — World Action Model (planning-layer mental-simulation /
+  failure-anticipation component per CLAUDE.md §3). Reserved so the
+  discriminator is forward-compatible; the loader / runner branch is not
+  implemented yet and ``kind: wam`` manifests are rejected at resolve time
+  with ``ROSConfigError``.
+* ``"ros_action"`` — wraps an existing ROS 2 action server. Requires a
+  ``RosIntegration`` block. ``model_family`` and ``weights_uri`` are
+  forbidden. ``chunk_size`` is pinned to ``1`` so the safety supervisor's
+  per-row check sees every commanded position.
+* ``"ros_service"`` — wraps an existing ROS 2 service. Same constraints as
+  ``"ros_action"``.
+* ``"procedural"`` — a deterministic, non-learned actuator: a scripted or
+  behaviour-tree-style skill with no weights and no external ROS action/
+  service server to wrap (unlike ``"ros_action"``/``"ros_service"``, which
+  drive a running server this project does not own; a ``"procedural"``
+  skill's own Python class computes the ``Action`` directly). Exists for
+  procedure-driven / non-learned mission execution — the operating model
+  that coordinates the same underlying capabilities without a learned
+  policy or an LLM reasoner in the loop. Requires a
+  ``ProceduralIntegration`` block (an ``entrypoint`` import string plus
+  ``default_goal_json``, mirroring ``RosIntegration``'s contract).
+  ``model_family``, ``weights_uri``, ``ros_integration``, ``processors``,
+  ``state_contract``, ``action_contract``, ``n_action_steps``,
+  ``image_preprocessing``, ``starting_pose``, ``detector``, ``segmenter``,
+  and ``reward`` are FORBIDDEN. ``chunk_size`` is pinned to ``1`` for the
+  same reason as the ROS-wrapper kinds — the safety supervisor only checks
+  row 0 of every chunk today. ``actuators_required`` REQUIRED (≥1 entry).
+* ``"detector"`` — perception producer that runs an exported detection model
+  (RT-DETR / D-FINE ONNX) on the camera tee and publishes
+  ``ObjectsMetadata``; emits no
+  ``Action``. Requires a
+  ``DetectorContract`` block and ``RSkillManifest.weights_uri``
+  (the exported ONNX / TensorRT engine). ``model_family`` and
+  ``action_contract`` / ``state_contract`` are forbidden.
+* ``"segmenter"`` — perception producer that answers a **geometric** prompt
+  (a point, or a small set of positive/negative points, in pixel coordinates)
+  with a binary mask over the current camera frame. Unlike ``"detector"`` it
+  carries no label vocabulary and no score threshold: it does not say *what*
+  the pixels are, only *which* pixels belong to the prompted thing. Its
+  consumer is the HAL's vision attachment-evidence producer, which intersects
+  the mask with the wrist depth frame to bound a grasped payload. Requires a
+  ``SegmenterContract`` block and ``RSkillManifest.weights_uri``;
+  ``model_family``, ``detector``, ``reward``, ``ros_integration``,
+  ``action_contract`` / ``state_contract``, ``processors``,
+  ``image_preprocessing``, ``n_action_steps`` and ``starting_pose`` are
+  FORBIDDEN, and ``actuators_required`` MUST be empty — a segmenter actuates
+  nothing.
+* ``"vlm"`` — vision/video-language model used as a scene-understanding
+  perception component (e.g. Qwen3.5-4B NF4). Accepts RGB image or video
+  frames and a natural-language query; returns a text answer. Emits no
+  actions or bounding boxes. Runs at S2 rate (``role: "s2"``), so it is
+  surfaced to the reasoner as a read-only scene-query tool, never as an
+  ``ExecuteRskill`` policy. ``weights_uri`` REQUIRED; ``actuators_required``
+  MUST be empty; ``action_contract``, ``state_contract``, ``detector``,
+  ``ros_integration``, ``processors``, ``image_preprocessing``,
+  ``n_action_steps``, and ``starting_pose`` are FORBIDDEN. ``model_family``
+  is OPTIONAL metadata.
+* ``"playbook"`` — a symbolic, human-authored **decision procedure** (a
+  Markdown standard-operating-procedure) the S2 Reasoner *reads*, not code it
+  executes. Carries no weights, no actuators, no ROS server, no Action
+  contract — it is the symbolic counterpart to a ``vla`` policy. Requires a
+  ``PlaybookContract`` block and ``role: "s2"``; ``chunk_size`` MUST be
+  ``1`` (required field, no Action rows); ``actuators_required`` MUST be empty;
+  ``actions`` MUST include ``RSkillAction.PLAN``. ``weights_uri``,
+  ``model_family``, ``min_vram_gb``, ``detector``, ``reward``,
+  ``ros_integration``, ``processors``, ``image_preprocessing``,
+  ``action_contract``, ``state_contract``, ``n_action_steps``, ``starting_pose``
+  are FORBIDDEN. Surfaced to the reasoner by injecting its ``PLAYBOOK.md`` body
+  into the system prompt (or via a retrieval tool at scale), never as an
+  ``ExecuteRskill`` policy.
+"""
+
+_ROS_WRAPPER_KINDS: frozenset[str] = frozenset({"ros_action", "ros_service"})
+
+# Embodiment-agnostic rSkills (perception kinds detector / vlm / reward, and
+# ``playbook`` decision procedures) do not target a specific embodiment. They
+# declare this **explicitly** with the wildcard ``embodiment_tags: ["any"]``
+# — never an empty list, which ``_check_embodiment_tags_present``
+# rejects. The rSkill↔robot gate (``openral_rskill.loader.rSkill.check_embodiment_tags``)
+# treats ``"any"`` in a skill's tags as match-any.
+
+
+class RosIntegration(BaseModel):
+    """Wiring for an rSkill that wraps an existing ROS 2 action or service.
+
+    Populated when ``RSkillManifest.kind`` is ``"ros_action"`` or
+    ``"ros_service"``. The
+    ``ROSActionRskill`` adapter reads
+    this block at configure time to build the right action / service client
+    on the host ``LifecycleNode``.
+
+    Attributes:
+        package: IDL package name (e.g. ``"moveit_msgs"``, ``"nav2_msgs"``).
+            Imported lazily so manifests for un-installed ROS packages
+            still parse — the loader raises
+            ``ROSConfigError`` only when the
+            skill is actually resolved.
+        interface_type: Action / service type name inside ``package`` (e.g.
+            ``"MoveGroup"``, ``"NavigateToPose"``).
+        interface_name: Fully-qualified ROS path of the running server
+            (e.g. ``"/move_action"``, ``"/navigate_to_pose"``).
+        result_trajectory_field: Dotted accessor pointing at a
+            ``trajectory_msgs/JointTrajectory`` inside the action result
+            (e.g. ``"planned_trajectory.joint_trajectory"`` for MoveIt's
+            ``MoveGroup``). When set, the adapter replays one waypoint per
+            ``step`` call onto
+            ``/openral/candidate_action`` (so the safety supervisor + HAL
+            see every position). When ``None`` the action is treated as
+            result-only: the adapter awaits the action result, raises
+            ``ROSRskillGoalSatisfied`` on
+            success, and never emits an
+            ``Action`` chunk. This second mode
+            covers wrapped ROS packages that drive actuators on their own
+            (Nav2's behaviour tree publishes ``cmd_vel`` directly).
+        default_goal_json: JSON dict literal used to construct the goal
+            message. v1 hard-codes the target here — the structured-prompt
+            path that lowers LLM-emitted JSON into
+            ``ExecuteRskill.Goal.prompt_metadata_json`` is a follow-up.
+            REQUIRED so that a wrapped skill is always invocable end-to-end
+            without per-call schema work.
+        ros_dependencies: Apt / colcon packages the operator must have
+            installed for the wrapped server to be reachable (e.g.
+            ``"ros-${ROS_DISTRO}-moveit"``). Surfaced by ``ral skill check``
+            and quoted in ``ROSConfigError``
+            messages when the action client fails to connect.
+
+    Example:
+        >>> ri = RosIntegration(
+        ...     package="moveit_msgs",
+        ...     interface_type="MoveGroup",
+        ...     interface_name="/move_action",
+        ...     result_trajectory_field="planned_trajectory.joint_trajectory",
+        ...     default_goal_json='{"target_joint_positions": [0, 0, 0, 0, 0, 0, 0]}',
+        ...     ros_dependencies=["ros-${ROS_DISTRO}-moveit"],
+        ... )
+        >>> ri.package
+        'moveit_msgs'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    package: str = Field(min_length=1, max_length=200)
+    interface_type: str = Field(min_length=1, max_length=200)
+    interface_name: str = Field(min_length=1, max_length=200)
+    result_trajectory_field: str | None = Field(default=None, max_length=200)
+    default_goal_json: str = Field(min_length=2, max_length=10_000)
+    ros_dependencies: list[str] = Field(default_factory=list)
+    goal_builder: Literal["joint", "pose", "look_at"] | None = None
+    """Optional goal-lowering adapter over the shared
+    ``ROSActionRskill`` MoveGroup engine. ``None`` (the default) sends
+    ``default_goal_json`` + LLM overrides verbatim (the raw-IDL escape hatch).
+    The named builders consume a typed block from the merged goal and lower it
+    into MoveGroup constraints:
+
+    * ``"joint"`` — a ``joint`` block (``positions``, ``joint_names``) →
+      ``joint_constraints`` (``JointGoalRskill``).
+    * ``"pose"`` — a ``pose`` block (``position``, ``orientation`` as a
+      quaternion array with ``quaternion_order``, ``link_name``) → MoveGroup
+      position + orientation constraints for a Cartesian end-effector goal
+      (``PoseGoalRskill``).
+    * ``"look_at"`` — a ``look_at`` block (``target_xyz``, ``camera``, …) → the
+      same pose-constraint lowering, with the gaze pose computed from the
+      camera's live TF pose (``LookAtRskill``,
+      a specialisation of the ``pose`` builder)."""
+
+    @field_validator("interface_name")
+    @classmethod
+    def _check_interface_name_is_ros_path(cls, v: str) -> str:
+        """``interface_name`` is the running server's ROS topic path."""
+        if not v.startswith("/"):
+            raise ValueError(
+                f"RosIntegration.interface_name must be a fully-qualified ROS "
+                f"path starting with '/', got {v!r}."
+            )
+        return v
+
+    @field_validator("default_goal_json")
+    @classmethod
+    def _check_default_goal_json_parses(cls, v: str) -> str:
+        """Reject manifests that ship un-parseable goal JSON."""
+        import json  # noqa: PLC0415  # reason: stdlib, defer to keep import-time cheap
+
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"RosIntegration.default_goal_json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "RosIntegration.default_goal_json must encode a JSON object, "
+                f"got {type(parsed).__name__}."
+            )
+        return v
+
+
+class ProceduralIntegration(BaseModel):
+    """Wiring for an rSkill implemented as a plain, deterministic Python class.
+
+    Populated when ``RSkillManifest.kind == "procedural"``: a scripted /
+    behaviour-tree-style skill with no learned weights and no external ROS
+    action/service server on the other end (unlike ``RosIntegration``, which
+    wraps a running server this project does not own — Nav2, MoveGroup — a
+    procedural skill's own class computes the ``Action`` directly, in-process).
+    Mirrors ``RosIntegration``'s ``entrypoint`` + ``default_goal_json`` +
+    per-dispatch-merge contract so the reasoner/LLM tool-call path is
+    identical regardless of kind.
+
+    Attributes:
+        entrypoint: ``"module.path:ClassName"`` import string, resolved the
+            same way a HAL's ``hal.real``/``hal.sim`` entrypoint is. The
+            referenced class must implement ``openral_rskill.base.rSkillBase``
+            directly — constructed with the same
+            ``(description, prompt, prompt_metadata_json, goal_params_json)``
+            shape ``ROSActionRskill`` takes, so the runner's call site stays
+            uniform across kinds.
+        default_goal_json: JSON dict literal the skill is invoked with by
+            default. Per-dispatch ``goal_params_json`` (the LLM's structured
+            override) is deep-merged over it at configure time — same
+            contract as ``RosIntegration.default_goal_json``.
+
+    Example:
+        >>> pi = ProceduralIntegration(
+        ...     entrypoint="openral_rskill.procedural_body_twist:ProceduralBodyTwistRskill",
+        ...     default_goal_json='{"linear": [0.0, 0.0, 0.0], "angular": [0.0, 0.0, 0.0], "duration_s": 1.0}',
+        ... )
+        >>> pi.entrypoint
+        'openral_rskill.procedural_body_twist:ProceduralBodyTwistRskill'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entrypoint: str = Field(min_length=1, max_length=200)
+    default_goal_json: str = Field(min_length=2, max_length=10_000)
+
+    @field_validator("default_goal_json")
+    @classmethod
+    def _check_default_goal_json_is_object(cls, v: str) -> str:
+        """Reject manifests that ship un-parseable goal JSON."""
+        import json  # noqa: PLC0415  # reason: stdlib, defer to keep import-time cheap
+
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"ProceduralIntegration.default_goal_json is not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "ProceduralIntegration.default_goal_json must encode a JSON object, "
+                f"got {type(parsed).__name__}."
+            )
+        return v
+
+
+class DetectorEngine(str, Enum):
+    """Backend that executes a ``kind: "detector"`` rSkill.
+
+    Selects which runtime detector class ``build_manifest_detector``
+    constructs. ``None`` (the default on ``DetectorContract``) preserves
+    the legacy ``runtime``-keyed dispatch: ``runtime: onnx``/``tensorrt`` →
+    RT-DETR ONNX, ``runtime: pytorch`` → the LocateAnything VLM sidecar. Set it
+    explicitly to opt into a backend that the ``runtime`` value alone cannot
+    disambiguate (e.g. an in-process Transformers open-vocabulary detector,
+    which is also ``runtime: pytorch``).
+
+    Attributes:
+        RTDETR_ONNX: Fixed-label RT-DETR / D-FINE ONNX export (CPU / NVMM
+            tiers). Equivalent to leaving ``engine`` unset with an
+            ``onnx``/``tensorrt`` runtime.
+        VLM_SIDECAR: Out-of-process open-vocabulary visual-grounding VLM
+            (LocateAnything-3B). Equivalent to leaving ``engine`` unset with a
+            ``pytorch`` runtime. Query-driven (prompted).
+        ZEROSHOT_HF: In-process Transformers open-vocabulary detector
+            (``AutoModelForZeroShotObjectDetection`` — e.g. OmDet-Turbo). Runs
+            against a **fixed** class vocabulary (the manifest ``labels``)
+            every frame, so it behaves like a large closed-vocabulary detector
+            that needs no prompting — an unprompted background producer that
+            populates the world object list with far more than the 80 COCO
+            classes.
+
+    Example:
+        >>> DetectorEngine.ZEROSHOT_HF.value
+        'zeroshot_hf'
+    """
+
+    RTDETR_ONNX = "rtdetr_onnx"
+    VLM_SIDECAR = "vlm_sidecar"
+    ZEROSHOT_HF = "zeroshot_hf"
+
+
+class DetectorMode(str, Enum):
+    """Invocation mode of a ``kind: "detector"`` rSkill.
+
+    The axis **orthogonal** to ``DetectorEngine``: where ``engine`` says
+    *how* the model runs, ``mode`` says *when the reasoner invokes it* and
+    therefore how its output reaches the LLM.
+
+    Attributes:
+        CONTINUOUS: An always-on background producer. Runs on the camera tee
+            every frame and streams ``ObjectsMetadata`` into
+            ``WorldState.detected_objects``; the reasoner reads it **passively**
+            (via world state / ``recall_object``) and never prompts it. It is
+            **not** an ExecuteRskill-dispatchable tool and carries no actuation
+            authority. RT-DETR (closed vocab) and OmDet-Turbo (frozen open
+            vocab) are continuous. The reasoner may still toggle it via
+            ``LifecycleTransitionTool`` to free VRAM.
+        ON_DEMAND: A prompted locator the reasoner invokes only when it needs
+            to find a specific object **right now**. Surfaces the read-only
+            ``locate_in_view`` tool backed by an open-vocabulary
+            detector; it is not run continuously. LocateAnything is on-demand.
+
+    The two modes cleanly separate "open-vocabulary" from "prompting":
+    continuous detectors cover a fixed bank of classes the reasoner reads for
+    free; the on-demand locator handles the long tail that bank does not cover.
+
+    Example:
+        >>> DetectorMode.CONTINUOUS.value
+        'continuous'
+        >>> DetectorMode.ON_DEMAND.value
+        'on_demand'
+    """
+
+    CONTINUOUS = "continuous"
+    ON_DEMAND = "on_demand"
+
+
+class DetectorContract(BaseModel):
+    """Manifest contract for ``kind: "detector"`` rSkills.
+
+    Carries the configuration the runtime
+    ``ObjectsDetector`` needs to instantiate an
+    exported detection model (RT-DETR / D-FINE ONNX) and match its output
+    indices to semantic class labels.
+
+    Required when ``RSkillManifest.kind`` is ``"detector"``; forbidden
+    for all other kinds (enforced by
+    ``RSkillManifest._check_kind_consistency``).
+
+    Attributes:
+        labels: Ordered class-label list; the integer class-id the model
+            emits is used as an index into this list.  At least one label
+            is required.
+        input_size: Model input resolution as ``(width, height)`` in pixels.
+            Both dimensions must be > 0.  Default ``(640, 640)`` matches the
+            RT-DETR / D-FINE default export resolution.
+        score_threshold: Detections with confidence below this value are
+            discarded before publishing.  Must be in ``[0.0, 1.0]``.
+            Default ``0.5``.
+        engine: Optional explicit backend selector (``DetectorEngine``).
+            ``None`` (default) keeps the legacy ``runtime``-keyed dispatch.
+            Set it to disambiguate backends that share a ``runtime`` — e.g.
+            ``zeroshot_hf`` for an in-process Transformers open-vocabulary
+            detector, which is ``runtime: pytorch`` like the VLM sidecar.
+        mode: Invocation mode (``DetectorMode``; default ``continuous``).
+            Declares whether the detector is an always-on background producer
+            (output reaches the reasoner via world state) or an on-demand
+            prompted locator (surfaces the ``locate_in_view`` tool).
+
+    Example:
+        >>> c = DetectorContract(
+        ...     labels=["person", "bicycle", "car"],
+        ...     input_size=(640, 640),
+        ...     score_threshold=0.4,
+        ... )
+        >>> c.labels[0]
+        'person'
+        >>> c.mode
+        <DetectorMode.CONTINUOUS: 'continuous'>
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    labels: list[str] = Field(min_length=1)
+    input_size: tuple[int, int] = (640, 640)
+    score_threshold: float = Field(ge=0.0, le=1.0, default=0.5)
+    engine: DetectorEngine | None = None
+    mode: DetectorMode = DetectorMode.CONTINUOUS
+    # VLM-sidecar detectors (LocateAnything-3B) resize each frame so its longest
+    # edge is at most this many pixels before grounding. Lower = fewer image
+    # tokens = lower activation VRAM peak (the lever for co-residency with a
+    # reward model on a small GPU); higher = sharper. ``None`` keeps the
+    # backend default (1024). Ignored by ONNX/zero-shot detectors.
+    max_side: int | None = Field(default=None, gt=0)
+
+    @field_validator("input_size")
+    @classmethod
+    def _check_input_size_positive(cls, v: tuple[int, int]) -> tuple[int, int]:
+        """Both width and height must be strictly positive."""
+        w, h = v
+        if w <= 0 or h <= 0:
+            raise ValueError(
+                f"DetectorContract.input_size must have both dimensions > 0, got {v!r}."
+            )
+        return v
+
+
+class SegmenterEngine(str, Enum):
+    """Backend that executes a ``kind: "segmenter"`` rSkill.
+
+    The segmenter counterpart of ``DetectorEngine``. There is no legacy
+    ``runtime``-keyed fallback to preserve here, so
+    ``SegmenterContract.engine`` is REQUIRED — a segmenter manifest always
+    names its backend outright.
+
+    Attributes:
+        SAM2_HF: In-process Transformers ``Sam2Model`` promptable segmenter
+            (SAM 2.1 Hiera). Consumes positive/negative point prompts in pixel
+            coordinates and emits binary masks at the frame's own resolution.
+
+    Example:
+        >>> SegmenterEngine.SAM2_HF.value
+        'sam2_hf'
+    """
+
+    SAM2_HF = "sam2_hf"
+
+
+class SegmenterContract(BaseModel):
+    """Manifest contract for ``kind: "segmenter"`` rSkills.
+
+    The sibling of ``DetectorContract`` for models that answer a
+    **geometric** prompt rather than a semantic one: a detector is asked
+    "where are the cups?" and replies with labelled, scored boxes; a
+    segmenter is asked "what is the extent of the thing under *this
+    pixel*?" and replies with a mask. It carries **no** ``labels`` and
+    **no** ``score_threshold`` — it never classifies, and its consumer
+    never gates on model confidence.
+
+    That is a safety property, not an oversight: the mask feeds the HAL's
+    vision attachment-evidence producer, which turns masked depth into the
+    collision payload a manipulator plans around. Only geometry (containment
+    between the jaws, payload extent, depth validity) can reject a bad mask;
+    a measured instance of a 59.8%-of-frame mask returned at the model's own
+    top score of 0.977 is what removed ``score_threshold`` from this
+    contract.
+
+    Required when ``RSkillManifest.kind`` is ``"segmenter"``; forbidden for
+    all other kinds (``RSkillManifest._check_kind_consistency``). Like
+    ``detector`` / ``vlm``, a pure perception producer: no Action chunks, no
+    actuators.
+
+    Attributes:
+        engine: Backend that executes the model (``SegmenterEngine``).
+            REQUIRED — there is no ``runtime``-keyed fallback for this kind.
+        max_prompt_points: Upper bound on how many prompt points one request may
+            carry (positive TCP point plus optional negative jaw-tip points).
+            Bounds the request so a caller cannot make one segmentation
+            unboundedly expensive. Default ``8``.
+        multimask: Ask the backend for its multi-hypothesis head (SAM 2 returns
+            three nested candidates per point prompt) instead of a single mask.
+            The consumer picks among candidates on **geometry**, never on the
+            model's per-candidate score. Default ``True``.
+        min_mask_area_px: Masks smaller than this many set pixels are discarded
+            as degenerate before they ever reach the depth intersection — a
+            handful of pixels cannot bound a payload. Default ``64``.
+
+    Example:
+        >>> c = SegmenterContract(engine=SegmenterEngine.SAM2_HF)
+        >>> c.engine.value
+        'sam2_hf'
+        >>> (c.max_prompt_points, c.multimask, c.min_mask_area_px)
+        (8, True, 64)
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    engine: SegmenterEngine
+    max_prompt_points: int = Field(default=8, ge=1)
+    multimask: bool = True
+    min_mask_area_px: int = Field(default=64, ge=1)
+
+
+class RewardContract(BaseModel):
+    """Manifest contract for ``kind: "reward"`` rSkills.
+
+    Carries the configuration a robotic **reward / progress-monitor** model
+    (e.g. Robometer-4B, a Qwen3-VL-4B reward foundation model) needs to score
+    a rollout. A reward skill runs in parallel with a ``kind: "vla"`` policy,
+    continuously ingesting the VLA's camera frames into a rolling window, and
+    emits per-frame **progress** ∈ ``progress_range`` and per-frame **success**
+    probability. The Reasoner queries it on demand (``QueryTaskProgressTool``)
+    to decide whether to continue, escalate to a scene VLM, advance, or replan.
+    The signal is **advisory only** — it never actuates and never gates motors
+    (CLAUDE.md §1.1).
+
+    Required when ``RSkillManifest.kind`` is ``"reward"``; forbidden for all
+    other kinds (enforced by ``RSkillManifest._check_kind_consistency``).
+    Like ``detector`` / ``vlm``, a reward skill is a pure perception consumer:
+    it emits no Action chunks and requires no actuators.
+
+    Attributes:
+        progress_range: ``(min, max)`` of the normalized per-frame progress
+            scalar. Default ``(0.0, 1.0)`` — Robometer's discrete/binned mode
+            (see ``num_bins``) emits progress already in ``[0, 1]``.
+        success_threshold: Per-frame success probability at/above which the
+            frame is considered a task success. In ``[0.0, 1.0]``; default
+            ``0.5``.
+        preference: Whether the model also exposes a trajectory-preference
+            head (Robometer does). Default ``False`` — the progress/success
+            path is the Reasoner-facing contract; preference is future work.
+        backend: Which reward runtime scores this skill. ``"robometer"``
+            (default) → the fine-tuned Robometer RewardModel in-process;
+            ``"topreward"`` → the zero-shot TOPReward monitor (lerobot
+            ``TOPRewardModel``, per-frame progress from a prefix sweep of
+            ``P("True" | video, instruction)``), run in-process. Selects the
+            backend in ``build_reward_monitor``; existing manifests default to
+            ``"robometer"`` so behavior is unchanged.
+        frame_window_s: Length of the rolling frame buffer in seconds. The node
+            evicts frames older than this relative to the newest. Must be > 0.
+        target_fps: Frame-sampling rate fed to the model (Robometer's example
+            uses 3 fps). Must be > 0. This is an S2-cadence monitor, not a
+            per-control-step signal.
+        num_bins: Discrete-mode bin count for the progress head. Robometer's
+            discrete mode yields per-frame normalized progress in ``[0, 1]``;
+            continuous mode yields raw regression values. Must be > 0;
+            default ``100``.
+        instruction_required: Whether a natural-language task instruction must
+            accompany the frames (Robometer requires one). Default ``True``.
+        check_floor: Below this progress value the attempt is clearly not done
+            → no VLM adjudication, straight to the replanning ladder. Must be
+            ≤ ``success_threshold``; default ``0.4`` (calibrated for robometer's
+            loose/general eval distribution that wanders ~0.55-0.78).
+        plateau_window_s: Trailing window (seconds) over which
+            ``progress_trend ≈ 0`` indicates the policy has stopped getting
+            closer to the goal. Default ``3.0``.
+        plateau_tolerance: ε band absorbing critic noise when deciding whether
+            the trend is flat. Default ``0.05``.
+        default_patience_s: Baseline execution ceiling (seconds) used as a
+            backstop before the Reasoner escalates. Default ``30.0``.
+
+    Example:
+        >>> c = RewardContract(frame_window_s=8.0, target_fps=3.0)
+        >>> c.progress_range
+        (0.0, 1.0)
+        >>> c.success_threshold
+        0.5
+        >>> c.check_floor
+        0.4
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    progress_range: tuple[float, float] = (0.0, 1.0)
+    success_threshold: float = Field(ge=0.0, le=1.0, default=0.5)
+    preference: bool = False
+    backend: Literal["robometer", "topreward"] = "robometer"
+    frame_window_s: float = Field(gt=0.0)
+    target_fps: float = Field(gt=0.0)
+    num_bins: int = Field(gt=0, default=100)
+    instruction_required: bool = True
+    check_floor: float = Field(ge=0.0, le=1.0, default=0.4)
+    plateau_window_s: float = Field(gt=0.0, default=3.0)
+    plateau_tolerance: float = Field(ge=0.0, default=0.05)
+    default_patience_s: float = Field(gt=0.0, default=30.0)
+
+    @field_validator("progress_range")
+    @classmethod
+    def _check_progress_range(cls, v: tuple[float, float]) -> tuple[float, float]:
+        """``progress_range`` must be a non-degenerate ``(min, max)`` interval."""
+        lo, hi = v
+        if hi <= lo:
+            raise ValueError(f"RewardContract.progress_range must have max > min, got {v!r}.")
+        return v
+
+    @model_validator(mode="after")
+    def _check_floor_le_threshold(self) -> RewardContract:
+        """``check_floor`` must be ≤ ``success_threshold``."""
+        if self.check_floor > self.success_threshold:
+            raise ValueError(
+                f"RewardContract.check_floor ({self.check_floor}) must be ≤ "
+                f"success_threshold ({self.success_threshold})."
+            )
+        return self
+
+
+class PlaybookContract(BaseModel):
+    """Manifest contract for ``kind: "playbook"`` rSkills.
+
+    A **playbook** is a human-authored standard-operating-procedure — a
+    structured Markdown document describing *how the S2 Reasoner should approach
+    a class of task*: its trigger, the ordered decision steps it composes from
+    existing reasoner tools, the bound on those steps, and its verifiable
+    acceptance (``done``) predicate. It is **content the reasoner reads, never
+    code it executes**, and carries no weights, actuators, ROS server, or Action
+    contract — the symbolic counterpart to a ``vla`` policy.
+
+    Required when ``RSkillManifest.kind`` is ``"playbook"``; forbidden for
+    all other kinds (enforced by ``RSkillManifest._check_kind_consistency``).
+    The ``body_uri`` Markdown body is what the reasoner injects into its system
+    prompt (or retrieves by ``trigger`` similarity at scale); the manifest
+    ``description`` + ``trigger`` drive selection. Advisory only — a playbook
+    changes what the LLM *decides*, never its actuation authority: every motion
+    it triggers is still an ``ExecuteRskill`` → Action chunk → C++ safety kernel
+    (CLAUDE.md §1.1).
+
+    Attributes:
+        trigger: Natural-language description of when this playbook applies.
+            Used as the retrieval key when more playbooks are installed than
+            fit the system prompt (the deferred ``load_playbook`` tool).
+        body_uri: Repo-relative path to the Markdown SOP (e.g. ``"./PLAYBOOK.md"``).
+        composes_tools: The ``ReasonerToolCall`` discriminators the SOP uses
+            (``execute_rskill``, ``recall_object``, ``locate_in_view``,
+            ``query_scene``, ``query_task_progress``, ``memory_write``,
+            ``memory_search`` …). Advisory — a manifest-level hint of the
+            playbook's tool surface; at least one entry is required.
+        done_predicate: Natural-language acceptance test the playbook verifies
+            before declaring success (e.g. ``"the target object is in the
+            gripper"``).
+        max_steps: Hard bound on the number of tool calls before the playbook
+            must terminate (no hidden default — CLAUDE.md §1.4). Must be > 0.
+
+    Example:
+        >>> p = PlaybookContract(
+        ...     trigger="the goal names a physical object whose location is not given",
+        ...     body_uri="./PLAYBOOK.md",
+        ...     composes_tools=["recall_object", "locate_in_view", "execute_rskill"],
+        ...     done_predicate="the target object is confirmed in view at a known pose",
+        ...     max_steps=12,
+        ... )
+        >>> p.max_steps
+        12
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    trigger: str = Field(min_length=1, max_length=500)
+    body_uri: str = Field(min_length=1)
+    composes_tools: list[str] = Field(min_length=1)
+    done_predicate: str = Field(min_length=1, max_length=500)
+    max_steps: int = Field(gt=0)
+
+
+class RSkillManifest(BaseModel):
+    """Pydantic model of the ``rskill.yaml`` package manifest (V1).
+
+    On-disk schema for an rSkill HF Hub repo; loaded by capability-checking
+    against a ``RobotDescription``, then constructing a runtime
+    ``Skill``. Commercial-use posture is derived from
+    ``license`` via ``is_commercial_use_allowed``.
+
+    Attributes:
+        schema_version: On-disk format version; ``"0.1"`` today (CLAUDE.md §1.6).
+        name: HF Hub identifier ``<owner>/<repo>``, e.g. ``"openral/rskill-pick-cube-so100"``.
+        version: SemVer string of the rSkill package (not the wrapped weights).
+        license: License posture surfaced at install time; drives ``is_commercial_use_allowed``.
+        role: rSkill slot — ``"s1"`` fast policy (the only slot loaded today),
+            ``"s0"`` cerebellar realtime (reserved), ``"s2"`` slow reasoning (reserved).
+        model_family: Closed VLA / policy family; drives the runner's adapter dispatch.
+        embodiment_tags: Robot embodiments targeted; must intersect the robot's tags.
+            ``"custom"`` requires ``embodiment_extra``.
+        embodiment_extra: Sensor + actuator surface for ``"custom"``; required
+            iff ``"custom"`` is tagged, ``None`` otherwise.
+        capabilities_required: Per-flag ``RobotCapabilities`` requirements
+            the target robot must satisfy.
+        sensors_required: Sensor inputs the policy expects. See ``SensorRequirement``.
+        actuators_required: At least one ``ActuatorRequirement``; matched
+            against the robot's ``action_spec.control_mode``.
+        runtime: Preferred inference runtime.
+        quantization: Default ``QuantizationConfig`` for this rSkill.
+        weights_uri: HF Hub revision-pinned URI or local path to weights;
+            production deployments pin a SHA (CLAUDE.md operating principle 8).
+        chunk_size: Action-chunk length emitted per ``Skill.step``.
+        latency_budget: Latency contract enforced by CI on the reference host (CLAUDE.md §7.4).
+        min_vram_gb: Optional minimum VRAM (GB) per quantization dtype; informational only.
+        fallback_skill_id: rSkill id to substitute on failure (RFC §8.3 replanning ladder).
+        benchmarks: Canonical suite id → success rate ``[0.0, 1.0]``; full
+            per-task breakdown lives in the matching ``eval/<key>.json``.
+        evaluated_tasks: Benchmark task ids / families trained or validated on;
+            gates a scene's ``task.id`` against it (empty = permissive).
+        sim_env_control_mode: Optional simulator controller override
+            (``"relative"``/``"absolute"``); ``None`` = backend default.
+        policy_extras: Adapter-owned runtime knobs copied into ``VLASpec.extra``
+            at CLI composition.
+        paper_url: Canonical paper URL for this skill / family.
+        dataset_uri: HF Hub URI for the training dataset.
+        source_repo: HF Hub URI for the upstream weights repo.
+        description: REQUIRED. Short (1-500 char) summary surfaced to operators
+            and the reasoner's tool palette.
+        default_prompt: Optional verbatim task string the checkpoint was
+            trained on; fallback when the goal's ``prompt`` is empty.
+        actions: REQUIRED. Closed-vocabulary action verbs (≥1); see ``RSkillAction``.
+        objects: Optional free-form object keywords (discriminative hints for the LLM).
+        scenes: Optional free-form scene / environment keywords.
+        processors: Per-file lerobot ``PolicyProcessorPipeline`` URIs; required
+            for modern families (``smolvla``/``pi05``/``xvla``/``diffusion``/``rldx``).
+        image_preprocessing: Per-checkpoint image knobs (flip, camera renames);
+            ``None`` = schema defaults.
+        state_contract: Per-checkpoint proprioception layout.
+        action_contract: Per-checkpoint action vector contract (dim + optional representation).
+        n_action_steps: Replay cadence; omit when equal to ``chunk_size``.
+
+    Example:
+        >>> m = RSkillManifest(
+        ...     name="openral/rskill-pick-cube-so100",
+        ...     version="0.1.0",
+        ...     license=RSkillLicensePosture.APACHE_2_0,
+        ...     role="s1",
+        ...     kind="vla",
+        ...     model_family="smolvla",
+        ...     embodiment_tags=["so100_follower"],
+        ...     runtime=RSkillRuntime.PYTORCH,
+        ...     weights_uri="hf://lerobot/smolvla_base",
+        ...     chunk_size=16,
+        ...     latency_budget=RSkillLatencyBudget(per_chunk_ms=100.0),
+        ...     description="Pick a cube on the SO-100 follower arm.",
+        ...     actions=[RSkillAction.PICK],
+        ...     objects=["cube"],
+        ...     scenes=["tabletop"],
+        ...     actuators_required=[
+        ...         ActuatorRequirement(
+        ...             kind=ControlMode.JOINT_POSITION,
+        ...             control_mode_semantics=ControlModeSemantics(mode="absolute"),
+        ...         ),
+        ...     ],
+        ...     processors=RSkillProcessors(
+        ...         preprocessor_uri="hf://lerobot/smolvla_base/policy_preprocessor.json",
+        ...         postprocessor_uri="hf://lerobot/smolvla_base/policy_postprocessor.json",
+        ...     ),
+        ... )
+        >>> m.is_commercial_use_allowed
+        True
+        >>> m.schema_version
+        '0.1'
+    """
+
+    model_config = ConfigDict(use_enum_values=False, extra="forbid")
+
+    schema_version: Literal["0.1"] = "0.1"
+    name: str = Field(pattern=_HF_HUB_ID_PATTERN)
+    version: str = Field(pattern=_SEMVER_PATTERN)
+    license: RSkillLicensePosture = RSkillLicensePosture.UNKNOWN
+    role: Literal["s0", "s1", "s2"] = "s1"
+    # Discriminator selecting the loader / runner branch. Required (no
+    # default) so every manifest declares it explicitly — see
+    # ``RSkillKind`` for the semantics of each value and which other
+    # fields are required / forbidden per kind.
+    kind: RSkillKind
+    # Required when `kind == "vla"`, forbidden otherwise (enforced by
+    # ``_check_kind_consistency``).
+    model_family: ModelFamily | None = None
+    # Every kind must declare >=1 tag (enforced by `_check_embodiment_tags_present`):
+    # actuating kinds name their embodiments; agnostic kinds (detector / vlm /
+    # reward / playbook) declare the explicit wildcard ["any"]. Empty is rejected.
+    embodiment_tags: list[EmbodimentTag] = Field(default_factory=list)
+    embodiment_extra: EmbodimentExtra | None = None
+    capabilities_required: dict[str, bool | float | int | str] = Field(default_factory=dict)
+    sensors_required: list[SensorRequirement] = Field(default_factory=list)
+    actuators_required: list[ActuatorRequirement] = Field(default_factory=list)
+    runtime: RSkillRuntime = RSkillRuntime.PYTORCH
+    quantization: QuantizationConfig = Field(default_factory=QuantizationConfig)
+    # Required when `kind == "vla"`, forbidden otherwise (a wrapped ROS
+    # action has no weights to download). Enforced by
+    # ``_check_kind_consistency``.
+    weights_uri: str | None = Field(default=None, pattern=_WEIGHTS_URI_PATTERN)
+    chunk_size: int = Field(gt=0)
+    latency_budget: RSkillLatencyBudget
+    min_vram_gb: dict[QuantizationDtype, float] | None = None
+    fallback_skill_id: str | None = Field(default=None, pattern=_HF_HUB_ID_PATTERN)
+    benchmarks: dict[BenchmarkName, float] = Field(default_factory=dict)
+    evaluated_tasks: list[str] = Field(default_factory=list)
+    sim_env_control_mode: str | None = None
+    paper_url: str | None = Field(default=None, pattern=_HTTPS_URL_PATTERN)
+    dataset_uri: str | None = Field(default=None, pattern=_HF_DATASET_URI_PATTERN)
+    source_repo: str | None = Field(default=None, pattern=_HF_DATASET_URI_PATTERN)
+    description: str = Field(min_length=1, max_length=500)
+    # The literal task string the checkpoint was conditioned on. Used only
+    # when an ExecuteRskill goal carries an empty `prompt`.
+    default_prompt: str | None = Field(default=None, min_length=1, max_length=500)
+    # Per-skill action vocabulary surfaced to the reasoner LLM
+    # tool palette so it can pick the right skill for a given goal.
+    actions: list[RSkillAction] = Field(min_length=1)
+    objects: list[str] = Field(default_factory=list)
+    scenes: list[str] = Field(default_factory=list)
+    # Optional per-skill safety envelope, enforced by the C++ safety
+    # kernel. When set, the kernel enforces the *intersection* with the
+    # robot ceiling at goal acceptance (envelope_loader.py): every field that
+    # is tighter than the robot's wins; any field that LOOSENS the robot
+    # ceiling causes the loader to reject the skill with ROSConfigError
+    # (never silently honored — CLAUDE.md §1.1 / §1.4). Pre-existing skill
+    # manifests without this field continue to load unchanged; they inherit
+    # the full robot ceiling.
+    envelope: SafetyEnvelope | None = None
+
+    @field_validator("benchmarks")
+    @classmethod
+    def _validate_benchmark_scores(cls, v: dict[str, float]) -> dict[str, float]:
+        """Reject benchmark scores outside ``[0.0, 1.0]``."""
+        for key, score in v.items():
+            if not 0.0 <= score <= 1.0:
+                raise ValueError(
+                    f"benchmarks[{key!r}] = {score!r} is out of range; success "
+                    "rates must satisfy 0.0 <= score <= 1.0"
+                )
+        return v
+
+    @field_validator("min_vram_gb")
+    @classmethod
+    def _validate_vram_positive(
+        cls, v: dict[QuantizationDtype, float] | None
+    ) -> dict[QuantizationDtype, float] | None:
+        """Reject zero / negative VRAM entries."""
+        if v is None:
+            return v
+        for dtype, gb in v.items():
+            if gb <= 0:
+                raise ValueError(f"min_vram_gb[{dtype.value!r}] = {gb!r} must be > 0")
+        return v
+
+    def active_min_vram_gb(self) -> float | None:
+        """Declared VRAM (GB) for this skill at its **active** quantization dtype.
+
+        Reads ``min_vram_gb[quantization.dtype]`` — the footprint the skill will
+        actually use at load, since ``quantization.dtype`` pins the runtime format
+        . Returns ``None`` when ``min_vram_gb`` is unset or has no entry
+        for the active dtype (the size is simply not declared — the caller decides
+        whether that is an error). See ``assert_vla_reward_fits`` for the pair
+        check that consumes this.
+        """
+        if self.min_vram_gb is None:
+            return None
+        return self.min_vram_gb.get(self.quantization.dtype)
+
+    @model_validator(mode="after")
+    def _check_self_referential_fallback(self) -> RSkillManifest:
+        """A skill cannot list itself as its own fallback."""
+        if self.fallback_skill_id is not None and self.fallback_skill_id == self.name:
+            raise ValueError(
+                f"fallback_skill_id ({self.fallback_skill_id!r}) cannot equal the "
+                "skill's own name; pick a different rSkill id or leave it null."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_embodiment_tags_present(self) -> RSkillManifest:
+        """Every rSkill must declare at least one embodiment tag.
+
+        Empty ``embodiment_tags`` is rejected for **all** kinds: agnosticism is a
+        contract to declare, not to derive from an empty list (CLAUDE.md §1.4).
+        An rSkill that genuinely runs on every embodiment — perception kinds
+        (``detector`` / ``vlm`` / ``reward``) and ``playbook`` decision
+        procedures — declares the explicit wildcard ``embodiment_tags: ["any"]``;
+        actuating kinds (``vla`` / ``ros_action`` / ``ros_service`` / ``wam``)
+        name the specific embodiments they target.
+        """
+        if not self.embodiment_tags:
+            raise ValueError(
+                f"RSkillManifest({self.name!r}): embodiment_tags must be non-empty. "
+                'Declare the specific embodiment(s) this skill targets, or ["any"] '
+                "for an embodiment-agnostic skill (perception / playbook kinds)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_custom_embodiment_extra(self) -> RSkillManifest:
+        """Enforce the ``"custom"`` ↔ ``embodiment_extra`` contract.
+
+        Three rules:
+
+        1. ``"custom"`` in ``embodiment_tags`` → ``embodiment_extra``
+           MUST be set.
+        2. ``embodiment_extra`` set → ``"custom"`` MUST be in
+           ``embodiment_tags`` (otherwise the extra block is dead
+           weight; reject loudly).
+        3. When ``"custom"`` is in ``embodiment_tags``, every entry in
+           ``actuators_required`` MUST have both ``n_dof`` and
+           ``vla_action_key`` populated — the loader has no canonical
+           robot YAML to auto-fill them from.
+        """
+        is_custom = "custom" in self.embodiment_tags
+        has_extra = self.embodiment_extra is not None
+        if is_custom and not has_extra:
+            raise ValueError(
+                "embodiment_tags contains 'custom' but embodiment_extra is not set; "
+                "custom embodiments must declare their sensor + actuator surface "
+                ". Either drop 'custom' or populate embodiment_extra."
+            )
+        if has_extra and not is_custom:
+            raise ValueError(
+                "embodiment_extra is set but 'custom' is not in embodiment_tags; "
+                "the extra block is only meaningful for the custom-embodiment hatch "
+                ". Either add 'custom' to embodiment_tags or drop "
+                "embodiment_extra."
+            )
+        if is_custom:
+            for i, act in enumerate(self.actuators_required):
+                if act.n_dof is None or act.vla_action_key is None:
+                    raise ValueError(
+                        f"actuators_required[{i}] is missing n_dof or "
+                        "vla_action_key. These are auto-filled from the robot "
+                        "YAML for canonical embodiments, but 'custom' has no "
+                        "canonical YAML — set both fields explicitly on the "
+                        "manifest."
+                    )
+        return self
+
+    @property
+    def is_commercial_use_allowed(self) -> bool:
+        """Derive commercial-use posture from ``license``.
+
+        ``apache-2.0`` / ``mit`` / ``bsd`` → True. Every other posture
+        (including ``unknown``) → False, conservatively. The loader
+        consults this in ``rSkill._check_license``; users wanting to
+        deploy a non-commercial skill in a research context set
+        ``OPENRAL_ALLOW_NONCOMMERCIAL=1`` per CLAUDE.md §7.4.
+        """
+        return self.license in _LICENSES_ALLOWING_COMMERCIAL
+
+    @property
+    def is_scaffold_placeholder(self) -> bool:
+        """True when this is an unresolved ``rskills/template/`` scaffold.
+
+        Checks the identity fields (``name``, ``weights_uri``,
+        ``source_repo``) for the ``RSKILL_TEMPLATE_SENTINELS``. The
+        scaffold parses as a valid manifest (so tests can load it) but is not a
+        real, loadable skill: the reasoner palette must not offer it as
+        dispatchable, and the publish gate rejects it. One predicate so callers
+        don't re-derive the sentinel check.
+        """
+        return any(
+            contains_rskill_template_sentinel(field)
+            for field in (self.name, self.weights_uri, self.source_repo)
+        )
+
+    # ── Preprocessing block ───────────────────────────────────────────────
+    # Knobs the trained checkpoint needs to interpret IO. Grouped here so
+    # manifest readers see them together. ``processors`` is the explicit
+    # per-file URI block (Gap 1 + Gap 3); ``image_preprocessing`` /
+    # ``state_contract`` carry the small bits of checkpoint metadata that
+    # can't be encoded in the processor JSONs. Precedence at adapter
+    # construction: ``spec_extra`` > manifest > schema default. See
+    # ``openral_rskill._vla_core.resolve_image_preprocessing``,
+    # ``resolve_state_dim``, ``resolve_camera_keys``, and ``apply_chunk_replay``.
+    policy_extras: dict[str, object] = Field(default_factory=dict)
+    processors: RSkillProcessors | None = None
+    image_preprocessing: ImagePreprocessing | None = None
+    state_contract: StateContract | None = None
+    # Action contract mirrors state_contract for the
+    # bridge's LeRobot v3 feature binding. Optional today (backward-compat
+    # with checkpoints that pre-date the bridge); the dataset bridge
+    # requires either this OR RobotDescription.action_spec.dim, raising
+    # ROSConfigError when both are missing.
+    action_contract: ActionContract | None = None
+    n_action_steps: int | None = Field(default=None, gt=0)
+    # Optional initial joint pose the policy expects an episode to
+    # start from. The list is ``state_contract.dim``-long and uses the
+    # checkpoint's own ``action_feature_names`` order (i.e. the same
+    # order the policy emits actions in — *not* the robot.yaml URDF
+    # order). Units are radians. Sim adapters apply this as the qpos
+    # at ``reset()`` and the live HAL can use it as the calibration
+    # target.
+    #
+    # When omitted, sim adapters fall back to a kinematic default
+    # (e.g. elbows at +π/2). There is no implicit "centre-of-training"
+    # discovery — if a specific start pose matters, declare it here.
+    starting_pose: list[float] | None = None
+
+    # Wiring for wrapped ROS 2 actions / services. REQUIRED when
+    # ``kind in {"ros_action", "ros_service"}``; FORBIDDEN otherwise. The
+    # ``_check_kind_consistency`` validator enforces this so that a VLA
+    # manifest cannot accidentally carry stale wrapper config.
+    ros_integration: RosIntegration | None = None
+
+    # Wiring for a deterministic, non-learned Python class. REQUIRED when
+    # ``kind == "procedural"``; FORBIDDEN otherwise.
+    procedural: ProceduralIntegration | None = None
+
+    # Detector model contract. REQUIRED when ``kind == "detector"``;
+    # FORBIDDEN otherwise. Carries the class-label list, input resolution, and
+    # score threshold the runtime ObjectsDetector reads at configure time.
+    # A detector emits no Action chunks and requires no actuators — it is a
+    # pure perception producer.
+    detector: DetectorContract | None = None
+
+    # Promptable-segmenter contract. REQUIRED when ``kind == "segmenter"``;
+    # FORBIDDEN otherwise. Carries the backend selector and the prompt/mask
+    # bounds a geometric segmenter (SAM 2.1) needs. Like a detector it is a pure
+    # perception producer — no Action chunks, no actuators — but it answers a
+    # point prompt with a mask instead of a vocabulary with labelled boxes.
+    segmenter: SegmenterContract | None = None
+
+    # Reward / progress-monitor model contract. REQUIRED when
+    # ``kind == "reward"``; FORBIDDEN otherwise. Carries the rolling-window +
+    # sampling-rate + progress-range config a robotic reward model (Robometer)
+    # needs. A reward skill is a pure perception consumer — it emits no Action
+    # chunks, requires no actuators, and its progress/success signal is
+    # advisory-only (never gates motors).
+    reward: RewardContract | None = None
+
+    # The reward/progress-monitor rSkill this VLA pairs with (an rSkill
+    # ``name``, e.g. ``"OpenRAL/rskill-robometer_4b-any-general-nf4"``). A VLA emits no success
+    # signal of its own, so the reasoner needs a reward model resident alongside it
+    # to know whether the policy is progressing / has finished. Allowed
+    # ONLY for ``kind == "vla"`` (forbidden otherwise — it is a reference FROM a VLA,
+    # distinct from the ``reward`` contract a reward-kind manifest carries). ``None``
+    # defers to the deployment default reward model — it does NOT mean "run without
+    # reward". The deploy refuses to launch a VLA + reward pair that does not fit GPU
+    # VRAM together (pre-load check over both manifests' ``min_vram_gb``).
+    reward_rskill_name: str | None = None
+
+    # Playbook decision-procedure contract. REQUIRED when
+    # ``kind == "playbook"``; FORBIDDEN otherwise. Carries the SOP body pointer,
+    # the trigger/done predicate, and the tool-call step bound. A playbook is a
+    # symbolic, authored decision procedure the S2 Reasoner reads — it carries no
+    # weights and never actuates (its proposed motions still cross the kernel).
+    playbook: PlaybookContract | None = None
+
+    # Optional JSON-Schema (OpenAPI / JSON-Schema 7 shape)
+    # describing the per-skill ``goal_params_json`` payload the LLM may
+    # attach to an ``ExecuteRskillTool`` dispatch. The reasoner's
+    # ``build_tool_palette`` surfaces this verbatim as the per-skill
+    # tool ``parameters`` block in the LLM's tool definition, so the
+    # provider's structured-output / tool-use path generates well-formed
+    # JSON the wrapped-ROS adapter can merge onto its ``default_goal_json``.
+    # ``None`` (default) means "no structured params for this skill" —
+    # backward-compat for every existing VLA / wrapped-ROS manifest. The
+    # field is intentionally a free ``dict[str, Any]`` (not a typed
+    # JSONSchema Pydantic model) because the schema must support the full
+    # JSON-Schema vocabulary the LLM provider expects.
+    goal_params_schema: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _check_processors_required_for_modern_families(self) -> RSkillManifest:
+        """Modern lerobot families MUST declare a ``processors`` block.
+
+        Closes Gap 1 + Gap 3: SmolVLA / pi05 / xVLA / Diffusion / RLDX
+        adapters consume the modern ``PolicyProcessorPipeline`` and must
+        be able to download exactly the preprocessor + postprocessor
+        artefacts from per-file URIs. Only the ``act`` family may omit
+        the block — its legacy checkpoints carry norm stats inside
+        ``model.safetensors`` and the ACT adapter dispatches on
+        ``manifest.processors is not None``.
+        """
+        # model_family is a closed Literal (typed as ``ModelFamily``) or None
+        # for wrapped-ROS kinds; the `in` check is safe against None.
+        if self.model_family in _MODERN_PROCESSOR_FAMILIES and self.processors is None:
+            raise ValueError(
+                f"RSkillManifest({self.name!r}): model_family={self.model_family!r} "
+                "requires a `processors` block (preprocessor_uri + postprocessor_uri). "
+                "Only `act` may omit it (legacy norm-stats-in-safetensors path)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_joint_units_declared(self) -> RSkillManifest:
+        """A joint-position rSkill MUST declare its ``action_contract.joint_units``.
+
+        The skill_runner converts deg↔rad at the policy boundary. When the
+        manifest omits the units it falls back to a stats-magnitude heuristic
+        that silently mis-detected a degrees-trained SmolVLA SO-101 checkpoint as
+        radians — feeding the policy ~57x too-small state and emitting ~57x
+        too-large HAL commands, which drove a real arm into its joint limits
+        (issue #135). openral's ``JointState`` / ``Action`` contract is radians,
+        so getting this wrong is a hardware-safety hazard, not a nicety. Making
+        it a required field means a new joint-position rSkill cannot merge without
+        a verified declaration. EE-space representations (``delta_ee_*``,
+        ``cartesian_pose``) are unaffected — their action is not joint angles.
+        """
+        ac = self.action_contract
+        if (
+            ac is not None
+            and ac.representation is ActionRepresentation.JOINT_POSITIONS
+            and ac.joint_units is None
+        ):
+            raise ValueError(
+                f"RSkillManifest({self.name!r}): action_contract.representation is "
+                "'joint_positions' but action_contract.joint_units is not declared. "
+                "Add `joint_units: degrees|radians`, verified against the checkpoint's "
+                "normalizer stats (a manipulator joint peaking above ~5 (~90°+) is "
+                "degrees; all channels under π is radians). See issue #135 — a wrong "
+                "guess sends ~57x commands and the arm slams its limits."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_kind_consistency(self) -> RSkillManifest:  # noqa: PLR0911, PLR0912, PLR0915  # reason: each branch is a separate kind (one early return each) — splitting would obscure the per-kind contract table
+        """Enforce the per-``kind`` field shape for VLA vs ROS-wrapper vs detector.
+
+        Rules:
+
+        * ``kind == "vla"`` → ``model_family`` REQUIRED,
+          ``weights_uri`` REQUIRED, ``ros_integration`` FORBIDDEN,
+          ``detector`` FORBIDDEN.
+          ``actuators_required`` REQUIRED (≥1 entry).
+          The existing VLA adapter dispatch path consumes both required
+          fields; without them the loader cannot build a runtime skill.
+        * ``kind in {"ros_action", "ros_service"}`` →
+          ``ros_integration`` REQUIRED; ``model_family``,
+          ``weights_uri``, ``processors``, ``state_contract``,
+          ``action_contract``, ``n_action_steps``,
+          ``image_preprocessing``, ``starting_pose``,
+          ``detector`` all FORBIDDEN
+          (none of them have meaning for a wrapped server). ``chunk_size``
+          is pinned to ``1`` so that each waypoint of a planner trajectory
+          is its own ``Action`` chunk — the safety supervisor only checks
+          row 0 of every chunk today (``supervisor_node.py``), and we MUST
+          NOT let rows 1..N actuate unchecked.
+          ``actuators_required`` REQUIRED (≥1 entry).
+        * ``kind == "detector"`` → ``detector`` REQUIRED;
+          ``weights_uri`` REQUIRED (the exported ONNX / TensorRT engine);
+          ``model_family``, ``ros_integration``,
+          ``action_contract``, ``state_contract``,
+          ``processors``, ``n_action_steps``, ``starting_pose``
+          all FORBIDDEN (a detector has no VLA policy family, no ROS wrapper,
+          and no VLA inference lifecycle);
+          ``actuators_required`` MUST be empty (a detector actuates
+          nothing).
+        * ``kind == "segmenter"`` → ``segmenter`` REQUIRED;
+          ``weights_uri`` REQUIRED; the same VLA-only fields the
+          ``detector`` branch forbids are forbidden here, plus
+          ``detector`` itself (the two contracts are alternatives, never
+          both); ``actuators_required`` MUST be empty.
+        * ``kind == "wam"`` → schema-side this is unconstrained beyond the
+          base VLA shape; the loader's resolver branch raises
+          ``ROSConfigError`` at resolve time
+          because the WAM dispatch path is not implemented in this PR
+          (tracked separately).
+        """
+        # A ``playbook`` block belongs only to kind='playbook'. One guard here
+        # forbids it for every other kind, so the per-kind branches
+        # below stay focused on their own required/forbidden fields.
+        if self.kind != "playbook" and self.playbook is not None:
+            raise ValueError(
+                f"RSkillManifest({self.name!r}): kind={self.kind!r} forbids a "
+                "`playbook` block (it is for kind='playbook' decision procedures only)."
+            )
+
+        # `reward_rskill_name` pairs a VLA with its progress-monitor
+        # reward rSkill; it is a reference FROM a VLA and meaningless on any other
+        # kind. One guard forbids it everywhere except kind='vla'.
+        if self.kind != "vla" and self.reward_rskill_name is not None:
+            raise ValueError(
+                f"RSkillManifest({self.name!r}): kind={self.kind!r} forbids "
+                "`reward_rskill_name` (it pairs a VLA with its reward model; "
+                "kind='vla' only)."
+            )
+
+        if self.kind == "vla":
+            if self.model_family is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='vla' requires `model_family` to be set."
+                )
+            if self.weights_uri is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='vla' requires `weights_uri` to be set."
+                )
+            if self.ros_integration is not None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='vla' forbids "
+                    "`ros_integration` (it is for wrapped ROS 2 servers only)."
+                )
+            if self.detector is not None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='vla' forbids "
+                    "`detector` (it is for kind='detector' perception producers only)."
+                )
+            if self.segmenter is not None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='vla' forbids "
+                    "`segmenter` (it is for kind='segmenter' mask producers only)."
+                )
+            if self.reward is not None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='vla' forbids "
+                    "`reward` (it is for kind='reward' progress monitors only)."
+                )
+            if not self.actuators_required:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='vla' requires at least one "
+                    "`actuators_required` entry."
+                )
+            return self
+
+        if self.kind in _ROS_WRAPPER_KINDS:
+            if self.ros_integration is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind={self.kind!r} requires "
+                    "a `ros_integration` block."
+                )
+            forbidden = {
+                "model_family": self.model_family,
+                "weights_uri": self.weights_uri,
+                "processors": self.processors,
+                "state_contract": self.state_contract,
+                "action_contract": self.action_contract,
+                "n_action_steps": self.n_action_steps,
+                "image_preprocessing": self.image_preprocessing,
+                "starting_pose": self.starting_pose,
+                "detector": self.detector,
+                "segmenter": self.segmenter,
+                "reward": self.reward,
+            }
+            set_fields = sorted(name for name, value in forbidden.items() if value is not None)
+            if set_fields:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind={self.kind!r} forbids "
+                    f"these VLA-only fields: {set_fields!r}. Drop them from the "
+                    "manifest (wrapped ROS skills have no weights or policy "
+                    "preprocessing)."
+                )
+            if self.chunk_size != 1:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind={self.kind!r} requires "
+                    f"chunk_size=1, got {self.chunk_size}. Wrapped trajectories "
+                    "must be emitted one waypoint per chunk so the safety "
+                    "supervisor's per-row check sees every commanded position."
+                )
+            if not self.actuators_required:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind={self.kind!r} requires at least one "
+                    "`actuators_required` entry."
+                )
+            return self
+
+        if self.kind == "procedural":
+            if self.procedural is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' requires a "
+                    "`procedural` block (entrypoint, default_goal_json)."
+                )
+            forbidden_procedural = {
+                "model_family": self.model_family,
+                "weights_uri": self.weights_uri,
+                "ros_integration": self.ros_integration,
+                "processors": self.processors,
+                "state_contract": self.state_contract,
+                "action_contract": self.action_contract,
+                "n_action_steps": self.n_action_steps,
+                "image_preprocessing": self.image_preprocessing,
+                "starting_pose": self.starting_pose,
+                "detector": self.detector,
+                "segmenter": self.segmenter,
+                "reward": self.reward,
+            }
+            set_procedural_forbidden = sorted(
+                name for name, value in forbidden_procedural.items() if value is not None
+            )
+            if set_procedural_forbidden:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' forbids "
+                    f"these fields: {set_procedural_forbidden!r}. A procedural skill has "
+                    "no weights, no policy preprocessing, and no external ROS server "
+                    "to wrap."
+                )
+            if self.chunk_size != 1:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' requires "
+                    f"chunk_size=1, got {self.chunk_size}. The safety supervisor's "
+                    "per-row check only sees row 0 of every chunk today."
+                )
+            if not self.actuators_required:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='procedural' requires at least one "
+                    "`actuators_required` entry."
+                )
+            return self
+
+        if self.kind == "detector":
+            if self.detector is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='detector' requires a "
+                    "`detector` block (labels, input_size, score_threshold)."
+                )
+            if self.weights_uri is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='detector' requires "
+                    "`weights_uri` (the exported ONNX / TensorRT engine path)."
+                )
+            forbidden_detector = {
+                "model_family": self.model_family,
+                "segmenter": self.segmenter,
+                "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
+                "action_contract": self.action_contract,
+                "state_contract": self.state_contract,
+                "processors": self.processors,
+                "n_action_steps": self.n_action_steps,
+                "starting_pose": self.starting_pose,
+                "reward": self.reward,
+            }
+            set_detector_forbidden = sorted(
+                name for name, value in forbidden_detector.items() if value is not None
+            )
+            if set_detector_forbidden:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='detector' forbids "
+                    f"these fields: {set_detector_forbidden!r}. A detector is a "
+                    "pure perception producer — it has no VLA policy family, no "
+                    "ROS wrapper, no VLA inference lifecycle (processors / "
+                    "n_action_steps / starting_pose), and emits no actions or "
+                    "proprioception."
+                )
+            if self.actuators_required:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='detector' requires "
+                    f"`actuators_required` to be empty (got {len(self.actuators_required)} "
+                    "entries). A detector actuates nothing."
+                )
+            return self
+
+        if self.kind == "segmenter":
+            if self.segmenter is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='segmenter' requires a "
+                    "`segmenter` block (engine, max_prompt_points, multimask)."
+                )
+            if self.weights_uri is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='segmenter' requires "
+                    "`weights_uri` (the Hugging Face segmentation-model repository)."
+                )
+            forbidden_segmenter = {
+                "detector": self.detector,
+                "reward": self.reward,
+                "model_family": self.model_family,
+                "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
+                "action_contract": self.action_contract,
+                "state_contract": self.state_contract,
+                "processors": self.processors,
+                "n_action_steps": self.n_action_steps,
+                "image_preprocessing": self.image_preprocessing,
+                "starting_pose": self.starting_pose,
+            }
+            set_segmenter_forbidden = sorted(
+                name for name, value in forbidden_segmenter.items() if value is not None
+            )
+            if set_segmenter_forbidden:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='segmenter' forbids "
+                    f"these fields: {set_segmenter_forbidden!r}. A segmenter is a "
+                    "pure perception producer — it answers a geometric point "
+                    "prompt with a mask, so it has no label vocabulary, no VLA "
+                    "policy family, no ROS wrapper, and no VLA inference "
+                    "lifecycle."
+                )
+            if self.actuators_required:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='segmenter' requires "
+                    f"`actuators_required` to be empty (got "
+                    f"{len(self.actuators_required)} entries). A segmenter actuates nothing."
+                )
+            return self
+
+        if self.kind == "vlm":
+            if self.weights_uri is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='vlm' requires "
+                    "`weights_uri` (the Hugging Face model repository)."
+                )
+            forbidden_vlm = {
+                "detector": self.detector,
+                "segmenter": self.segmenter,
+                "reward": self.reward,
+                "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
+                "action_contract": self.action_contract,
+                "state_contract": self.state_contract,
+                "processors": self.processors,
+                "n_action_steps": self.n_action_steps,
+                "image_preprocessing": self.image_preprocessing,
+                "starting_pose": self.starting_pose,
+            }
+            set_vlm_forbidden = sorted(
+                name for name, value in forbidden_vlm.items() if value is not None
+            )
+            if set_vlm_forbidden:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='vlm' forbids "
+                    f"these fields: {set_vlm_forbidden!r}. A scene VLM is a "
+                    "pure perception component — it has no action contract, no "
+                    "detector block, no ROS wrapper, and no VLA policy "
+                    "preprocessing."
+                )
+            if self.actuators_required:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='vlm' requires "
+                    f"`actuators_required` to be empty (got {len(self.actuators_required)} "
+                    "entries). A scene VLM actuates nothing."
+                )
+            return self
+
+        if self.kind == "reward":
+            if self.reward is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='reward' requires a "
+                    "`reward` block (frame_window_s, target_fps, progress_range)."
+                )
+            if self.weights_uri is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='reward' requires "
+                    "`weights_uri` (the Hugging Face reward-model repository)."
+                )
+            forbidden_reward = {
+                "detector": self.detector,
+                "segmenter": self.segmenter,
+                "model_family": self.model_family,
+                "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
+                "action_contract": self.action_contract,
+                "state_contract": self.state_contract,
+                "processors": self.processors,
+                "n_action_steps": self.n_action_steps,
+                "image_preprocessing": self.image_preprocessing,
+                "starting_pose": self.starting_pose,
+            }
+            set_reward_forbidden = sorted(
+                name for name, value in forbidden_reward.items() if value is not None
+            )
+            if set_reward_forbidden:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='reward' forbids "
+                    f"these fields: {set_reward_forbidden!r}. A reward monitor is a "
+                    "pure perception consumer — it has no action contract, no "
+                    "detector block, no ROS wrapper, and no VLA policy "
+                    "preprocessing."
+                )
+            if self.actuators_required:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='reward' requires "
+                    f"`actuators_required` to be empty (got {len(self.actuators_required)} "
+                    "entries). A reward monitor actuates nothing."
+                )
+            return self
+
+        if self.kind == "playbook":
+            if self.playbook is None:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='playbook' requires a "
+                    "`playbook` block (trigger, body_uri, done_predicate, max_steps)."
+                )
+            if self.role != "s2":
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='playbook' requires role='s2' "
+                    f"(got {self.role!r}); a playbook is an S2 decision procedure."
+                )
+            if RSkillAction.PLAN not in self.actions:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='playbook' requires the "
+                    f"'plan' action verb in `actions` (got "
+                    f"{[a.value for a in self.actions]!r})."
+                )
+            if self.chunk_size != 1:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='playbook' requires "
+                    f"chunk_size=1, got {self.chunk_size}. A playbook emits no "
+                    "Action rows."
+                )
+            forbidden_playbook = {
+                "model_family": self.model_family,
+                "weights_uri": self.weights_uri,
+                "min_vram_gb": self.min_vram_gb,
+                "detector": self.detector,
+                "segmenter": self.segmenter,
+                "reward": self.reward,
+                "ros_integration": self.ros_integration,
+                "procedural": self.procedural,
+                "processors": self.processors,
+                "image_preprocessing": self.image_preprocessing,
+                "action_contract": self.action_contract,
+                "state_contract": self.state_contract,
+                "n_action_steps": self.n_action_steps,
+                "starting_pose": self.starting_pose,
+                "envelope": self.envelope,
+            }
+            set_playbook_forbidden = sorted(
+                name for name, value in forbidden_playbook.items() if value is not None
+            )
+            if set_playbook_forbidden:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='playbook' forbids "
+                    f"these fields: {set_playbook_forbidden!r}. A playbook is a "
+                    "symbolic decision procedure — it has no weights, no actuators, "
+                    "no ROS wrapper, no detector/reward block, and no VLA inference "
+                    "lifecycle."
+                )
+            if self.actuators_required:
+                raise ValueError(
+                    f"RSkillManifest({self.name!r}): kind='playbook' requires "
+                    f"`actuators_required` to be empty (got "
+                    f"{len(self.actuators_required)} entries). A playbook actuates "
+                    "nothing."
+                )
+            return self
+
+        # kind == "wam": no extra schema constraint here; loader rejects at
+        # resolve time.
+        return self
+
+    @classmethod
+    def from_yaml(cls, path: str) -> RSkillManifest:
+        """Load and validate an ``rskill.yaml`` from disk.
+
+        Args:
+            path: Filesystem path to the manifest YAML.
+
+        Returns:
+            A validated ``RSkillManifest``.
+
+        Raises:
+            FileNotFoundError: If ``path`` does not exist.
+            pydantic.ValidationError: If the YAML fails schema validation.
+        """
+        return _load_yaml_model(cls, path)
+
+
+# ── rSkill HF-repo naming convention ────────────────────────────────────────
+# Enforced published-repo shape (CLAUDE.md §3 rSkill packaging), ratified by the
+# org naming audit:
+#
+#   <owner>/rskill-<model>-<robot>-<task>-<quant>       (weight-bearing kinds)
+#   <owner>/rskill-<model>-<robot>-<task>               (ros_action / ros_service)
+#   <owner>/rskill-playbook-<name>                      (kind == "playbook")
+#
+# Grammar rules:
+# - Hyphens are ONLY the segment separators; every token uses underscores
+#   internally. So a name parses by a plain ``split("-")`` into exactly 5 parts
+#   (``rskill`` + 4 segments) — no anchored vocab matching needed.
+# - Each segment matches ``^[a-z0-9][a-z0-9_]*$``.
+# - ``<model>`` ∈ ``CANONICAL_MODEL_TOKENS`` (a versioned checkpoint token,
+#   NOT the bare ``ModelFamily``, so future gr00t_n2 / rldx2 don't collide).
+# - ``<robot>`` ∈ ``CANONICAL_ROBOT_NAME_TOKENS`` (the ``EmbodimentTag``
+#   values — includes ``"any"`` and ``"multi"`` for skills that declare >1
+#   concrete robot).
+# - ``<task>`` is AUTHOR-CHOSEN — validated by shape only, never by equality
+#   against ``evaluated_tasks`` (that collapses e.g. so101 "pen" vs
+#   "pick_place_pen", or omdet "indoor" vs "locator"). ``expected_repo_name``
+#   only *suggests* a default task slug.
+# - ``<quant>`` ∈ ``CANONICAL_QUANT_TOKENS``. ``int4`` weights ship as
+#   bitsandbytes NF4, so the schema dtype ``int4`` maps to the token ``nf4``.
+#   Weightless wrappers (``ros_action`` / ``ros_service``) OMIT ``<quant>``.
+# - When ``model_family`` is set (VLA skills), the ``<model>`` token must also be
+#   family-consistent — in ``_MODEL_FAMILY_ALLOWED_TOKENS`` for that family —
+#   so a smolvla checkpoint can't be mislabelled ``pi05``.
+
+_DEFAULT_RSKILL_OWNER = "OpenRAL"
+"""Owner used when a manifest ``name`` carries no ``<owner>/`` prefix."""
+
+_RSKILL_NAME_SEGMENT_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
+"""Every name segment (model / robot / task / quant / playbook name) shape."""
+
+# Split-on-hyphen part counts (the leading ``rskill`` counts as one):
+#   5 → ``rskill-<model>-<robot>-<task>-<quant>``  (weight-bearing kinds)
+#   4 → ``rskill-<model>-<robot>-<task>``          (ROS wrappers, no quant)
+#   3 → ``rskill-playbook-<name>``                 (playbooks)
+_RSKILL_NAME_PARTS = 5
+_RSKILL_ROS_NAME_PARTS = 4
+_RSKILL_PLAYBOOK_NAME_PARTS = 3
+
+CANONICAL_QUANT_TOKENS: frozenset[str] = frozenset({"fp32", "fp16", "bf16", "int8", "nf4"})
+"""Canonical ``<quant>`` name tokens for weight-bearing kinds. ``int4`` → ``nf4``
+(bitsandbytes NF4). The ROS wrappers (``_WEIGHTLESS_KINDS``) carry no
+weights and OMIT the ``<quant>`` segment entirely (a 4-part name)."""
+
+_WEIGHTLESS_KINDS: frozenset[str] = frozenset({"ros_action", "ros_service"})
+"""Kinds that wrap an existing ROS interface — no weights, so their name has no
+``<quant>`` segment: ``rskill-<model>-<robot>-<task>``."""
+
+_NAME_TAIL_QUANT_LIKE: frozenset[str] = CANONICAL_QUANT_TOKENS | {"none"}
+"""Trailing tokens the author-slug fallback drops from a name tail — the quant
+tokens plus the legacy ``none`` some pre-convention names carried."""
+
+_QUANT_DTYPE_TO_TOKEN: dict[QuantizationDtype, str] = {
+    QuantizationDtype.FP32: "fp32",
+    QuantizationDtype.FP16: "fp16",
+    QuantizationDtype.BF16: "bf16",
+    QuantizationDtype.INT8: "int8",
+    # 4-bit checkpoints ship as bitsandbytes NF4 (see the ``*-nf4`` in-tree
+    # rSkills and OpenRAL org repos, e.g. rskill-molmoact2-...-nf4): the token
+    # says ``nf4``, not the schema's ``int4`` dtype. ``fp4_nvfp4`` has no
+    # canonical token yet (unused in tree) and is intentionally absent.
+    QuantizationDtype.INT4: "nf4",
+}
+"""Map a ``QuantizationDtype`` to its name token. Every manifest has a
+``quantization.dtype`` (default ``fp32``), so ``<quant>`` is always derivable."""
+
+CANONICAL_MODEL_TOKENS: frozenset[str] = frozenset(
+    {
+        # VLA / policy checkpoint tokens. Where a ModelFamily exists the token
+        # matches it verbatim; versioned families use a versioned token.
+        "smolvla",  # family smolvla
+        "pi05",  # family pi05
+        "xvla",  # family xvla
+        "xr1",  # family xr1 (Xiaomi Robotics-1 / MiBoT)
+        "act",  # family act
+        "diffusion",  # family diffusion
+        "molmoact2",  # family molmoact2
+        "openvla",  # family openvla (bare)
+        "openvla_oft",  # family openvla, OFT checkpoint
+        "gr00t_n17",  # family gr00t, N1.7 checkpoint
+        "rldx1_ft",  # family rldx, RLDX-1 finetune
+        "3d_diffuser_actor",  # family diffuser_actor
+        "lingbot_vla",  # family lingbot_vla
+        "lingbot_vla2",  # family lingbot_vla2
+        "lingbot_va_a1",  # family lingbot_va_a1
+        "internvla_n1",  # family internvla_n1 (InternVLA-N1 / DualVLN)
+        # Non-VLA tool-model tokens (detector / segmenter / vlm / reward).
+        "sam2_1",  # SAM 2.1 Hiera promptable segmenter
+        "omdet_turbo",
+        "rtdetr_coco_r18",
+        "rtdetr_v2_r50vd",
+        "robometer_4b",
+        "topreward_qwen3vl_4b",
+        "locateanything_3b",
+        "qwen35_4b",
+        # ROS wrapped-action tool tokens (ros_action / ros_service).
+        "moveit",
+        "nav2",
+    }
+)
+"""Canonical ``<model>`` name tokens — the versioned checkpoint vocabulary the
+repo-naming convention allows. Distinct from ``ModelFamily`` (a runner
+dispatch key): several tokens can share one family (openvla / openvla_oft) and
+non-VLA tool models (omdet_turbo, robometer_4b, moveit, …) have no family at
+all. Adding a checkpoint token here lets a new rSkill publish under it."""
+
+_MODEL_FAMILY_TO_TOKEN: dict[str, str] = {
+    "smolvla": "smolvla",
+    "pi05": "pi05",
+    "xvla": "xvla",
+    "xr1": "xr1",
+    "act": "act",
+    "diffusion": "diffusion",
+    "molmoact2": "molmoact2",
+    "rldx": "rldx1_ft",
+    "gr00t": "gr00t_n17",
+    "diffuser_actor": "3d_diffuser_actor",
+    "openvla": "openvla_oft",
+    "lingbot_vla": "lingbot_vla",
+    "lingbot_vla2": "lingbot_vla2",
+    "lingbot_va_a1": "lingbot_va_a1",
+    "internvla_n1": "internvla_n1",
+}
+"""VLA ``ModelFamily`` → its canonical ``<model>`` *suggestion* token
+(the single token ``expected_repo_name`` proposes)."""
+
+_MODEL_FAMILY_ALLOWED_TOKENS: dict[str, frozenset[str]] = {
+    "smolvla": frozenset({"smolvla"}),
+    "pi05": frozenset({"pi05"}),
+    "xvla": frozenset({"xvla"}),
+    "xr1": frozenset({"xr1"}),
+    "act": frozenset({"act"}),
+    "diffusion": frozenset({"diffusion"}),
+    "molmoact2": frozenset({"molmoact2"}),
+    "rldx": frozenset({"rldx1_ft"}),
+    "gr00t": frozenset({"gr00t_n17"}),
+    "diffuser_actor": frozenset({"3d_diffuser_actor"}),
+    # A manifest family ``openvla`` may carry the base or the OFT checkpoint.
+    "openvla": frozenset({"openvla", "openvla_oft"}),
+    "lingbot_vla": frozenset({"lingbot_vla"}),
+    "lingbot_vla2": frozenset({"lingbot_vla2"}),
+    "lingbot_va_a1": frozenset({"lingbot_va_a1"}),
+    "internvla_n1": frozenset({"internvla_n1"}),
+}
+"""The documented **family → allowed ``<model>`` tokens** map: when a manifest
+declares ``model_family``, the name's ``<model>`` segment must be one of these
+(a per-family allowlist rather than a bare ``startswith`` stem, so
+``lingbot_vla`` and ``lingbot_vla2`` — where one string prefixes the other —
+stay distinct). Keyed by every ``ModelFamily`` value."""
+
+_EMBODIMENT_TO_ROBOT_TOKEN: dict[str, str] = {
+    "so100_follower": "so100",
+    "so101_follower": "so101",
+}
+"""EmbodimentTag values whose ``<robot>`` name token is shortened: the
+``_follower`` suffix carries no information in a repo name (there is no other
+so100/so101 embodiment), so names use the bare robot id."""
+
+CANONICAL_ROBOT_NAME_TOKENS: frozenset[str] = frozenset(
+    _EMBODIMENT_TO_ROBOT_TOKEN.get(t, t) for t in get_args(EmbodimentTag)
+)
+"""Canonical ``<robot>`` name tokens: the ``EmbodimentTag`` values —
+including the ``"any"`` wildcard and the ``"multi"`` aggregate (a skill
+declaring >1 concrete robot) — with the ``so10x_follower`` tags shortened to
+``so100``/``so101`` via ``_EMBODIMENT_TO_ROBOT_TOKEN``."""
+
+
+def _quant_token_for_dtype(dtype: QuantizationDtype) -> str:
+    """Return the canonical ``<quant>`` token for a dtype (raises if unmapped)."""
+    token = _QUANT_DTYPE_TO_TOKEN.get(dtype)
+    if token is None:
+        raise ValueError(
+            f"quantization dtype {dtype.value!r} has no canonical name token yet; "
+            f"extend CANONICAL_QUANT_TOKENS + _QUANT_DTYPE_TO_TOKEN."
+        )
+    return token
+
+
+def _robot_token_for_manifest(manifest: RSkillManifest) -> str:
+    """Suggest the ``<robot>`` token: ``multi`` for >1 concrete tag, else the first.
+
+    Concrete = any tag other than the ``"any"`` wildcard. A skill declaring
+    several concrete robots (the ``moveit-*`` case) collapses to ``"multi"``.
+    An empty / wildcard-only tag list yields ``"any"``.
+    """
+    concrete = [t for t in manifest.embodiment_tags if t != "any"]
+    if len(concrete) > 1:
+        return "multi"
+    if len(concrete) == 1:
+        return _EMBODIMENT_TO_ROBOT_TOKEN.get(concrete[0], concrete[0])
+    return "any"
+
+
+def _model_token_for_manifest(manifest: RSkillManifest) -> str:
+    """Suggest the ``<model>`` token.
+
+    VLA skills map their ``model_family`` through
+    ``_MODEL_FAMILY_TO_TOKEN``. Non-VLA skills (no ``model_family``) match
+    the current repo tail against ``CANONICAL_MODEL_TOKENS`` by longest
+    prefix (e.g. ``omdet-turbo-locator`` → ``omdet_turbo``).
+
+    Raises:
+        ValueError: If no canonical token can be determined.
+    """
+    if manifest.model_family is not None:
+        token = _MODEL_FAMILY_TO_TOKEN.get(manifest.model_family)
+        if token is None:
+            raise ValueError(
+                f"RSkillManifest({manifest.name!r}): model_family "
+                f"{manifest.model_family!r} has no canonical <model> token; "
+                "extend _MODEL_FAMILY_TO_TOKEN."
+            )
+        return token
+    tail = _repo_tail_slug(manifest.name)
+    candidates = [t for t in CANONICAL_MODEL_TOKENS if tail == t or tail.startswith(f"{t}_")]
+    if not candidates:
+        raise ValueError(
+            f"RSkillManifest({manifest.name!r}): cannot determine a canonical "
+            f"<model> token for a {manifest.kind!r} skill — no CANONICAL_MODEL_TOKENS "
+            f"entry is a prefix of {tail!r}. Add one or rename the skill."
+        )
+    return max(candidates, key=len)
+
+
+def _repo_tail_slug(name: str) -> str:
+    """Return the ``rskill-``-stripped repo tail as an underscore slug.
+
+    ``"OpenRAL/rskill-omdet_turbo-any-locator-fp16"`` → ``"omdet_turbo_any_locator_fp16"``.
+    """
+    repo = name.split("/", 1)[1] if "/" in name else name
+    tail = repo.removeprefix("rskill-")
+    return tail.lower().replace("-", "_")
+
+
+def _task_slug_for_manifest(manifest: RSkillManifest, model_token: str, robot_token: str) -> str:
+    """Suggest the AUTHOR-OWNED ``<task>`` slug (a default only — never enforced).
+
+    Priority:
+
+    1. ``evaluated_tasks`` — first entry's ``scene_family``.
+    2. ``benchmarks`` — lexicographically first suite key.
+    3. The current repo tail with the ``<model>`` / ``<robot>`` prefixes and a
+       trailing quant-like token removed — recovers an author's discriminator
+       that lives only in the name (``omdet-turbo-locator`` → ``locator``; the
+       two so101 pen skills → ``pen`` vs ``pick_place_pen``), which the benchmark
+       fields cannot distinguish. Idempotent on an already-canonical name and
+       drops a stale/legacy trailing quant token (``fp32`` / ``none``).
+    4. ``scenes`` — first scene keyword.
+    5. ``"main"`` — shape-valid placeholder when nothing else is available.
+    """
+    if manifest.evaluated_tasks:
+        return scene_family(manifest.evaluated_tasks[0]).lower().replace("-", "_")
+    if manifest.benchmarks:
+        return sorted(manifest.benchmarks)[0].lower().replace("-", "_")
+    tail = _repo_tail_slug(manifest.name)
+    for prefix in (model_token, robot_token):
+        if tail == prefix:
+            tail = ""
+        elif tail.startswith(f"{prefix}_"):
+            tail = tail[len(prefix) + 1 :]
+    segments = tail.split("_")
+    if len(segments) > 1 and segments[-1] in _NAME_TAIL_QUANT_LIKE:
+        tail = "_".join(segments[:-1])
+    elif tail in _NAME_TAIL_QUANT_LIKE:
+        tail = ""
+    tail = tail.strip("_")
+    if tail and tail != robot_token and _RSKILL_NAME_SEGMENT_RE.match(tail):
+        return tail
+    if manifest.scenes:
+        return manifest.scenes[0].lower().replace("-", "_")
+    return "main"
+
+
+def repo_name_is_canonical(name: str, *, kind: RSkillKind, model_family: str | None = None) -> bool:
+    """Return ``True`` when ``name`` obeys the repo-naming grammar for ``kind``.
+
+    Three shapes, chosen by ``kind``:
+
+    * ``playbook`` → ``rskill-playbook-<name>`` (3 parts).
+    * ``ros_action`` / ``ros_service`` (``_WEIGHTLESS_KINDS``) →
+      ``rskill-<model>-<robot>-<task>`` (4 parts) — no ``<quant>`` segment, since
+      a ROS wrapper carries no weights.
+    * every other kind → ``rskill-<model>-<robot>-<task>-<quant>`` (5 parts) with
+      ``<quant>`` ∈ ``CANONICAL_QUANT_TOKENS``.
+
+    In all cases ``<model>`` ∈ ``CANONICAL_MODEL_TOKENS``, ``<robot>`` ∈
+    ``CANONICAL_ROBOT_NAME_TOKENS``, and ``<task>`` matches the segment
+    shape. The owner prefix (``<owner>/``) is ignored.
+
+    When ``model_family`` is given (a VLA skill), the ``<model>`` segment must
+    additionally be family-consistent — one of
+    ``_MODEL_FAMILY_ALLOWED_TOKENS`` for that family — so a checkpoint can't
+    be mislabelled with another family's token. When ``model_family`` is ``None``
+    (tool / ROS skills, or a pure name check) only vocab membership is required.
+
+    Example:
+        >>> repo_name_is_canonical(
+        ...     "OpenRAL/rskill-smolvla-franka_panda-libero_spatial-bf16", kind="vla"
+        ... )
+        True
+        >>> repo_name_is_canonical(
+        ...     "OpenRAL/rskill-moveit-multi-eef_pose", kind="ros_action"
+        ... )  # ROS wrapper: no quant segment
+        True
+        >>> repo_name_is_canonical(
+        ...     "OpenRAL/rskill-pi05-franka_panda-libero-bf16",
+        ...     kind="vla",
+        ...     model_family="smolvla",
+        ... )  # wrong family token
+        False
+        >>> repo_name_is_canonical("OpenRAL/rskill-playbook-find_object", kind="playbook")
+        True
+        >>> repo_name_is_canonical("OpenRAL/rskill-smolvla-libero", kind="vla")  # old 3-part name
+        False
+    """
+    repo = name.split("/", 1)[1] if "/" in name else name
+    parts = repo.split("-")
+    if parts[0] != "rskill":
+        return False
+    if kind == "playbook":
+        return (
+            len(parts) == _RSKILL_PLAYBOOK_NAME_PARTS
+            and parts[1] == "playbook"
+            and bool(_RSKILL_NAME_SEGMENT_RE.match(parts[2]))
+        )
+    if kind in _WEIGHTLESS_KINDS:
+        if len(parts) != _RSKILL_ROS_NAME_PARTS:
+            return False
+        _, model, robot, task = parts
+        quant_ok = True
+    else:
+        if len(parts) != _RSKILL_NAME_PARTS:
+            return False
+        _, model, robot, task, quant = parts
+        quant_ok = quant in CANONICAL_QUANT_TOKENS
+    ok = (
+        model in CANONICAL_MODEL_TOKENS
+        and robot in CANONICAL_ROBOT_NAME_TOKENS
+        and bool(_RSKILL_NAME_SEGMENT_RE.match(task))
+        and quant_ok
+    )
+    if ok and model_family is not None:
+        ok = model in _MODEL_FAMILY_ALLOWED_TOKENS.get(model_family, frozenset())
+    return ok
+
+
+def expected_repo_name(manifest: RSkillManifest) -> str:
+    """Suggest the canonical HF-repo name for an rSkill manifest.
+
+    Returns a name that satisfies ``repo_name_is_canonical`` for the
+    manifest's ``kind`` — the value the publisher prints on a mismatch and
+    ``--fix-name`` writes back. The ``<task>`` segment is a *suggested default*
+    (see ``_task_slug_for_manifest``); it is author-owned and the migration
+    agent may refine it. The owner prefix is preserved from
+    ``RSkillManifest.name`` (default ``_DEFAULT_RSKILL_OWNER``).
+
+    Playbooks map to ``<owner>/rskill-playbook-<name>``; ROS wrappers
+    (``ros_action`` / ``ros_service``) to ``<owner>/rskill-<model>-<robot>-<task>``
+    (no ``<quant>``); every other kind to
+    ``<owner>/rskill-<model>-<robot>-<task>-<quant>``.
+
+    Raises:
+        ValueError: If no canonical ``<model>`` token can be determined (see
+            ``_model_token_for_manifest``).
+
+    Example:
+        >>> m = RSkillManifest(
+        ...     name="OpenRAL/rskill-smolvla-franka_panda-libero_spatial-bf16",
+        ...     version="0.1.0",
+        ...     license=RSkillLicensePosture.APACHE_2_0,
+        ...     role="s1",
+        ...     kind="vla",
+        ...     model_family="smolvla",
+        ...     embodiment_tags=["franka_panda"],
+        ...     runtime=RSkillRuntime.PYTORCH,
+        ...     weights_uri="hf://lerobot/smolvla_base",
+        ...     chunk_size=16,
+        ...     latency_budget=RSkillLatencyBudget(per_chunk_ms=100.0),
+        ...     quantization=QuantizationConfig(dtype=QuantizationDtype.BF16),
+        ...     evaluated_tasks=["libero_spatial"],
+        ...     description="SmolVLA on LIBERO.",
+        ...     actions=[RSkillAction.GENERALIST],
+        ...     actuators_required=[
+        ...         ActuatorRequirement(
+        ...             kind=ControlMode.JOINT_POSITION,
+        ...             control_mode_semantics=ControlModeSemantics(mode="absolute"),
+        ...         ),
+        ...     ],
+        ...     processors=RSkillProcessors(
+        ...         preprocessor_uri="hf://lerobot/smolvla_base/policy_preprocessor.json",
+        ...         postprocessor_uri="hf://lerobot/smolvla_base/policy_postprocessor.json",
+        ...     ),
+        ... )
+        >>> expected_repo_name(m)
+        'OpenRAL/rskill-smolvla-franka_panda-libero_spatial-bf16'
+    """
+    owner = manifest.name.split("/", 1)[0] if "/" in manifest.name else _DEFAULT_RSKILL_OWNER
+    if manifest.kind == "playbook":
+        tail = _repo_tail_slug(manifest.name).removeprefix("playbook_").strip("_")
+        name = tail if tail and _RSKILL_NAME_SEGMENT_RE.match(tail) else "main"
+        return f"{owner}/rskill-playbook-{name}"
+    model = _model_token_for_manifest(manifest)
+    robot = _robot_token_for_manifest(manifest)
+    task = _task_slug_for_manifest(manifest, model, robot)
+    # Weightless wrappers (ros_action / ros_service) omit the <quant> segment.
+    if manifest.kind in _WEIGHTLESS_KINDS:
+        return f"{owner}/rskill-{model}-{robot}-{task}"
+    quant = _quant_token_for_dtype(manifest.quantization.dtype)
+    return f"{owner}/rskill-{model}-{robot}-{task}-{quant}"
+
+
+def assert_vla_reward_fits(
+    vla: RSkillManifest,
+    reward: RSkillManifest,
+    gpu_total_gb: float,
+    *,
+    margin_gb: float = 0.5,
+) -> float:
+    """Verify a VLA + its paired reward model co-reside in GPU VRAM.
+
+    A VLA emits no success signal of its own, so the reasoner needs the reward
+    model resident *alongside* the running policy. This is the
+    pre-load gate: both sizes are declared in their manifests, so we check the
+    pair fits before the VLA is ever loaded — failing fast and loud instead of a
+    mid-run CUDA OOM. It checks the **model pair footprint** only (a necessary
+    condition); the sim / ROS overhead is budgeted separately.
+
+    Args:
+        vla: The VLA manifest (``kind == "vla"``) about to be loaded.
+        reward: Its paired reward manifest (``kind == "reward"``).
+        gpu_total_gb: The GPU's total VRAM in GB.
+        margin_gb: Headroom reserved for fragmentation / framework overhead.
+
+    Returns:
+        The combined VRAM (GB) the pair requires (``vla + reward``).
+
+    Raises:
+        ROSConfigError: Either manifest does not declare ``min_vram_gb`` for its
+            active dtype — co-residency we are about to *require* cannot be
+            verified, so the operator must declare the size.
+        ROSGPUMemoryError: ``vla + reward + margin_gb > gpu_total_gb`` — the pair
+            does not fit; the deploy must not run a VLA without its reward signal.
+
+    See ``tests/unit/test_vla_reward_pairing.py`` for fixture-backed coverage
+    (smolvla-libero + robometer-4b-nf4 = 6.7 GB, fits 8 GB, OOMs a 4 GB card).
+    """
+    vla_gb = vla.active_min_vram_gb()
+    reward_gb = reward.active_min_vram_gb()
+    missing = [m.name for m, gb in ((vla, vla_gb), (reward, reward_gb)) if gb is None]
+    if missing:
+        raise ROSConfigError(
+            f"cannot verify VLA+reward VRAM co-residency: {missing!r} do not declare "
+            f"min_vram_gb for their active dtype. Declare it so the pair can be "
+            f"checked before load."
+        )
+    assert vla_gb is not None and reward_gb is not None  # narrowed by the guard above
+    combined = vla_gb + reward_gb
+    if combined + margin_gb > gpu_total_gb:
+        raise ROSGPUMemoryError(
+            f"VLA {vla.name!r} ({vla_gb:.2f} GB @ {vla.quantization.dtype.value}) + "
+            f"reward {reward.name!r} ({reward_gb:.2f} GB @ {reward.quantization.dtype.value}) "
+            f"= {combined:.2f} GB + {margin_gb:.2f} GB margin exceeds GPU VRAM "
+            f"{gpu_total_gb:.2f} GB. A VLA must run with its reward model resident; "
+            f"pick a smaller-footprint pair or a larger GPU."
+        )
+    return combined
+
+
+# ─── Skill evaluation results (rskills/<id>/eval/<benchmark>.json) ───────────
+#
+# Every benchmarked rSkill ships one ``eval/<benchmark>.json`` file per
+# benchmark suite it has been (or will be) evaluated on.  Four shapes are
+# already in tree (``rskills/{smolvla-libero, smolvla-metaworld, pi05-libero-int8,
+# xvla-libero}/eval/*.json``); CLAUDE.md §6.4 lists ``eval/`` as required
+# packaging.  This schema pins the format so ``rSkill.from_yaml`` can
+# validate every JSON it finds and ``openral benchmark report`` can aggregate
+# across skills.
+
+
+class RSkillEvalSource(BaseModel):
+    """Provenance for a benchmark result block.
+
+    Used inside ``RSkillEvalResult`` so consumers know where the numbers
+    came from (paper vs local reproduction) without having to read the
+    ``_comment`` line.
+
+    Attributes:
+        paper: Plain-text title of the source paper / report.
+        arxiv: Optional arxiv URL or id.
+        model_variant: Which checkpoint variant the numbers describe
+            (e.g. ``"SmolVLA (0.45B)"``).
+        evaluated_by: Free-text — ``"upstream authors"`` or a contributor.
+        reproduced_locally: ``True`` only when OpenRAL CI / contributor
+            re-ran the benchmark and the listed numbers match.
+        reproduction_planned: Optional plan for closing the gap when
+            ``reproduced_locally`` is ``False``.
+        reproduction_cli: Either a single command string or a structured
+            ``{description, single_suite_example, all_suites, suite_max_steps,
+            notes}`` block (matches the LIBERO eval JSON shape).
+        table: Optional pointer at a specific table in the source paper.
+        status: Optional state marker — ``"in_progress"``, ``"deferred"``,
+            ``"reproduced"`` — for benchmarks that are not yet final.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    paper: str
+    arxiv: str | None = None
+    model_variant: str
+    evaluated_by: str
+    reproduced_locally: bool
+    reproduction_planned: str | None = None
+    reproduction_cli: dict[str, object] | str | None = None
+    table: str | None = None
+    status: str | None = None
+
+
+class RSkillEvalBenchmark(BaseModel):
+    """The benchmark suite a ``RSkillEvalResult`` was measured against.
+
+    Attributes:
+        name: Canonical suite name (``"LIBERO"``, ``"MetaWorld"``,
+            ``"ALOHA"``, ``"PushT"``, ``"RoboCasa"`` …).  Used by
+            ``openral benchmark report`` to group rows.
+        dataset: Optional HF dataset identifier.
+        protocol: Free-text description of the eval protocol.
+        robot: ``robot_id`` the benchmark was evaluated on.
+        simulator: Free-text simulator description.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    dataset: str | None = None
+    protocol: str
+    robot: str
+    simulator: str
+
+
+class RSkillEvalResult(BaseModel):
+    """Pydantic model of a ``rskills/<id>/eval/<benchmark>.json`` file.
+
+    The ``results`` and ``baselines`` blocks are intentionally
+    benchmark-specific — LIBERO has four sub-suites with success rates,
+    MetaWorld carries an MT50 average, ALOHA has a single cube-transfer
+    rate.  We require the metadata blocks (``source``, ``benchmark``,
+    ``eval_config``) but leave ``results`` as a free-form dict so each
+    benchmark can declare its own keys.
+
+    Attributes:
+        schema_version: Semver-ish version string for this on-disk format.
+        source: Provenance — paper / reproduction state.
+        benchmark: Suite identity (name, robot, simulator).
+        eval_config: Free-form configuration the benchmark was run with
+            (chunk size, image size, denoising steps, …).
+        results: Free-form per-task / per-suite success rates.
+        baselines: Optional free-form comparison numbers from prior work.
+        trace_id: Hex OTel trace id (32 chars) for the rollout that
+            produced this result. Set by ``openral benchmark run`` from the
+            ``cli.command`` root span so reviewers can deep-link from
+            ``rskills/<id>/eval/<benchmark>.json`` straight to the
+            trace tree in Jaeger / Tempo. Optional — paper-cited
+            numbers (``reproduced_locally: false``) leave it ``None``.
+
+    Example:
+        >>> # RSkillEvalResult.model_validate_json(
+        >>> #     '{"schema_version": "0.1", "source": {...}, ...}')
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: str = "0.1"
+    source: RSkillEvalSource
+    benchmark: RSkillEvalBenchmark
+    eval_config: dict[str, object] = Field(default_factory=dict)
+    results: dict[str, object]
+    baselines: dict[str, object] = Field(default_factory=dict)
+    # OTel design doc §6 P2: link the eval JSON to the OTel trace tree
+    # that produced it. Hex trace id (32 chars), no ``traceparent``
+    # — the dataset / trace cross-reference is a one-way pointer at
+    # the top of the run, not a propagation seam.
+    trace_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+    @classmethod
+    def from_json(cls, path: str) -> RSkillEvalResult:
+        """Load and validate a ``rskills/<id>/eval/<benchmark>.json`` file.
+
+        Args:
+            path: Filesystem path to the JSON file.
+
+        Returns:
+            A validated ``RSkillEvalResult``.
+
+        Raises:
+            FileNotFoundError: If ``path`` does not exist.
+            pydantic.ValidationError: If the JSON fails schema validation.
+        """
+        import json as _json  # noqa: PLC0415  # reason: deferred import
+
+        with open(path, encoding="utf-8") as fh:
+            data = _json.load(fh)
+        return cls.model_validate(data)
+
+
+# ─── Validation-matrix round verdicts (outputs/validation-matrix/<round>/) ───
+#
+# The collision stack is validated by replaying a fixed scene set on a GPU
+# host and reading the artifacts each run leaves. Before this ledger (~17
+# rounds) that reading was manual and several rounds left no written
+# conclusion (``docs/reference/collision-validation-evidence.md``, "Standing
+# caveats" §5). ``tools/validation_matrix.py`` now derives one
+# ``ValidationRoundVerdicts`` per round from recorded artifacts only, so
+# "what changed since the last round" is a diff
+# (``ValidationRoundDiff``) rather than re-reading logs.
+#
+# The kernel's verdict is transcribed verbatim
+# (``ValidationStopEvidence``) and adjudicated only against the
+# simulator's ground truth (``ValidationGroundTruthAdjudication``) — a
+# "false positive" label is about the world model, never licence to relax a
+# margin.
+
+
+ValidationOutcome: TypeAlias = Literal[
+    "completed",
+    "estop-collision-real",
+    "estop-collision-false-positive",
+    "estop-collision-within-quantization",
+    "estop-collision-unadjudicated",
+    "estop-initial-configuration",
+    "deadline-after-grasp",
+    "deadline-no-grasp",
+    "harness-error",
+]
+"""How one scene of a validation round ended.
+
+``completed`` is the only success. The four ``estop-collision-*`` values all
+mean the C++ safety kernel stopped the run and differ only in what the
+simulator's ground truth says about that stop; ``estop-initial-configuration``
+means the stop landed before any action reached the HAL, so it is a
+scene-initialisation defect rather than a stack one (see
+``openral_hal.sim_sensor_bridge.initial_configuration_stop_record``).
+``harness-error`` means the run never produced a usable artifact set.
+"""
+
+
+GroundTruthAdjudication: TypeAlias = Literal[
+    "real-contact",
+    "false-positive",
+    "within-quantization",
+    "unadjudicated",
+]
+"""Verdict of the simulator ground-truth probe on a kernel stop.
+
+``real-contact`` — some probed pair of **solid** geoms is at or below 0 m, so
+geometry really is touching. ``false-positive`` — the nearest true geometry is
+further from the tripping party than the admissible kernel-vs-probe gap can
+explain; this requires a *published* gap, since the voxel term alone is a lower
+bound on it and exceeding a lower bound establishes nothing.
+``within-quantization`` — the kernel was conservative by an amount that
+gap accounts for, which is correct behaviour. ``unadjudicated`` — the probe did
+not cover the stop (truncated, no snapshot recorded, no budget known, or the
+recorded probe does not attest that both of its sides were collidability
+filtered, in which case a 0 m pair may be a purely visual mesh and cannot
+support ``real-contact``).
+"""
+
+
+class ValidationStopEvidence(BaseModel):
+    """The kernel's ``safety.collision`` verdict for one scene, transcribed.
+
+    Every field is read verbatim out of the ``safety.collision`` log line the
+    C++ kernel emits; nothing is recomputed. ``min_distance_m`` is the depth of
+    the cell the kernel *reported*, ``sweep_min_distance_m`` the depth of the
+    deepest cell its sweep found — they differ only when a support-contact
+    witness exempted a deeper cell, which makes their inequality the
+    authoritative "was an exemption live at the trip" evidence.
+
+    Attributes:
+        kind: The kernel's collision kind (``"world"``, ``"self"``).
+        party_a: First party — a robot link, or ``attached:<object_id>`` when
+            the declared payload is the subject.
+        party_b: Second party — usually ``voxel_<index>`` for a world stop.
+        horizon_step: Predicted-horizon index the verdict was evaluated at.
+            ``-1`` is the reactive (measured-state) check.
+        min_distance_m: Reported penetration depth, negative when inside.
+        sweep_min_distance_m: Deepest cell the sweep found, negative when
+            inside. ``None`` when the kernel build did not report it.
+        place_allowance_active: Whether the ADR-0097 place-approach allowance
+            was applied on the trip itself.
+        place_target: Declared place target at the trip, empty when none.
+        depth_is_box_bound: Whether the reported ``min_distance_m`` is the
+            OBB's **bound** rather than a measurement of the geometry the
+            evidence names (#213). Set by the kernel only for a self-collision
+            pair whose two links both ship a stage-2 hull and whose hulls the
+            GJK found overlapping — GJK proves an overlap but does not size
+            one. Sound (the hull is inside its box, so the box can only report
+            more penetration) but loose: -31.97 mm for a ~1.5 mm hull
+            interpenetration on ``panda_link5``/``panda_link7``. An adjudicator
+            must charge the box budget for such a stop, never treat the number
+            as a hull measurement. ``False`` on a snapshot recorded before
+            #213.
+        exemption_active: ``True`` when ``sweep_min_distance_m`` is strictly
+            deeper than ``min_distance_m`` — a deeper cell was exempted.
+            ``None`` when the sweep depth was not reported.
+
+    Example:
+        >>> ev = ValidationStopEvidence(
+        ...     kind="world",
+        ...     party_a="panda_link5",
+        ...     party_b="voxel_170781",
+        ...     horizon_step=0,
+        ...     min_distance_m=-0.0209178,
+        ...     sweep_min_distance_m=-0.0209178,
+        ... )
+        >>> ev.exemption_active
+        False
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    kind: str
+    party_a: str
+    party_b: str
+    horizon_step: int
+    min_distance_m: float
+    sweep_min_distance_m: float | None = None
+    place_allowance_active: bool = False
+    place_target: str = ""
+    depth_is_box_bound: bool = False
+
+    @property
+    def exemption_active(self) -> bool | None:
+        """Whether the sweep found a deeper cell than the one reported."""
+        if self.sweep_min_distance_m is None:
+            return None
+        return self.sweep_min_distance_m < self.min_distance_m - 1e-9
+
+    @property
+    def involves_payload(self) -> bool:
+        """Whether the declared payload — not a bare robot link — tripped."""
+        return self.party_a.startswith("attached:") or self.party_b.startswith("attached:")
+
+
+class ValidationGroundTruthAdjudication(BaseModel):
+    """What the simulator's own probe says about a kernel stop.
+
+    Derived from the ``sim.estop_ground_truth_snapshot`` line the sim HAL emits
+    per stop. The probe measures against solid world geometry only and carries
+    its own caveat that a zero contact count is *not* an emptiness test, so the
+    adjudication is driven by the distance probes rather than the contact list.
+
+    Attributes:
+        verdict: The adjudication.
+        stop_class: The probe's own class for the stop (``"robot_world"``, ``"attached_payload"``).
+        sim_time_s: Simulator time at the stop.
+        grid_resolution_m: Occupancy-grid edge length; sets the quantization budget.
+        quantization_budget_m: Half the grid cell's body diagonal — the voxel-only
+            term, not the whole admissible gap.
+        admissible_gap_m: Budget applied to ``discrepancy_m``; prefers the HAL's
+            own ``adjudication_budget.admissible_gap_m`` (88.2 mm vs. a 25 mm
+            grid's 21.7 mm voxel-only term on the 2026-08-23 rounds), else
+            ``quantization_budget_m`` for a pre-budget snapshot.
+        budget_source: Where ``admissible_gap_m`` came from —
+            ``"hal-adjudication-budget"``, ``"grid-quantization"`` (a lower
+            bound only: can prove ``within-quantization``, never
+            ``false-positive``), or ``""`` (no budget; rounds before #144
+            published none and two verdicts were over-convicted on that alone).
+        probe_collidability_filtered: Whether both probe sides were
+            solid-geom-restricted; ``False`` on pre-filter snapshots (a 0 m
+            pair may be a visual mesh, so cannot support ``real-contact``).
+        probe_distance_certified: Whether every probe distance is
+            proof-certified (``openral_hal.convex_distance``); ``False`` on
+            ``mujoco.mj_geomDistance`` snapshots, which read confidently wrong
+            ``0.000 m`` for pairs whose certified value is ``+14.8``/``+82.2``/
+            ``+107.9 mm`` — such a probe withdraws the verdict to
+            ``unadjudicated`` rather than reversing it.
+        unadjudicated_reason: Why the verdict is ``unadjudicated`` (empty
+            otherwise) — distinguishes a harness fault from a run fact.
+        nearest_any_m: Distance of the closest probed pair of any kind;
+            ``None`` when nothing was within ``distmax_m``.
+        nearest_tripping_party_m: Distance of the closest pair naming the
+            kernel's tripping party; ``None`` when out of range.
+        nearest_pair: Bodies/geoms of the closest probed pair, verbatim.
+        discrepancy_m: ``nearest_tripping_party_m`` minus the kernel's
+            ``min_distance_m`` — clearance the kernel did not see.
+        probed_pairs: Pairs the probe actually measured.
+        probe_truncated: Whether the probe hit its call budget (a truncated
+            probe can never support ``false-positive``).
+        distmax_m: The probe's cutoff distance.
+        payload_contacts: MuJoCo contact count involving the payload.
+
+    Example:
+        >>> adj = ValidationGroundTruthAdjudication(
+        ...     verdict="real-contact", stop_class="attached_payload", sim_time_s=17.5
+        ... )
+        >>> adj.verdict
+        'real-contact'
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    verdict: GroundTruthAdjudication
+    stop_class: str | None = None
+    sim_time_s: float | None = None
+    grid_resolution_m: float | None = None
+    quantization_budget_m: float | None = None
+    admissible_gap_m: float | None = None
+    budget_source: str = ""
+    probe_collidability_filtered: bool | None = None
+    probe_distance_certified: bool | None = None
+    unadjudicated_reason: str = ""
+    nearest_any_m: float | None = None
+    nearest_tripping_party_m: float | None = None
+    nearest_pair: dict[str, object] = Field(default_factory=dict)
+    discrepancy_m: float | None = None
+    probed_pairs: int | None = None
+    probe_truncated: bool | None = None
+    distmax_m: float | None = None
+    payload_contacts: int | None = None
+
+
+class ValidationWitnessTimeline(BaseModel):
+    """The attach / witness / place-declaration lifecycle of one scene.
+
+    Reconstructed from the run's monitor JSONL (producer side) and the kernel's
+    own ``safety.support_witness_*`` / ``safety.place_region_*`` log lines
+    (consumer side). Both are recorded because a disagreement between them is
+    itself a finding.
+
+    Attributes:
+        attach_t_s: Monitor time of the first payload attach, ``None`` if the
+            run never grasped.
+        detach_t_s: Monitor time of the payload detach, if any.
+        support_id: The support body the witness last attested against.
+        kernel_witness_armed: ``safety.support_witness_armed`` line count.
+        kernel_witness_separated: ``safety.support_witness_separated`` count.
+        place_declaration_seen: Whether a place declaration with a
+            producer-measured region reached the monitor.
+        place_region_armed: Whether the kernel armed the declared place region.
+        place_allowance_active_lines: How many lines disclosed
+            ``place_allowance_active=1``. ``0`` means the approach allowance
+            never applied anywhere in the run.
+
+    Example:
+        >>> ValidationWitnessTimeline(attach_t_s=176.32).place_allowance_active_lines
+        0
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    attach_t_s: float | None = None
+    detach_t_s: float | None = None
+    support_id: str | None = None
+    kernel_witness_armed: int = 0
+    kernel_witness_separated: int = 0
+    place_declaration_seen: bool = False
+    place_region_armed: bool = False
+    place_allowance_active_lines: int = 0
+
+
+class ValidationSceneVerdict(BaseModel):
+    """One scene of one validation round, as a queryable record.
+
+    Attributes:
+        scene: Short scene key (``"baguette"``, ``"sink_cup"``, ``"fridge"``,
+            ``"utensil"``).
+        config_path: Repo-relative path of the DeployScene YAML that ran.
+        config_sha256: Digest of that YAML's bytes as executed, so a round can
+            be reproduced even if the scene later changes.
+        seed: The scene seed in force.
+        prompt: The instruction dispatched to the policy.
+        rskill_id: The rSkill the run dispatched.
+        outcome: The scene's outcome.
+        task_success_final: ``success`` from the terminal
+            ``sim.task_success_final`` line. ``None`` when the run never
+            emitted one.
+        task_success_ever: ``ever_succeeded`` from the same line.
+        task_success_steps: Simulator steps the episode ran.
+        task_success_transitions: Success-predicate transitions observed.
+        stop: The kernel's verdict, when the run was stopped.
+        ground_truth: Adjudication of that stop against the simulator.
+        witness: The attach / witness / declaration lifecycle.
+        monitor_records: How many records the run's monitor wrote from a ROS
+            subscription — every line except its own ``monitor_started`` /
+            ``monitor_stopped`` pair. ``None`` when no monitor JSONL exists.
+            **Zero means the monitor received nothing**, which is a harness
+            fault (its DDS participant never saw the graph) and must not be
+            read as "the run stopped before there was anything to see".
+        dispatch_failure_reason: ``failure_reason`` reported by the action
+            client, verbatim — or, when the dispatcher died before writing a
+            status line at all, why it did.
+        wall_s: Wall-clock seconds the dispatch took.
+        artifacts: Round-relative paths of the files this verdict was derived
+            from, so every field is traceable to a file.
+        harness_error_reason: Why the run produced no usable artifact set —
+            the graph never came up, or the deploy CLI rejected its own argv.
+            Non-empty exactly when ``outcome`` is ``harness-error``, so a
+            failed launch can never be read as a clean deadline.
+
+    Example:
+        >>> v = ValidationSceneVerdict(
+        ...     scene="fridge",
+        ...     config_path="scenes/deploy/robocasa_fridge_drawer.yaml",
+        ...     seed=1,
+        ...     outcome="estop-initial-configuration",
+        ... )
+        >>> v.outcome
+        'estop-initial-configuration'
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    scene: str
+    config_path: str
+    config_sha256: str | None = None
+    seed: int
+    prompt: str = ""
+    rskill_id: str = ""
+    outcome: ValidationOutcome
+    task_success_final: bool | None = None
+    task_success_ever: bool | None = None
+    task_success_steps: int | None = None
+    task_success_transitions: int | None = None
+    stop: ValidationStopEvidence | None = None
+    ground_truth: ValidationGroundTruthAdjudication | None = None
+    witness: ValidationWitnessTimeline = Field(default_factory=ValidationWitnessTimeline)
+    monitor_records: int | None = None
+    dispatch_failure_reason: str = ""
+    wall_s: float | None = None
+    artifacts: dict[str, str] = Field(default_factory=dict)
+    harness_error_reason: str = ""
+
+
+class ValidationRoundMetadata(BaseModel):
+    """What was executed, on what, from what — the reproducibility half.
+
+    Every field answers a "why couldn't we reproduce a past round" question:
+    which code ran, whether the overlay was built from it, which dependency
+    set, which entry point.
+
+    Attributes:
+        round_id: Directory name of the round, e.g. ``"2026-08-22-master-1"``.
+        started_at: ISO-8601 UTC timestamp the round began.
+        host: Hostname of the validation runner.
+        executed_sha: Full git SHA of the checkout that ran.
+        worktree_clean: Whether ``git status --porcelain`` was empty; ``None``
+            only for pre-harness imports (``run`` refuses a dirty worktree).
+        overlay_built_at_ns: Modification time of the built ROS overlay, to
+            prove it isn't older than the sources.
+        launcher_path: Absolute path of the ``openral`` entry point invoked.
+        repo_root: Absolute path exported as ``OPENRAL_REPO_ROOT``.
+        robot_manifest_path: Repo-relative path of the resolved robot manifest.
+        robot_id: The robot id the scenes resolved to.
+        sync_groups: Dependency groups the environment was synced with.
+        stack_argv: The launch argv shared by every scene, verbatim.
+        safety_overrides_absent: ``True`` only when the composed argv was
+            checked and carries no safety-knob override; a round is refused
+            rather than recorded ``False``.
+        collision_scale: The #188 graded-velocity band the kernel ran with,
+            when armed; empty = shipped default (disabled). Arrives via
+            ``OPENRAL_COLLISION_SCALE_*`` env vars, invisible to argv inspection.
+        gpu_name: GPU the round ran on, when ``nvidia-smi`` was available.
+        notes_path: Round-relative path of the human-readable notes.
+        scene_dirs: Scene key → round-relative artifact directory; empty =
+            same name as the scene key.
+        seed: The scene seed the round pinned; read with ``executed_sha`` for
+            a true reproducibility pair (a seed mismatch is a before/after).
+        artifact_stem: Filename stem of every per-scene artifact; pre-harness
+            rounds used ``"seed1"``.
+        imported_from: Absolute path of the pre-harness round this was
+            imported from, if any.
+        scene_pins: Scene ``runtime:`` keys the round pinned (no CLI flag
+            exists for them); read with ``stack_argv`` for the whole executed stack.
+
+    Example:
+        >>> m = ValidationRoundMetadata(
+        ...     round_id="2026-08-22-master-1",
+        ...     started_at="2026-08-22T10:02:00Z",
+        ...     executed_sha="2edcf67" + "0" * 33,
+        ...     worktree_clean=True,
+        ... )
+        >>> m.safety_overrides_absent
+        True
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    round_id: str
+    started_at: str
+    host: str = ""
+    executed_sha: str
+    worktree_clean: bool | None
+    overlay_built_at_ns: int | None = None
+    launcher_path: str = ""
+    repo_root: str = ""
+    robot_manifest_path: str | None = None
+    robot_id: str | None = None
+    sync_groups: list[str] = Field(default_factory=list)
+    stack_argv: list[str] = Field(default_factory=list)
+    safety_overrides_absent: bool = True
+    collision_scale: dict[str, float] = Field(default_factory=dict)
+    gpu_name: str | None = None
+    ros_domain_id: str = ""
+    """``ROS_DOMAIN_ID`` the round ran on; ``""`` means unset, i.e. domain 0.
+
+    Recorded from #227 onward. Before it, no round's DDS scope was captured, so
+    it is not knowable after the fact whether one shared a ROS graph with
+    another machine — which is exactly what happened on 2026-09-05, when a sim
+    on the default scope consumed a live OpenArm's ``/joint_states``.
+    """
+    ros_automatic_discovery_range: str = ""
+    """``ROS_AUTOMATIC_DISCOVERY_RANGE``; ``""`` means unset, i.e. ``SUBNET`` —
+    discovery across the whole subnet, which is how a robot on another host
+    reaches a simulation."""
+    notes_path: str | None = None
+    scene_dirs: dict[str, str] = Field(default_factory=dict)
+    seed: int = 1
+    artifact_stem: str = "run"
+    imported_from: str | None = None
+    scene_pins: dict[str, bool] = Field(default_factory=dict)
+
+
+class ValidationRoundVerdicts(BaseModel):
+    """One validation round's machine-readable result — ``verdicts.json``.
+
+    This is the on-disk contract ``tools/validation_matrix.py`` writes and
+    ``docs/reference/collision-validation-evidence.md`` is fed from.
+
+    Attributes:
+        schema_version: On-disk format version.
+        metadata: Reproducibility metadata for the round.
+        scenes: One verdict per scene, in execution order.
+
+    Example:
+        >>> r = ValidationRoundVerdicts(
+        ...     metadata=ValidationRoundMetadata(
+        ...         round_id="r1",
+        ...         started_at="2026-08-22T10:02:00Z",
+        ...         executed_sha="0" * 40,
+        ...         worktree_clean=True,
+        ...     ),
+        ...     scenes=[],
+        ... )
+        >>> r.schema_version
+        '0.1'
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: str = "0.1"
+    metadata: ValidationRoundMetadata
+    scenes: list[ValidationSceneVerdict] = Field(default_factory=list)
+
+    @classmethod
+    def from_json(cls, path: str) -> ValidationRoundVerdicts:
+        """Load and validate a round's ``verdicts.json``.
+
+        Args:
+            path: Filesystem path to the JSON file.
+
+        Returns:
+            A validated ``ValidationRoundVerdicts``.
+
+        Raises:
+            FileNotFoundError: If ``path`` does not exist.
+            pydantic.ValidationError: If the JSON fails schema validation.
+        """
+        import json as _json  # noqa: PLC0415  # reason: deferred import
+
+        with open(path, encoding="utf-8") as fh:
+            data = _json.load(fh)
+        return cls.model_validate(data)
+
+    def scene(self, name: str) -> ValidationSceneVerdict | None:
+        """Return the verdict for ``name``, or ``None`` when absent.
+
+        Args:
+            name: The scene key.
+
+        Returns:
+            The matching ``ValidationSceneVerdict``, if the round ran it.
+        """
+        return next((s for s in self.scenes if s.scene == name), None)
+
+
+class ValidationSceneDelta(BaseModel):
+    """How one scene's verdict moved between two rounds.
+
+    Attributes:
+        scene: The scene key.
+        baseline_outcome: Outcome in the baseline round, ``None`` if the scene
+            is new.
+        outcome: Outcome in the current round, ``None`` if the scene was
+            dropped.
+        changed: Whether the outcome differs.
+        changed_fields: Field-by-field deltas, as
+            ``{field: {"from": ..., "to": ...}}``, for the comparable subset
+            (outcome, task success, tripping pair, distances, allowance).
+
+    Example:
+        >>> d = ValidationSceneDelta(
+        ...     scene="baguette",
+        ...     baseline_outcome="estop-collision-real",
+        ...     outcome="estop-collision-false-positive",
+        ...     changed=True,
+        ... )
+        >>> d.changed
+        True
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    scene: str
+    baseline_outcome: ValidationOutcome | None = None
+    outcome: ValidationOutcome | None = None
+    changed: bool = False
+    changed_fields: dict[str, dict[str, object]] = Field(default_factory=dict)
+
+
+class ValidationRoundDiff(BaseModel):
+    """Round-over-round comparison — the "what changed" artifact.
+
+    Attributes:
+        schema_version: On-disk format version.
+        round_id: The newer round.
+        baseline_round_id: The round it is compared against.
+        executed_sha: SHA the newer round ran.
+        baseline_executed_sha: SHA the baseline ran.
+        seed: Scene seed the newer round pinned.
+        baseline_seed: Scene seed the baseline pinned. The SHA alone does not
+            make a comparison a reproducibility one: the scene seed decides the
+            initial configuration, so two rounds at one SHA on different seeds
+            are a before/after of two different scenes. A seed-1-vs-seed-2 diff
+            was labelled ``reproducibility`` for exactly that reason.
+        scenes: Per-scene deltas, in the newer round's order.
+
+    Example:
+        >>> d = ValidationRoundDiff(
+        ...     round_id="b",
+        ...     baseline_round_id="a",
+        ...     executed_sha="0" * 40,
+        ...     baseline_executed_sha="0" * 40,
+        ...     seed=1,
+        ...     baseline_seed=2,
+        ... )
+        >>> d.same_sha, d.is_reproducibility
+        (True, False)
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: str = "0.1"
+    round_id: str
+    baseline_round_id: str
+    executed_sha: str
+    baseline_executed_sha: str
+    seed: int | None = None
+    baseline_seed: int | None = None
+    scenes: list[ValidationSceneDelta] = Field(default_factory=list)
+
+    @property
+    def same_sha(self) -> bool:
+        """Whether both rounds ran the same code."""
+        return self.executed_sha == self.baseline_executed_sha
+
+    @property
+    def same_seed(self) -> bool:
+        """Whether both rounds pinned the same scene seed."""
+        return self.seed == self.baseline_seed
+
+    @property
+    def is_reproducibility(self) -> bool:
+        """Whether this compares one configuration with itself.
+
+        Same code **and** same seed. Anything else is a before/after: a seed
+        change moves the scene's initial configuration, so the two rounds are
+        not repeats of one another however equal their SHAs are.
+        """
+        return self.same_sha and self.same_seed
+
+    @property
+    def changed_scenes(self) -> list[str]:
+        """Scene keys whose outcome moved between the two rounds."""
+        return [s.scene for s in self.scenes if s.changed]
+
+
+# ─── Sim environment specs (scene x task x VLA composition) ──────────────────
+#
+# These three models compose into a ``SimEnvironment``, the swappable
+# triple consumed by ``openral_sim`` to validate rSkills before hardware
+# deployment (CLAUDE.md §6 "WAMs / sim eval").
+#
+# Design notes:
+#   - The registry pattern (string ids ↔ Python factories) keeps these specs
+#     fully serialisable and YAML-friendly while letting backend code live in
+#     ``openral_sim.{policies,backends}``.
+#   - Backends (LIBERO, MetaWorld, ...) are imported lazily by the factory;
+#     the schemas have no hard dependency on physics packages.
+#   - ``SimEnvironment`` itself does NOT bake in a specific physics engine —
+#     the engine is declared on ``SceneSpec``.
+
+
+class PhysicsBackend(str, Enum):
+    """Physics / scene backend used to instantiate a ``SceneSpec``.
+
+    Attributes:
+        MUJOCO: Vanilla MuJoCo (CPU / single-env). Default for LIBERO, MetaWorld,
+            and VLABench (native lerobot 0.6.0 VLABenchEnv, in-process).
+        MUJOCO_MJX: MuJoCo MJX (XLA, GPU-batched headless rollouts).
+        PYBULLET: PyBullet (legacy adapters, contact-rich tabletop).
+        SAPIEN: SAPIEN (Hillbot/UCSD physics + ray-traced rendering). The
+            engine under ManiSkill3 and RoboTwin 2.0; the RoboTwin dual-arm
+            benchmark backend runs it out-of-process via a py3.10 sidecar.
+            ManiSkill3 scenes predate this slot and historically
+            declared ``MUJOCO`` — new SAPIEN backends use this value.
+        ISAACSIM: NVIDIA Isaac Sim (Omniverse, GPU). Future.
+        COPPELIASIM: CoppeliaSim/PyRep — the RLBench benchmark backend, driven
+            out-of-process via a py3.10 sidecar.
+        GENESIS: Genesis (physics-language unification). Future.
+        MOCK: In-process mock with no physics — used for wiring smoketests.
+    """
+
+    MUJOCO = "mujoco"
+    MUJOCO_MJX = "mujoco_mjx"
+    PYBULLET = "pybullet"
+    SAPIEN = "sapien"
+    ISAACSIM = "isaacsim"
+    COPPELIASIM = "coppeliasim"
+    GENESIS = "genesis"
+    MOCK = "mock"
+
+
+class SceneSpec(BaseModel):
+    """A physics scene declaration — the WORLD the robot acts in.
+
+    A scene is a deterministic, reproducible MuJoCo / MJX / etc. world: assets,
+    lighting, cameras, fixed objects.  Tasks (``TaskSpec``) are evaluated
+    INSIDE a scene; multiple tasks can share one scene (e.g. ``libero_spatial``
+    has 10 tasks per suite).
+
+    Attributes:
+        id: Stable scene identifier used by the eval registry, e.g.
+            ``"libero_spatial"``, ``"metaworld_mt50"``, ``"so100_tabletop"``.
+        backend: Physics backend used to instantiate the scene.
+        assets_uri: Optional URI (file:// or hf://) pointing at scene assets
+            (XML / MJCF / asset bundle).  When ``None``, the registered
+            adapter resolves assets internally (LIBERO / MetaWorld pull theirs
+            from their own packages).
+        observation_height: Default render height in pixels for camera obs.
+        observation_width: Default render width in pixels for camera obs.
+        cameras: List of camera names the scene exposes.  Adapters use this
+            both to render and to map sensors to VLA feature keys.
+        backend_options: Backend-specific overrides
+            (e.g. ``{"render_modes": ["rgb_array"]}``).  Opaque to the eval
+            layer; passed through to the adapter.
+
+    Example:
+        >>> s = SceneSpec(id="libero_spatial", backend=PhysicsBackend.MUJOCO)
+        >>> s.observation_width
+        256
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    backend: PhysicsBackend = PhysicsBackend.MUJOCO
+    assets_uri: str | None = None
+    observation_height: int = Field(default=256, gt=0)
+    observation_width: int = Field(default=256, gt=0)
+    cameras: list[str] = Field(default_factory=list)
+    backend_options: dict[str, object] = Field(default_factory=dict)
+
+
+# Scene-pool id domains, mirrored from RoboCasa 1.0.1
+# ``robocasa/models/scenes/scene_registry.py``. Transcribed, not guessed
+# (CLAUDE.md §1.2): ``LayoutType`` declares ``LAYOUT001..LAYOUT060`` = 1..60
+# plus the negative group aliases ``TEST=-1 TRAIN=-2 ALL=-3 NO_ISLAND=-4
+# ISLAND=-5 DINING=-6``, and ``LAYOUT_GROUPS_TO_IDS`` is keyed by exactly
+# those six negatives. ``StyleType`` declares ``STYLE001..STYLE060`` = 1..60;
+# its only negative member is ``ALL=-3``, but ``unpack_style_ids`` indexes
+# ``STYLE_GROUPS_TO_IDS``, which is keyed ``-1 -2 -3`` — so the resolver
+# accepts three negatives where the enum names one, and this mirror follows
+# the resolver (it is what actually runs).
+#
+# 0 is NOT a layout or a style. RoboCasa numbers both from 1, so a
+# ``layout_ids: 0`` is always an authoring mistake, not "the first layout".
+_ROBOCASA_LAYOUT_ID_MIN = 1
+_ROBOCASA_LAYOUT_ID_MAX = 60
+_ROBOCASA_LAYOUT_GROUP_IDS = frozenset({-1, -2, -3, -4, -5, -6})
+_ROBOCASA_STYLE_ID_MIN = 1
+_ROBOCASA_STYLE_ID_MAX = 60
+_ROBOCASA_STYLE_GROUP_IDS = frozenset({-1, -2, -3})
+# ``Kitchen.__init__`` accepts these two strings for ``layout_and_style_ids``
+# (they resolve to ``EnvUtils.KITCHEN_SCENES_5X5`` / ``KITCHEN_SCENES_5X1``).
+# Any OTHER string falls through both branches leaving
+# ``self.layout_and_style_ids`` never assigned, so the failure surfaces much
+# later as an ``AttributeError`` on an unrelated line — reject it here.
+_ROBOCASA_LAYOUT_AND_STYLE_SHORTHANDS = frozenset({"5x5", "5x1"})
+_ROBOCASA_LAYOUT_AND_STYLE_PAIR_LEN = 2
+
+
+def _check_robocasa_scene_ids(
+    value: list[int] | int | None,
+    *,
+    field: str,
+    id_min: int,
+    id_max: int,
+    group_ids: frozenset[int],
+) -> list[int] | int | None:
+    """Reject a RoboCasa layout / style id outside the upstream domain.
+
+    Args:
+        value: The field's raw value — a scalar id, a list of ids, or ``None``.
+        field: Field name, quoted back in the error message.
+        id_min: Lowest concrete id upstream defines.
+        id_max: Highest concrete id upstream defines.
+        group_ids: Negative group shorthands the upstream resolver accepts.
+
+    Returns:
+        ``value`` unchanged when every id is in the domain.
+
+    Raises:
+        ValueError: naming the offending id and the whole accepted domain.
+            Pydantic wraps this into a ``ValidationError``, which the RoboCasa
+            scene adapter re-raises as a typed
+            ``ROSConfigError``.
+
+    Example:
+        >>> _check_robocasa_scene_ids(
+        ...     [3],
+        ...     field="layout_ids",
+        ...     id_min=1,
+        ...     id_max=60,
+        ...     group_ids=frozenset({-1, -2, -3, -4, -5, -6}),
+        ... )
+        [3]
+    """
+    if value is None:
+        return value
+    for scene_id in [value] if isinstance(value, int) else value:
+        if id_min <= scene_id <= id_max or scene_id in group_ids:
+            continue
+        raise ValueError(
+            f"RoboCasaBackendOptions.{field}: {scene_id} is not a RoboCasa "
+            f"scene id. Accepted: {id_min}..{id_max} (concrete scenes) or one "
+            f"of {sorted(group_ids)} (group shorthands). RoboCasa numbers "
+            f"layouts and styles from 1, so 0 is never valid."
+        )
+    return value
+
+
+class RoboCasaBackendOptions(BaseModel):
+    """Typed validator helper for ``SceneSpec.backend_options`` under RoboCasa.
+
+    RoboCasa exposes two scenario modes:
+
+    * **prebuilt** — pick one of the ~100 atomic-PnP / door / drawer /
+      navigation tasks shipped with the package by name (e.g.
+      ``"PnPCounterToCab"``). Set ``prebuilt_task``; leave all
+      procedural keys at their defaults.
+    * **procedural** -- author a kitchen by composing
+      ``kitchen_style`` x ``layout_id`` x ``fixtures`` x
+      ``spawn_objects`` x ``task_verb``. Set ``mode`` to
+      ``"procedural"`` and leave ``prebuilt_task`` ``None``.
+
+    The model is **purely additive**: it lives alongside ``SceneSpec`` and is
+    constructed by the RoboCasa scene adapter at factory time via
+    ``RoboCasaBackendOptions.model_validate(scene.backend_options)``. The
+    parent ``SceneSpec.backend_options: dict[str, object]`` field is
+    unchanged, so this class does not constitute a schema migration
+    (CLAUDE.md §1.6).
+
+    Attributes:
+        mode: ``"prebuilt"`` (default) or ``"procedural"``.
+        prebuilt_task: One of RoboCasa's ~100 atomic task names, e.g.
+            ``"PnPCounterToCab"``. Only valid when ``mode="prebuilt"``.
+        kitchen_style: 0..9, picks one of RoboCasa's 10 kitchen aesthetic
+            packs. Only valid when ``mode="procedural"``.
+        layout_id: 0..9, picks one of RoboCasa's 10 floor plans. Only
+            valid when ``mode="procedural"``.
+        fixtures: Subset of RoboCasa fixture names to spawn. Empty list
+            keeps the layout's default fixtures.
+        spawn_objects: Subset of RoboCasa object asset names to spawn on
+            counters / inside cabinets.
+        task_verb: Coarse procedural-mode goal: pick-and-place, open,
+            close, press, navigate. Required when ``mode="procedural"``.
+        robots: RoboCasa robot composition names, e.g.
+            ``["PandaMobile"]`` (default) or ``["GR1"]``. Must match
+            entries the upstream RoboCasa env factory accepts.
+        controller: RoboCasa controller name. ``"OSC_POSE"`` works for
+            arm-style robots; the adapter validates against the
+            controller config exposed by RoboCasa at import time.
+        horizon: Maximum step budget for the underlying RoboCasa env.
+
+    Example:
+        >>> opts = RoboCasaBackendOptions(mode="prebuilt", prebuilt_task="PnPCounterToCab")
+        >>> opts.task_verb is None
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["prebuilt", "procedural"] = "prebuilt"
+    prebuilt_task: str | None = None
+    kitchen_style: int | None = Field(default=None, ge=0, le=9)
+    layout_id: int | None = Field(default=None, ge=0, le=9)
+    fixtures: list[str] = Field(default_factory=list)
+    spawn_objects: list[str] = Field(default_factory=list)
+    task_verb: Literal["pnp", "open", "close", "press", "navigate"] | None = None
+    robots: list[str] = Field(default_factory=lambda: ["PandaMobile"])
+    controller: str = "OSC_POSE"
+    horizon: int = Field(default=500, gt=0)
+    # Proprioception layout the wrapped policy expects. Each option
+    # concatenates a different subset of `robot0_*` robosuite obs keys
+    # into the `observation.state` vector emitted by `_RoboCasaSim`:
+    #   "human300_16d"   base_to_eef_pos(3) + base_to_eef_quat(4)
+    #                    + base_pos(3) + base_quat(4) + gripper_qpos(2)
+    #                    -> 16-D, robocasa-benchmark/openpi
+    #                    `pi05_pretrain_human300` schema.
+    #   "smolvla_9d"      eef_pos(3) + eef_quat(4) + gripper_qpos(2)
+    #                    -> 9-D, the older smolvla / pre-mg_300 layout.
+    #   "gr1" robot0_joint_pos(17) + robot0_right_gripper_qpos(11)
+    #                    + robot0_left_gripper_qpos(11) -> 39-D. The 17 joint
+    #                    slots are waist(3) + right arm(7) + left arm(7) in
+    #                    MJCF order; the per-part views the upstream GR1
+    #                    fork's GR1ArmsAndWaistKeyConverter exposes
+    #                    (`hand.right_hand`, `body.right_arm`, etc.) are
+    #                    sub-slices into this same 39-D vector.
+    state_layout: Literal[
+        "smolvla_9d",
+        "human300_16d",
+        "xr1_8d",
+        "gr1",
+    ] = "human300_16d"
+
+    # Scene-pool restrictors mirroring `robocasa.environments.kitchen.kitchen.Kitchen`
+    # constructor kwargs. Independent of `mode` -- they apply equally to
+    # prebuilt and procedural authoring (the upstream Kitchen base class
+    # consumes them in both paths). Defaults are `None` so existing
+    # configs remain unchanged: when the user leaves these empty, the
+    # robocasa scene factory falls through to its own (uniform across
+    # all 60 layouts x 60 styles) sampling. To match the canonical
+    # benchmark eval split, pin
+    #   obj_instance_split="B"
+    #   layout_and_style_ids=[[1,1],[2,2],[4,4],[6,9],[7,10]]
+    # (see robocasa/utils/eval_utils.py::create_eval_env). To match the
+    # training-data collection distribution
+    # (DAVIAN-Robotics/robocasa-MG_*) pin
+    #   obj_instance_split="pretrain"
+    #   layout_ids=[-2]   # robocasa shorthand for "all train layouts (11..60)"
+    #   style_ids=[-2]
+    # See robocasa/scripts/collect_demos.py for the per-split semantics.
+    #
+    # ADR-amendment note: this is a purely additive Pydantic field. Old
+    # SimEnvironment YAMLs (which don't carry these keys) load
+    # unchanged because each field defaults to None.
+    #
+    # `layout_ids` / `style_ids` / `layout_and_style_ids` are RANGE-CHECKED
+    # against the upstream enums below. Without that check an out-of-range pin
+    # is not rejected here; it travels all the way into
+    # `SceneRegistry.get_layout_path`, which indexes a dict built from
+    # `LayoutType` and dies on a bare `KeyError: 99` from inside arena
+    # construction — a stack with no mention of the YAML key that caused it.
+    # A group shorthand outside `LAYOUT_GROUPS_TO_IDS` (`layout_ids: -7`) is
+    # the same failure one frame earlier, in `unpack_layout_ids`. Both are now
+    # `ROSConfigError` at scene-validation time, naming the offending value.
+    obj_instance_split: str | None = None
+    layout_and_style_ids: list[list[int]] | str | None = None
+    layout_ids: list[int] | int | None = None
+    style_ids: list[int] | int | None = None
+    obj_groups: str | None = None
+    """Pin the PnP target object to a specific RoboCasa object group / category
+    (e.g. ``"baguette"``, ``"vegetable"``). Forwarded to the prebuilt PnP task's
+    ``obj_groups`` kwarg so the sampled object is deterministic instead of the
+    default ``"all"`` random draw. Only valid for prebuilt PickPlace tasks;
+    leave ``None`` for door / drawer / navigation tasks."""
+    # ``False`` (default) matches ``openral sim run`` semantics: the env
+    # terminates at ``horizon`` so the runner can score the episode.
+    # ``True`` is for continuous-mode consumers (``openral deploy sim``)
+    # where the operator drives an indefinite stream of commands and we
+    # never want robosuite to refuse a follow-up step with
+    # ``ValueError: executing action in terminated episode``. The HAL
+    # bringup forces it on automatically via
+    # ``openral_hal.sim_bringup.build_sim_env_from_yaml`` regardless of
+    # what the YAML declares.
+    ignore_done: bool = False
+
+    @field_validator("layout_ids")
+    @classmethod
+    def _check_layout_ids(cls, value: list[int] | int | None) -> list[int] | int | None:
+        """Reject a layout id outside RoboCasa's 1..60 + group-shorthand domain."""
+        return _check_robocasa_scene_ids(
+            value,
+            field="layout_ids",
+            id_min=_ROBOCASA_LAYOUT_ID_MIN,
+            id_max=_ROBOCASA_LAYOUT_ID_MAX,
+            group_ids=_ROBOCASA_LAYOUT_GROUP_IDS,
+        )
+
+    @field_validator("style_ids")
+    @classmethod
+    def _check_style_ids(cls, value: list[int] | int | None) -> list[int] | int | None:
+        """Reject a style id outside RoboCasa's 1..60 + group-shorthand domain."""
+        return _check_robocasa_scene_ids(
+            value,
+            field="style_ids",
+            id_min=_ROBOCASA_STYLE_ID_MIN,
+            id_max=_ROBOCASA_STYLE_ID_MAX,
+            group_ids=_ROBOCASA_STYLE_GROUP_IDS,
+        )
+
+    @field_validator("layout_and_style_ids")
+    @classmethod
+    def _check_layout_and_style_ids(
+        cls, value: list[list[int]] | str | None
+    ) -> list[list[int]] | str | None:
+        """Reject an unknown shorthand string or a malformed (layout, style) pair."""
+        if value is None:
+            return value
+        if isinstance(value, str):
+            if value not in _ROBOCASA_LAYOUT_AND_STYLE_SHORTHANDS:
+                raise ValueError(
+                    f"RoboCasaBackendOptions.layout_and_style_ids: {value!r} is "
+                    f"not a RoboCasa shorthand. Accepted: "
+                    f"{sorted(_ROBOCASA_LAYOUT_AND_STYLE_SHORTHANDS)}, or an "
+                    f"explicit list of [layout, style] pairs."
+                )
+            return value
+        for pair in value:
+            if len(pair) != _ROBOCASA_LAYOUT_AND_STYLE_PAIR_LEN:
+                raise ValueError(
+                    f"RoboCasaBackendOptions.layout_and_style_ids: {pair!r} is "
+                    f"not a [layout, style] pair."
+                )
+            _check_robocasa_scene_ids(
+                pair[0],
+                field="layout_and_style_ids[0]",
+                id_min=_ROBOCASA_LAYOUT_ID_MIN,
+                id_max=_ROBOCASA_LAYOUT_ID_MAX,
+                group_ids=_ROBOCASA_LAYOUT_GROUP_IDS,
+            )
+            _check_robocasa_scene_ids(
+                pair[1],
+                field="layout_and_style_ids[1]",
+                id_min=_ROBOCASA_STYLE_ID_MIN,
+                id_max=_ROBOCASA_STYLE_ID_MAX,
+                group_ids=_ROBOCASA_STYLE_GROUP_IDS,
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _mutually_exclusive_scene_pool_pins(self) -> RoboCasaBackendOptions:
+        """Refuse the combination ``Kitchen.__init__`` asserts on.
+
+        Upstream: ``assert layout_ids is None and style_ids is None`` when
+        ``layout_and_style_ids`` is set. Raising here names the YAML keys;
+        the upstream assert surfaces as a bare ``AssertionError`` from inside
+        env construction with no pointer back to the scene file.
+        """
+        if self.layout_and_style_ids is not None and (
+            self.layout_ids is not None or self.style_ids is not None
+        ):
+            raise ValueError(
+                "RoboCasaBackendOptions: layout_and_style_ids is mutually "
+                "exclusive with layout_ids / style_ids (RoboCasa's Kitchen "
+                "ctor asserts on the combination). Pin either the pair list "
+                "or the two axes separately, not both."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _xor_prebuilt_vs_procedural(self) -> RoboCasaBackendOptions:
+        """Forbid mixing the two scenario authoring modes.
+
+        ``mode="prebuilt"`` requires ``prebuilt_task`` and forbids
+        any of the procedural-only keys (``kitchen_style``,
+        ``layout_id``, ``fixtures``, ``spawn_objects``,
+        ``task_verb``).
+
+        ``mode="procedural"`` forbids ``prebuilt_task`` and requires
+        at least one of the procedural-only keys to be set (otherwise
+        the user has just selected the upstream RoboCasa procedural
+        defaults, which is fine but ambiguous in a YAML — we force them
+        to set ``task_verb`` at minimum so the intent is explicit).
+        """
+        procedural_keys_set = any(
+            [
+                self.kitchen_style is not None,
+                self.layout_id is not None,
+                bool(self.fixtures),
+                bool(self.spawn_objects),
+                self.task_verb is not None,
+            ]
+        )
+        if self.mode == "prebuilt":
+            if self.prebuilt_task is None:
+                raise ValueError(
+                    "RoboCasaBackendOptions(mode='prebuilt') requires "
+                    "prebuilt_task to name one of the ~100 atomic tasks "
+                    "RoboCasa ships (e.g. 'PnPCounterToCab')."
+                )
+            if procedural_keys_set:
+                raise ValueError(
+                    "RoboCasaBackendOptions: procedural keys (kitchen_style, "
+                    "layout_id, fixtures, spawn_objects, task_verb) are not "
+                    "valid when mode='prebuilt'."
+                )
+        else:  # mode == "procedural"
+            if self.prebuilt_task is not None:
+                raise ValueError(
+                    "RoboCasaBackendOptions: prebuilt_task is not valid when mode='procedural'."
+                )
+            if not procedural_keys_set:
+                raise ValueError(
+                    "RoboCasaBackendOptions(mode='procedural') requires at "
+                    "least one procedural key — set task_verb (and "
+                    "kitchen_style / layout_id / fixtures / spawn_objects "
+                    "to taste)."
+                )
+        return self
+
+
+class TaskSpec(BaseModel):
+    """A task declaration — WHAT the robot must achieve inside a scene.
+
+    Tasks decouple scene assets (``SceneSpec``) from goal-conditioning. The
+    same scene can host many tasks; the same task can occasionally be run in
+    multiple compatible scenes (rare; usually 1:1 with ``scene_id``).
+
+    Success is evaluated by the scene adapter — the reward / success signal
+    comes from the underlying gym env (``info['is_success']``,
+    ``info['success']``, terminal reward, …).  ``success_key`` lets manifest
+    authors override which info field the runner reads.
+
+    Attributes:
+        id: Stable task identifier, e.g. ``"libero_spatial/task_0"``,
+            ``"metaworld/push-v3"``.  Adapters split on ``/`` to resolve.
+        scene_id: ID of the ``SceneSpec`` this task runs in.
+        instruction: Natural-language goal handed to the VLA as the
+            ``"task"`` text input.  Some adapters override this with a
+            description baked into the underlying suite (LIBERO, MetaWorld).
+        max_steps: Episode budget. Adapters may clip to scene-internal limits.
+            ``None`` means unset; ``BenchmarkScene`` enforces a concrete value
+            via its model validator.
+        success_key: Key inside ``info`` returned by ``env.step()`` whose
+            truthy value marks task success. ``None`` means unset;
+            ``BenchmarkScene`` enforces a concrete value via its model
+            validator (required for paper-comparison benchmarks).
+        metadata: Free-form per-task notes (paper reference, dataset split, …).
+
+    Example:
+        >>> t = TaskSpec(
+        ...     id="libero_spatial/task_0",
+        ...     scene_id="libero_spatial",
+        ...     instruction="pick up the black bowl",
+        ...     max_steps=200,
+        ...     success_key="is_success",
+        ... )
+        >>> t.max_steps
+        200
+        >>> t.success_key
+        'is_success'
+        >>> TaskSpec(id="libero_spatial/task_0", scene_id="libero_spatial").max_steps is None
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    scene_id: str
+    instruction: str = ""
+    max_steps: int | None = Field(default=None, gt=0)
+    success_key: str | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+class VLASpec(BaseModel):
+    """A VLA / policy declaration — the BRAIN driving the robot.
+
+    Lightweight pointer to a policy: either an installed rSkill (referenced
+    by manifest name) or a raw HF Hub repo. The eval registry resolves this
+    to a runtime adapter that returns ``Action`` objects.
+
+    Attributes:
+        id: Adapter id in the eval registry, e.g. ``"smolvla"``, ``"pi05"``,
+            ``"xvla"``, ``"random"``, ``"zero"``. Picks the loader.
+        weights_uri: Where to fetch weights from. Pass a bare rSkill
+            reference: a name (``smolvla-libero``), a path (``rskills/smolvla-libero``),
+            or a bare HF repo ID (``OpenRAL/rskill-smolvla-franka_panda-libero_spatial-bf16``). The
+            ``openral_sim.SimRunner`` requires a locally-resolvable
+            reference — raw ``"hf://"`` URIs are rejected. Other URI shapes
+            (e.g. ``"mock://"``) are still parsed by the schema so unit tests
+            of the eval registries can run without an rSkill, but they will
+            fail-fast if used with the runner.
+        device: Torch device override. ``"auto"`` picks ``cuda:0`` if
+            available, otherwise ``cpu``.
+        runtime: Optional runtime override; ``None`` means "use whatever the
+            policy/manifest declares".
+        quantization: Optional quantization override for this run.
+        deterministic: When True, set ``torch.use_deterministic_algorithms``
+            and disable cuDNN benchmarking.
+        extra: Adapter-specific options, e.g. ``{"chunk_size": 16}``.
+
+    Example:
+        >>> v = VLASpec(id="smolvla", weights_uri="rskills/smolvla-libero")
+        >>> v.device
+        'auto'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    weights_uri: str
+    device: str = "auto"
+    runtime: RSkillRuntime | None = None
+    quantization: QuantizationConfig | None = None
+    deterministic: bool = False
+    extra: dict[str, object] = Field(default_factory=dict)
+
+
+class SimEnvironment(BaseModel):
+    """A full sim configuration: the swappable (robot x scene x task x VLA) tuple.
+
+    The composed runtime form of a ``SimScene`` plus an
+    ``RSkillManifest``. ``openral_sim``'s CLI builds it; adapters
+    consume it. Not loaded from YAML directly — ``from_yaml`` raises.
+
+    Attributes:
+        robot_id: ID into the eval ``ROBOTS`` registry. Matches a robot's
+            ``RobotDescription.name`` or an embodiment shortcut (e.g.
+            ``"so100_follower"``, ``"franka_panda"``).
+        scene: Scene the robot acts in.
+        task: Task to evaluate. ``task.scene_id`` MUST equal ``scene.id``.
+        vla: Policy that drives the robot.
+        base_pose: Optional per-episode mounting pose for the robot in the
+            scene's world frame. ``None`` means "use the scene adapter's
+            default" (e.g. an URDF's identity placement). Only honoured by
+            **free-axis** scene adapters; setting it on a scene that
+            registers with a ``fixed_robot=`` constraint (LIBERO,
+            MetaWorld, RoboCasa, PushT, ALOHA) is rejected at CLI
+            compose-time. The pose's ``frame_id`` is expected to be
+            ``"world"``; adapters anchor on the robot's
+            ``RobotDescription.base_frame``.
+        seed: Global random seed (env reset, action sampling, torch RNG).
+        n_episodes: Number of episodes to run.  ``1`` for a smoketest;
+            ≥ 50 for an honest single-task success rate.
+        record_video: Whether to ask the runner to record video frames.
+        save_dir: Optional directory to write artefacts (video, traces, json
+            summary). ``None`` means "discard outputs".
+        metadata: Free-form notes (commit SHA, run owner, etc.).
+
+    Example:
+        >>> env = SimEnvironment(
+        ...     robot_id="franka_panda",
+        ...     scene=SceneSpec(id="libero_spatial"),
+        ...     task=TaskSpec(
+        ...         id="libero_spatial/task_0",
+        ...         scene_id="libero_spatial",
+        ...         instruction="pick up the cube",
+        ...     ),
+        ...     vla=VLASpec(id="smolvla", weights_uri="hf://lerobot/smolvla_libero"),
+        ... )
+        >>> env.task.scene_id == env.scene.id
+        True
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    robot_id: str
+    scene: SceneSpec
+    task: TaskSpec
+    vla: VLASpec
+    base_pose: Pose6D | None = None
+    seed: int = 0
+    n_episodes: int = Field(default=1, gt=0)
+    record_video: bool = False
+    save_dir: str | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+    def model_post_init(self, _context: object) -> None:
+        """Cross-field validation: task.scene_id must match scene.id."""
+        if self.task.scene_id != self.scene.id:
+            raise ValueError(
+                f"SimEnvironment.task.scene_id ({self.task.scene_id!r}) does not "
+                f"match scene.id ({self.scene.id!r}); a task can only run in its "
+                f"declared scene."
+            )
+
+
+class BenchmarkMetadata(BaseModel):
+    """Provenance block required on every BenchmarkScene.
+
+    ``paper`` / ``honest_scope`` are the published-protocol citation +
+    a one-sentence "what this eval actually measured" statement.
+
+    ``display_name`` / ``simulator`` are optional paper-comparison
+    labels that surface into ``RSkillEvalResult.benchmark``
+    when present — ``display_name`` becomes ``benchmark.name`` and
+    ``simulator`` becomes ``benchmark.simulator``. Before the scene-hierarchy
+    convergence these lived in a free-form dict on the deleted ``BenchmarkSpec``; moving
+    them per-scene keeps them with their provenance and lets the
+    aggregator emit identical JSON whether driven by ``run_benchmark``
+    (suite) or ``run_benchmark_scene`` (single scene).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    paper: str
+    honest_scope: str
+    display_name: str | None = None
+    simulator: str | None = None
+
+
+class LaunchInclude(BaseModel):
+    """A vendor ROS 2 launch file a deploy has to bring up alongside the graph.
+
+    Some sensors are not opened by OpenRAL at all — they are published by the
+    vendor's own driver, and the scene's ``SensorDeployBinding`` merely
+    *subscribes* to what that driver puts on the bus (``backend:
+    ros2_image``). The binding names the topic but not who publishes it, so
+    until this existed an operator had to start the driver by hand in a second
+    terminal and every camera fed that way was silently empty when they forgot.
+
+    Same shape as the HAL's ``real_bringup.launch.py`` convention, but declared
+    as data rather than by file name: a driver needs *arguments* (which camera
+    model, which override YAML), and those are host-specific — which is exactly
+    what a ``DeployScene`` is for.
+
+    Resolved through ``FindPackageShare``, so the launch comes from the sourced
+    overlay like any other vendor package, and a missing package fails loudly at
+    launch-parse time rather than leaving a topic quietly unpublished.
+
+    Attributes:
+        package: ROS 2 package providing the launch file.
+        launch_file: File name inside that package's ``launch/`` directory.
+        args: Launch arguments, forwarded verbatim. Values are strings because
+            that is what ``ros2 launch`` takes; ``"true"``/``"false"`` for
+            booleans.
+
+    Example:
+        >>> LaunchInclude(package="zed_wrapper", launch_file="zed_camera.launch.py").args
+        {}
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    package: str
+    launch_file: str
+    args: dict[str, str] = Field(default_factory=dict)
+
+
+class SimulatorBridgeSpec(BaseModel):
+    """A ROS node that adapts an external simulator's topics to OpenRAL's own.
+
+    A ROS-attached simulator publishes in its own vocabulary (SRB:
+    ``/srb/env0/...`` sensor topics and ``srb/env0/*`` TF frames); the
+    stack's consumers (Nav2's costmaps, SLAM, WorldState) expect
+    ``/odom``, ``odom -> base_frame`` TF and ``/openral/...`` sensor topics.
+    The adapter is part of the simulator integration, not of the robot's
+    HAL, so the scene declares it next to the simulator and the launch owns
+    its lifecycle: it starts with the simulator, and every consumer that
+    needs its output (Nav2 today) waits for ``publishes`` before bringing
+    itself up. Without this, Nav2's ``local_costmap`` activation blocks on a
+    TF only the adapter publishes and ``lifecycle_manager_navigation``
+    silently wedges before ``bt_navigator``.
+
+    Attributes:
+        package: ROS package of the node's executable.
+        executable: Executable name inside the package.
+        name: Node name.
+        parameters: ROS parameters. ``use_sim_time`` is added by the launch
+            from the graph's clock origin.
+        pass_robot_yaml: Also pass the deploy's resolved manifest path as the
+            node's ``robot_yaml`` parameter (the node must declare it).
+        publishes: Topics this node must be publishing before dependent
+            stacks (Nav2) are brought up.
+
+    Example:
+        >>> SimulatorBridgeSpec(package="openral_hal_lunar_bot", executable="sensor_bridge_node.py",
+        ...     name="openral_hal_lunar_bot_sensor_bridge", publishes=["/odom"]).pass_robot_yaml
+        False
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    package: str
+    executable: str
+    name: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    pass_robot_yaml: bool = False
+    publishes: list[str] = Field(default_factory=list)
+
+
+class ExternalSimulatorSpec(BaseModel):
+    """A ROS-attached external simulator ``deploy sim`` spawns and owns.
+
+    Some scenes are not stepped by OpenRAL at all — the sim is a separate
+    process reached only over ROS 2 topics, exactly like a real robot's
+    vendor driver (SRB/Isaac Lab today: OpenRAL never imports it, never
+    calls ``SimRollout.step``, and its ``robot.yaml`` ``hal.sim`` is the
+    *same* topic-bridge HAL class as ``hal.real`` — the only difference is
+    which process is on the other end). ``LaunchInclude`` is the analogous
+    real-path declaration (a vendor **launch file** to include); this is
+    its sim-path counterpart for a vendor **binary** to spawn, since SRB
+    has no ``ros2 launch`` entry point of its own.
+
+    The launch spawns this process before the HAL's ``configure`` and
+    blocks that transition until every ``ready_topics`` entry has a
+    publisher or ``boot_timeout_s`` elapses — the same discipline
+    ``openral_sim``'s sidecar backends use for their own out-of-process
+    boot, moved here because this process is ROS-native rather than a
+    ZMQ sidecar. On shutdown the launch terminates it by its exact spawned
+    PID, never a pattern match.
+
+    Attributes:
+        argv: Full command + arguments to spawn, e.g. ``["srb", "agent",
+            "ros", "--env", "panel_remount_visual", "--headless", …]``.
+        cwd: Working directory for the spawned process. ``None`` = the
+            launch's own cwd.
+        env_set: Environment variables to set/override for the spawned
+            process (e.g. ``ISAAC_SIM_PATH``).
+        env_unset: Environment variables to strip before spawning (e.g. a
+            conda ``CONDA_PREFIX``/``PYTHONPATH`` that would poison the
+            simulator's own interpreter resolution, which SRB needs).
+        env_path_exclude_substrings: Substrings that disqualify a ``PATH``
+            entry — the launch rebuilds the spawned process's ``PATH`` from
+            its own inherited one with any component containing one of
+            these dropped (e.g. ``"miniconda3"``, so a conda install ahead
+            of the system/venv Python on this host's ``PATH`` cannot shadow
+            it). Unlike ``env_unset``, ``PATH`` itself must stay set — this
+            filters its entries rather than removing the whole variable.
+            Empty = ``PATH`` passed through unfiltered.
+        ready_topics: ROS 2 topics that must each have at least one
+            publisher before the HAL is allowed to configure. Empty means
+            "don't gate" (not recommended — the HAL would race the
+            simulator's own boot).
+        boot_timeout_s: How long the readiness gate waits for
+            ``ready_topics`` before failing loudly, mirroring
+            ``openral_sim``'s sidecar ``boot_timeout_s`` contract.
+        publishes_clock: Whether this process publishes ``/clock`` — when
+            true, the graph runs on simulation time (``use_sim_time``) and
+            the HAL's own ``/clock`` publisher (present on every
+            manifest-driven HAL for the plain-wall-time case) is
+            suppressed rather than fighting over clock authority.
+        bridges: Adapter nodes that translate this simulator's topics into
+            OpenRAL's (see ``SimulatorBridgeSpec``). Started with the
+            simulator; Nav2 waits for their ``publishes`` topics.
+        attach_existing: When true, the launch does not spawn a new
+            process — it only gates on ``ready_topics`` against whatever
+            is already running (an operator-launched simulator on a
+            second terminal, e.g. for interactive debugging).
+            ``False`` (default): always spawn and own the process, mirroring
+            ``SidecarClient``'s default posture.
+
+    Example:
+        >>> ExternalSimulatorSpec(
+        ...     argv=["srb", "agent", "ros", "--headless"],
+        ...     ready_topics=["/clock"],
+        ... ).boot_timeout_s
+        600.0
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    argv: list[str] = Field(min_length=1)
+    cwd: str | None = None
+    env_set: dict[str, str] = Field(default_factory=dict)
+    env_unset: list[str] = Field(default_factory=list)
+    env_path_exclude_substrings: list[str] = Field(default_factory=list)
+    ready_topics: list[str] = Field(default_factory=list)
+    boot_timeout_s: float = Field(default=600.0, gt=0)
+    publishes_clock: bool = False
+    bridges: list[SimulatorBridgeSpec] = Field(default_factory=list)
+    attach_existing: bool = False
+
+
+class DeployRuntime(BaseModel):
+    """Committed deploy-posture toggles for a workcell scene.
+
+    Every runtime leg ``openral deploy sim`` / ``deploy run`` can bring up is
+    declared here so a committed ``DeployScene`` pins its posture
+    explicitly instead of relying on per-invocation CLI flags. Precedence is
+    ``CLI flag > scene runtime > auto`` — an explicit CLI flag always wins,
+    and ``None`` means "auto" (the manifest-derived / built-in default the CLI
+    documents for that flag: SLAM from ``capabilities.has_lidar``/vision-SLAM,
+    Nav2 tracks SLAM, octomap from a depth SensorSpec, detector on,
+    kernel-check on, reward monitor / critic off).
+
+    Host-operational knobs (dashboard, foxglove, ports, dataset recording,
+    ``--initial-task``, ``--dry-run``) stay CLI-only — they describe the
+    invocation, not the workcell.
+
+    Relative ``*_manifest`` / ``object_detector_onnx`` paths that exist next
+    to the scene YAML are resolved against the scene's directory; otherwise
+    the value is passed through verbatim (repo-relative default / alias).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enable_reasoner: bool | None = None
+    enable_slam: bool | None = None
+    enable_nav2: bool | None = None
+    localization: Literal["amcl"] | None = None
+    """How the mobile base is localized when SLAM is off. ``"amcl"`` runs ``nav2_amcl`` inside Nav2
+    against the static map the deploy memory bundle serves (``memory_dir``'s ``map.yaml``); AMCL
+    then authors ``map -> odom``, so the robot's odom bridge must not. ``None`` = SLAM or the
+    HAL owns that edge, as before."""
+    enable_octomap: bool | None = None
+    enable_octomap_kernel_check: bool | None = None
+    octomap_cloud_topic: str | None = None
+    """The ``PointCloud2`` topic ``octomap_server`` consumes as ``cloud_in``,
+    i.e. what the world map is actually built from. ``None`` = the launch
+    default ``/openral/cameras/front_depth/points``, which is published by the
+    **sim** sensor bridge's depth back-projection — so a ``hal_mode:=real``
+    deploy that leaves this unset gives ``octomap_server`` no input at all and
+    the map, ``/openral/world_voxels`` and the dashboard's pointcloud card all
+    stay empty.
+
+    On real hardware, set it to whatever the depth driver already publishes
+    rather than adding a conversion node: ``zed_wrapper`` emits
+    ``/<name>/point_cloud/cloud_registered``, RealSense ``/camera/depth/color/points``.
+    Only meaningful when ``enable_octomap`` resolves true."""
+    enable_object_detector: bool | None = None
+    object_detector_onnx: str | None = None
+    object_detector_manifest: str | None = None
+    object_detector_query: str | None = None
+    object_detector_locators: list[str] | None = None
+    enable_reward_monitor: bool | None = None
+    reward_monitor_manifest: str | None = None
+    reward_monitor_task: str | None = None
+    enable_critic: bool | None = None
+    enable_scene_vlm: bool | None = None
+    """Bring up the scene-VLM query service so the reasoner is offered the
+    read-only ``query_scene`` tool. ``None`` = off unless the CLI passes
+    ``--enable-scene-vlm``. Backward-compatible addition: a scene that omits it
+    behaves exactly as before."""
+    scene_vlm_manifest: str | None = None
+    """Path to the ``kind: "vlm"`` rSkill manifest backing ``query_scene``.
+    Scene-relative like the other manifest paths. ``None`` defaults to the
+    in-tree ``rskills/qwen35-4b-nf4``. Ignored unless ``enable_scene_vlm``."""
+    spatial_memory_ingest: bool | None = None
+    approach_skill_id: str | None = None
+    slam_visual_impl: Literal["isaac_ros", "pycuvslam"] | None = None
+    """Which cuVSLAM implementation the visual SLAM backend composes when
+    ``slam_backend`` resolves to ``"visual"`` (``capabilities.has_vision_slam``,
+    no lidar). Orthogonal to the backend choice: the backend is *what* sensing
+    modality localises the robot (lidar vs camera), this is *which engine binary*
+    the host has installed.
+
+    * ``"isaac_ros"`` — the composable ``isaac_ros_visual_slam`` C++ node
+      (``cuvslam.launch.py``). NITROS zero-copy + raw-image undistortion +
+      mono/IMU/RGB-D modes, but needs the operator's full Isaac ROS apt stack.
+    * ``"pycuvslam"`` — the same cuVSLAM engine run in-process from NVIDIA's
+      PyCuVSLAM pip wheel (``pycuvslam.launch.py``); rectified stereo only, no
+      apt stack. For sim hosts / GPU boxes without the Isaac ROS install.
+
+    ``None`` = ``"isaac_ros"`` (the established default — do not silently pick
+    ``pycuvslam`` just because the wheel is present; §1.4). Ignored unless the
+    resolved backend is ``"visual"``."""
+    slam_stereo_cameras: tuple[str, str] | None = None
+    """The ``(left, right)`` camera *names* forming the rectified stereo rig the
+    visual SLAM backend tracks, e.g. ``["left", "right"]`` or
+    ``["front_left", "front_right"]``. Each name maps by the OpenRAL convention
+    to ``/openral/cameras/<name>/image`` (+ ``/camera_info``); the launch
+    forwards those topics to whichever visual impl is composed (Isaac ROS
+    ``image_0/1_topic`` or PyCuVSLAM ``left/right_image_topic``). ``None`` =
+    the impl's built-in ``left``/``right`` default. The two names must differ."""
+    slam_mono_camera: str | None = None
+    """The single camera *name* the visual SLAM backend tracks in **mono RGBD**
+    mode — one RGB camera fused with the DA3 metric-depth provider for scale,
+    the lidar-less path for robots without a stereo rig. When set, the launch
+    points PyCuVSLAM at ``/openral/cameras/<name>/image`` (+ ``/camera_info``),
+    auto-composes the depth provider (so cuVSLAM *and* nvblox get depth), and
+    runs cuVSLAM's ``OdometryMode.RGBD``. ``pycuvslam``-only (the Isaac ROS
+    impl has its own RGB-D wiring). Mutually exclusive with
+    ``slam_stereo_cameras``; ``None`` = stereo/multi-camera."""
+    slam_depth_sidecar_autostart: bool = True
+    """Whether the deploy launch spawns the DA3 metric-depth sidecar
+    (``tools/da3_depth_sidecar.py``, ZMQ port 5771) alongside the mono visual
+    SLAM graph. Only meaningful when ``slam_mono_camera`` is set. ``False`` =
+    the sidecar is operator-run / shared (e.g. one sidecar serving several
+    deploys, or a dev venv via ``$OPENRAL_DA3_DEPTH_SIDECAR_VENV``). First
+    autostart provisions the sidecar venv, which can take minutes; the depth
+    provider retries until it answers."""
+
+    @model_validator(mode="after")
+    def _check_stereo_cameras(self) -> Self:
+        if self.slam_stereo_cameras is not None:
+            left, right = self.slam_stereo_cameras
+            if not left or not right:
+                raise ValueError("slam_stereo_cameras names must be non-empty")
+            if left == right:
+                raise ValueError(
+                    f"slam_stereo_cameras must name two distinct cameras, got {left!r} twice"
+                )
+        if self.slam_mono_camera is not None:
+            if not self.slam_mono_camera:
+                raise ValueError("slam_mono_camera must be a non-empty camera name")
+            if self.slam_stereo_cameras is not None:
+                raise ValueError(
+                    "slam_mono_camera and slam_stereo_cameras are mutually exclusive "
+                    "(mono RGBD tracks one camera; stereo tracks a pair)"
+                )
+        return self
+
+
+class DeployScene(BaseModel):
+    """Unified deploy/workcell scene for ``openral deploy sim`` and ``deploy run``.
+
+    Carries the physical/logical workcell: scene identity, optional robot mount,
+    sim composition, and deploy-time safety/collision tightening. No task, no
+    eval config — the reasoner/operator supplies goals at runtime.
+
+    ``composition`` lets a deploy scene declare the MJCF composer that
+    builds its environment (e.g. the openarm tabletop arena: table + cubes +
+    drawer + overview camera) instead of the robot manifest carrying it: the
+    robot manifest describes the robot, the scene describes the scene. ``openral
+    deploy sim`` threads it to the manifest-driven HAL node. ``openral deploy
+    run`` ignores it because real-world geometry is physical, not MJCF.
+
+    ``safety`` tightens the robot manifest's ``SafetyEnvelope``; loosening
+    is rejected before launch. ``extra_allowed_collision_pairs`` is the only
+    sanctioned collision loosening: additive per-pair ACM entries, never a global
+    self-collision disable.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scene: SceneSpec
+    robot_id: str | None = None
+    base_pose: Pose6D | None = None
+    seed: int = 0
+    """Simulator reset seed for ``deploy sim``. Ignored by ``deploy run``.
+    Defaults to 0, preserving the pre-field deploy-sim episode."""
+    composition: SceneComposition | None = None
+    safety: SafetyEnvelope | None = None
+    extra_allowed_collision_pairs: list[tuple[str, str]] = Field(default_factory=list)
+    sensors: list[SensorSpec] = Field(default_factory=list)
+    """Deploy-time sensor bindings for this workcell.
+
+    Two kinds of entry, distinguished by name:
+
+    * A name **matching** a robot-manifest sensor (``top`` / ``wrist``) is the
+      deploy-time binding for that robot sensor — the manifest keeps frames /
+      intrinsics authoritative; this entry carries the host-specific
+      ``SensorSpec.deploy_binding`` (``deploy run`` loads the robot manifest
+      from the canonical ``robots/<robot_id>/`` dir, so a detect-scaffolded
+      local robot.yaml is never on that path — the scene is where a committed
+      workcell binds the robot's cameras). On a name collision the scene entry
+      wins over the manifest entry.
+    * A **new** name is a workcell-mounted camera (overhead / front) —
+      physically part of the cell, not the robot.
+
+    Entries whose ``deploy_binding`` is set are opened by the real-deploy
+    sensor leg and published on ``/openral/cameras/<name>/image``."""
+    drivers: list[LaunchInclude] = Field(default_factory=list)
+    """Vendor sensor drivers this workcell needs on the bus.
+
+    A ``deploy_binding`` with a ``ros2_*`` backend subscribes to a topic somebody
+    else publishes; these are the launches that publish them. ``deploy run``
+    includes each one on the real path (``hal_mode:=real``) before the sensor leg
+    starts reading, so a camera reached over ROS comes up with the graph instead
+    of needing a second terminal — the failure mode otherwise is a silently empty
+    panel, not an error.
+
+    Empty for a workcell whose sensors OpenRAL opens directly (``opencv_thread``,
+    ``gstreamer``): those need no driver. Ignored on the sim path, where cameras
+    are rendered rather than driven."""
+    simulator: ExternalSimulatorSpec | None = None
+    """A ROS-attached external simulator (e.g. SRB/Isaac Lab) this scene's
+    sim path spawns and owns — see ``ExternalSimulatorSpec``. ``None`` (the
+    default, every other scene) means the sim is stepped in-process via
+    ``openral_sim.SCENES``/``SimAttachedHAL`` as usual; this field is for the
+    other kind of scene, where the sim is a separate process on the ROS bus
+    the launch must bring up, gate on, and tear down — the sim-path sibling
+    of ``drivers`` (real path). Ignored by ``deploy run``."""
+    hal: HalParameters | None = None
+    """Deploy-time HAL binding for this workcell.
+
+    The scene's host-specific HAL construction defaults — serial ``port``,
+    lerobot calibration identity (``id`` + ``calibration_dir``),
+    ``calibrate_on_connect`` — the same shape as the robot manifest's
+    ``HalEntrypoints.parameters``. This is the HAL analogue of the
+    per-sensor ``SensorSpec.deploy_binding``: the robot manifest stays
+    authoritative for the HAL *adapter* + generic defaults, while the committed
+    workcell scene carries the host-specific transport + calibration so
+    ``openral deploy run --config <scene>`` is self-contained (no ``--hal``
+    overrides needed). ``deploy run`` resolves a **relative** ``calibration_dir``
+    against this scene file's directory (mirroring the ``--hal`` behaviour) and
+    merges these defaults into the HAL params *above* the robot-manifest
+    defaults but *below* any explicit ``--hal`` override, so the precedence is
+    ``--hal`` > scene ``hal`` > ``robot.yaml`` ``hal.parameters.defaults``.
+    ``None`` = fall back to the manifest defaults + ``--hal`` overrides."""
+    memory_dir: str | None = None
+    """Path to a per-robot deploy memory bundle directory
+    holding any of ``MEMORY.md`` (self-maintained semantic memory), ``scene_graph.json``
+    (3D world-state graph → ``recall_object``), and ``map.yaml`` (2D occupancy grid →
+    nav2 ``map_server``). ``openral deploy sim`` derives the three launch paths from it
+    by convention (each artifact loaded by its correct consumer). ``--memory-dir`` on
+    the CLI overrides this. ``None`` = no bundle (the reasoner starts with empty
+    memory). Advisory only — never a safety-kernel input (§1.1)."""
+    runtime: DeployRuntime | None = None
+    """Committed deploy-posture toggles (see ``DeployRuntime``). ``None``
+    = every leg on its CLI/auto default. CLI flags override field-by-field."""
+    place_declaration: PlaceDeclaration | None = None
+    """Committed place-phase declaration for **direct** dispatch (ADR-0097).
+
+    A reasoner grounds the place target per goal and puts the declaration on
+    the ``ExecuteRskill`` goal, which wins over this. A direct dispatch has no
+    reasoner in the loop, and the scene is the only place that knows the task's
+    place target — so a counter→cabinet scene declares it here, and ``openral
+    deploy sim`` / ``deploy run`` inject it into the rSkill runner, which scopes
+    it to each goal it dispatches (armed on start, retracted on end / cancel /
+    E-stop).
+
+    ``None`` means no declaration, so no place witness can ever arm and payload
+    contact mid-carry stops the robot exactly as it does now. The declaration
+    licenses nothing on its own: it only makes measured support contact *on the
+    declared target* attestable.
+
+    A scene declares a target, never a **region**: a scene file cannot measure
+    geometry, and ``PlaceRegion.frame_id`` is the robot base frame, which on
+    a mobile base moves under any box a file could name. The producer that
+    resolves the target measures it (in sim, from the declared body's MuJoCo
+    subtree), so ``place_declaration.region`` is rejected here rather than
+    carried to the kernel — see ``_reject_scene_supplied_place_region``."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_vla_block(cls, v: object) -> object:
+        if isinstance(v, dict) and "vla" in v:
+            raise ROSConfigError(
+                "'vla:' block is not accepted in scene configs. Pass --rskill on the CLI instead."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _reject_scene_supplied_place_region(self) -> Self:
+        """A scene may declare a place *target*; it may never supply its region.
+
+        ADR-0097's amendment makes ``PlaceRegion`` producer-supplied: the
+        region is what buys the payload a reduced world-collision margin, and it
+        is only sound because a producer *measured* the declared target. A
+        committed scene is dispatch — it names a target it cannot measure, in a
+        base frame that moves — so a region here would arm a margin relaxation
+        around a volume nobody observed (hazard log HZ-0097-2/4). Rejecting it
+        leaves exactly the pre-amendment margins, which is the fail-closed
+        direction.
+        """
+        if self.place_declaration is not None and self.place_declaration.region is not None:
+            raise ValueError(
+                "place_declaration.region is producer-supplied (ADR-0097's 2026-08-14 "
+                "amendment): a scene file cannot measure the declared target's geometry, "
+                "and the region is expressed in the robot base frame, which moves. Declare "
+                "the target only — the evidence producer that resolves it attaches the "
+                "measured region."
+            )
+        return self
+
+    @classmethod
+    def from_yaml(cls, path: str) -> Self:
+        """Load and validate a scene YAML from disk.
+
+        Inherited by ``SimScene`` and ``BenchmarkScene``, which
+        validate against their own (stricter) schemas via ``cls``.
+        """
+        return _load_yaml_model(cls, path)
+
+
+class SimScene(DeployScene):
+    """Scene + task for ``openral sim run``.
+
+    All task fields are overridable at the CLI level. ``max_steps`` and
+    ``success_key`` are optional — omit them for open-ended experiments.
+    Accepts a BenchmarkScene YAML transparently (the eval-specific fields
+    ``n_episodes``, ``seed``, and ``metadata`` simply fill the defaults).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    task: TaskSpec
+    seed: int = 0
+    n_episodes: int = Field(default=1, gt=0)
+    record_video: bool = False
+    save_dir: str | None = None
+    metadata: dict[str, object] | BenchmarkMetadata = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _task_scene_id_matches(self) -> SimScene:
+        if self.task.scene_id != self.scene.id:
+            raise ValueError(
+                f"task.scene_id={self.task.scene_id!r} does not match scene.id={self.scene.id!r}"
+            )
+        return self
+
+
+class BenchmarkScene(SimScene):
+    """Full benchmark eval spec for ``openral benchmark``.
+
+    ``n_episodes``, ``seed``, and ``metadata`` are required with no
+    defaults — they must match the published evaluation protocol.
+    The task must supply ``success_key`` and ``max_steps``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    n_episodes: int = Field(gt=0)  # required — no default
+    seed: int  # required — no default
+    metadata: BenchmarkMetadata  # typed, required
+
+    @model_validator(mode="after")
+    def _require_task_eval_fields(self) -> BenchmarkScene:
+        if self.task.success_key is None:
+            raise ValueError(
+                "BenchmarkScene.task.success_key is required. "
+                "Set it to the env info[] key that signals success (e.g. 'is_success')."
+            )
+        if self.task.max_steps is None:
+            raise ValueError(
+                "BenchmarkScene.task.max_steps is required. "
+                "Set it to the paper's canonical step budget."
+            )
+        return self
+
+
+# ─── Standalone protocol descriptor (eval suites are bare lists now) ─────────
+#
+# A benchmark suite is a bare ``list[BenchmarkScene]`` on disk and in memory;
+# the suite id is the filename stem. Load via
+# ``openral_core.load_benchmark_suite`` and validate suite-level
+# invariants (uniform robot_id/n_episodes/seed/metadata; unique task ids;
+# non-empty) via ``openral_core.raise_on_invalid_suite``. Output is a
+# validated ``RSkillEvalResult`` JSON in
+# ``rskills/<vla>/eval/<benchmark_id>.json`` with ``reproduced_locally=true``.
+#
+# Each ``BenchmarkScene`` carries its own ``robot_id``, ``task``,
+# ``n_episodes``, ``seed``, and ``BenchmarkMetadata``.
+# ``ProtocolSpec`` below is a standalone schema for describing a
+# protocol outside a suite (design-doc drafts, benchmark-report tooling).
+
+
+class ProtocolSpec(BaseModel):
+    """Stand-alone eval-protocol descriptor.
+
+    Each ``BenchmarkScene`` now carries its own ``n_episodes`` /
+    ``seed`` / ``task.success_key`` / ``task.max_steps``; ``ProtocolSpec`` is
+    retained as a public schema for describing a protocol independently of a
+    suite (ADR drafts, benchmark-report tooling).
+
+    Pins the methodology so two rSkills evaluated under the same benchmark
+    produce apples-to-apples numbers (e.g. LIBERO: 10 episodes per task,
+    fixed seed range, ``is_success``).
+
+    Attributes:
+        n_episodes: Number of independent episodes per task. Honest
+            success rates need >= 10 per task for the published LIBERO /
+            MetaWorld protocols.
+        seeds: Seed list applied per task (paired index-wise with the
+            episode index). Length MUST be >= ``n_episodes``; runners
+            slice ``seeds[:n_episodes]`` so re-runs are reproducible.
+        success_key: ``info`` key on the gym ``step()`` return whose truthy
+            value marks task success. Default ``"is_success"`` (LIBERO
+            convention); MetaWorld uses ``"success"``.
+        max_steps: Per-task episode budget. Adapters may clip to
+            scene-internal limits; the value here is the protocol ceiling.
+        min_reps: Minimum number of completed episodes per task before the
+            result JSON is written. Guards against a crash mid-suite
+            producing a misleadingly partial roll-up. ``None`` means
+            "require every task x episode".
+
+    Example:
+        >>> p = ProtocolSpec(n_episodes=10, seeds=list(range(10)), max_steps=280)
+        >>> p.success_key
+        'is_success'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    n_episodes: int = Field(default=10, gt=0)
+    seeds: list[int] = Field(default_factory=lambda: list(range(10)))
+    success_key: str = "is_success"
+    max_steps: int = Field(default=280, gt=0)
+    min_reps: int | None = Field(default=None, ge=1)
+
+    def model_post_init(self, _context: object) -> None:
+        """Cross-field validation: seeds list must cover n_episodes."""
+        if len(self.seeds) < self.n_episodes:
+            raise ValueError(
+                f"ProtocolSpec.seeds has {len(self.seeds)} entries but "
+                f"n_episodes={self.n_episodes}; provide at least n_episodes "
+                f"seeds so re-runs are reproducible."
+            )
+        if self.min_reps is not None and self.min_reps > self.n_episodes:
+            raise ValueError(
+                f"ProtocolSpec.min_reps ({self.min_reps}) exceeds "
+                f"n_episodes ({self.n_episodes}); a benchmark cannot require "
+                f"more completed reps than it schedules."
+            )
+
+
+# ─── Inference runner ─────────────────────────────────────────────
+#
+# This introduces a hardware inference runner: the loop that closes
+# ``WorldState → Skill.step → HAL.send_action`` at a cadence, mirroring the
+# sim ``SimRunner`` for hardware. The schemas below are the on-disk
+# contract for ``openral deploy --config <yaml>`` (sibling of ``openral sim run``) and
+# the in-process record returned by the runner.
+#
+# These schemas are additive — they do not change ``SimEnvironment``,
+# ``RSkillEvalResult``, or any pre-existing model. ``SensorFrame`` and
+# ``FrameEncoding`` are declared earlier in this file because
+# ``WorldState.image_frames`` references them.
+
+
+class SensorReaderBackend(str, Enum):
+    """Which ``SensorReader`` implementation to instantiate.
+
+    ``opencv_thread`` is the default and mirrors lerobot's per-camera
+    background-thread pattern. ``galaxea_a1_camera_bridge`` consumes the
+    versioned paired raw-frame service owned by an external A1 Runtime process
+    without importing Runtime or opening either RealSense device.
+    ``ros2_image`` subscribes to a ROS 2 image topic published by a vendor
+    driver — the path for streams that exist only because an SDK computed them
+    (ZED stereo depth, RealSense aligned depth), which no ``/dev/video*`` read
+    can reach. ``gstreamer`` runs a GStreamer pipeline whose appsink
+    delivers frames (NVMM / DMA-BUF on Jetson; CPU bytes on x86).
+
+    ``holoscan`` is **reserved-but-unimplemented**: a 2026-05-12 evaluation
+    of NVIDIA Holoscan SDK as a parallel ingest backbone
+    deferred adoption (lean GStreamer with custom NvBufSurface glue
+    won the comparison). The enum value exists so a future PR can add
+    the backend additively without bumping the schema again; configs
+    that select it today raise ``ROSConfigError`` at factory time.
+    """
+
+    OPENCV_THREAD = "opencv_thread"
+    ROS2_IMAGE = "ros2_image"
+    GSTREAMER = "gstreamer"
+    HOLOSCAN = "holoscan"
+    GALAXEA_A1_CAMERA_BRIDGE = "galaxea_a1_camera_bridge"
+
+
+class DeadlineOverrunPolicy(str, Enum):
+    """What the inference runner does when a tick exceeds the deadline.
+
+    ``warn`` logs + records an OTel attribute but still sends the action
+    (mirrors lerobot's record loop). ``drop`` skips the action for this
+    tick — used when stale actions are worse than no action (e.g. velocity
+    control). ``raise`` is test-only: raises ``ROSDeadlineMissed``.
+    """
+
+    WARN = "warn"
+    DROP = "drop"
+    RAISE = "raise"
+
+
+class SensorReaderConfig(BaseModel):
+    """Per-sensor backend configuration for the inference runner.
+
+    Picks which ``SensorReader`` backend services a sensor and how the
+    pipeline is parameterised. The optional ``publish_to_ros`` tee lets a
+    GStreamer pipeline publish a downsampled stream to a ROS 2 topic for
+    observability (rosbag2 / rqt_image_view) without putting the hot path
+    through ROS.
+
+    Attributes:
+        sensor_id: Sensor name; MUST match a ``SensorSpec.name`` in the
+            target ``RobotDescription``.
+        backend: Which ``SensorReaderBackend`` to instantiate.
+        backend_params: Backend-specific keyword arguments forwarded to the
+            reader constructor. For ``gstreamer`` typically a single
+            ``"pipeline"`` string. For ``opencv_thread`` typically
+            ``{"device": "/dev/video0", "fps": 30}``.
+        max_age_ms: How stale a frame may be before
+            ``SensorReader.read_latest`` raises. Defaults to ~3 frames at
+            30 Hz.
+        publish_to_ros: If True, the reader tees a downsampled stream to
+            ``publish_topic`` at ``publish_rate_hz``.
+        publish_topic: ROS 2 topic to publish to when ``publish_to_ros`` is
+            True. Required iff ``publish_to_ros``.
+        publish_rate_hz: Downsample rate for the ROS tee.
+
+    Example:
+        >>> SensorReaderConfig(
+        ...     sensor_id="wrist_rgb",
+        ...     backend=SensorReaderBackend.GSTREAMER,
+        ...     backend_params={
+        ...         "pipeline": "v4l2src device=/dev/video0 ! "
+        ...         "nvv4l2decoder ! nvvideoconvert ! appsink"
+        ...     },
+        ...     publish_to_ros=True,
+        ...     publish_topic="/cameras/wrist_rgb/image_raw",
+        ...     publish_rate_hz=5.0,
+        ... ).backend.value
+        'gstreamer'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sensor_id: str
+    backend: SensorReaderBackend = SensorReaderBackend.OPENCV_THREAD
+    backend_params: dict[str, object] = Field(default_factory=dict)
+    max_age_ms: int = Field(default=100, gt=0)
+    publish_to_ros: bool = False
+    publish_topic: str | None = None
+    publish_rate_hz: float | None = Field(default=None, gt=0)
+
+    def model_post_init(self, _context: object) -> None:
+        """Cross-field validation for the ROS tee."""
+        if self.publish_to_ros and self.publish_topic is None:
+            raise ValueError(
+                f"SensorReaderConfig({self.sensor_id!r}): publish_to_ros is "
+                f"True but publish_topic is unset; a ROS tee needs a topic."
+            )
+        if self.publish_topic is not None and not self.publish_to_ros:
+            raise ValueError(
+                f"SensorReaderConfig({self.sensor_id!r}): publish_topic is "
+                f"set but publish_to_ros is False; enable publish_to_ros "
+                f"explicitly or drop the topic."
+            )
+
+
+class SensorDeployBinding(BaseModel):
+    """Real-device binding that lets ``openral deploy run`` open a sensor.
+
+    The runtime counterpart to ``SensorSpec.sim_placement``: ``sim_placement``
+    says how the **sim** renders a camera; ``deploy_binding`` says how a **real**
+    deploy opens it — which ``SensorReaderBackend`` and its
+    ``/dev/video*`` / pipeline parameters. It is host/site-specific (a
+    ``/dev/video*`` index differs per machine), so committed reference manifests
+    leave it unset and ``openral detect`` fills it per host.
+
+    A ``SensorSpec`` carries this wherever the sensor is *physically
+    mounted*: robot-mounted cameras (wrist / head) declare it in
+    ``robots/<id>/robot.yaml``; workcell-mounted cameras (overhead / front)
+    declare it on a ``DeployScene.sensors`` entry. Either way the deploy
+    sensor leg (``openral_rskill_ros.sensor_leg``) opens every
+    ``SensorSpec`` that carries one and publishes it on
+    ``/openral/cameras/<name>/image``.
+
+    Attributes:
+        backend: Which ``SensorReaderBackend`` opens the device.
+        backend_params: Backend-specific reader kwargs, e.g.
+            ``{"device": "/dev/video0", "fps": 30}`` for ``opencv_thread`` or a
+            ``{"pipeline": ...}`` string for ``gstreamer``.
+        max_age_ms: How stale a frame may be before the reader raises.
+
+    Example:
+        >>> SensorDeployBinding(
+        ...     backend=SensorReaderBackend.OPENCV_THREAD,
+        ...     backend_params={"device": "/dev/video0", "fps": 30},
+        ... ).backend.value
+        'opencv_thread'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: SensorReaderBackend = SensorReaderBackend.OPENCV_THREAD
+    backend_params: dict[str, object] = Field(default_factory=dict)
+    max_age_ms: int = Field(default=100, gt=0)
+
+
+# `SensorSpec.deploy_binding` forward-references `SensorDeployBinding`, which the
+# reader schemas (and their `SensorReaderBackend` enum) define here rather than
+# up at `SensorSpec`. Resolve that annotation now that the target exists.
+SensorSpec.model_rebuild()
+# `PlaceRegion.geometry` names `AttachedCollisionPrimitive`, which this module
+# defines several hundred lines BELOW `PlaceRegion` — the place-phase schemas
+# were written before a declared target carried geometry. `from __future__
+# import annotations` defers the annotation; this resolves it. `PlaceDeclaration`
+# embeds a `PlaceRegion`, so it is rebuilt with it.
+PlaceRegion.model_rebuild()
+PlaceDeclaration.model_rebuild()
+
+
+class HalConfig(BaseModel):
+    """Configuration for a HAL adapter instantiation by the inference runner.
+
+    Picks which HAL adapter class to use (sim digital twin vs real hardware)
+    and how to reach the robot (serial port, FCI URI, ROS 2 namespace).
+    Adapter-specific fields are forwarded as ``params``.
+
+    Attributes:
+        adapter: HAL adapter id, e.g. ``"so100_follower"``,
+            ``"so100_digital_twin"``, ``"franka_panda_real"``, ``"ur5e_real"``,
+            ``"ros_control"``. Resolved against the HAL registry.
+        transport: Transport-layer parameters. Examples:
+            ``{"port": "/dev/ttyACM0", "baud": 1_000_000}`` for SO-100;
+            ``{"fci_uri": "172.16.0.2"}`` for Franka;
+            ``{"namespace": "/ur5e"}`` for ros2_control.
+        params: Adapter-specific keyword arguments forwarded to the
+            constructor (e.g. calibration overrides).
+
+    Example:
+        >>> HalConfig(
+        ...     adapter="so100_follower",
+        ...     transport={"port": "/dev/ttyACM0", "baud": 1_000_000},
+        ... ).adapter
+        'so100_follower'
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    adapter: str
+    transport: dict[str, object] = Field(default_factory=dict)
+    params: dict[str, object] = Field(default_factory=dict)
+
+
+class TickResult(BaseModel):
+    """One tick's record returned by ``InferenceRunner.tick``.
+
+    Carries the timing breakdown so the parent OTel span can attach exact
+    sub-stage durations and the latency budget enforcement can flag
+    violations without re-instrumenting.
+
+    The hardware fields (``sensors_ms``..``hal_ms``, ``safety_violations``,
+    ``action_applied``) are the original (v1) surface used by
+    ``DeployRunner``. The sim-specific fields
+    (``step_idx``..``truncated``) were added when
+    ``SimRunner`` adopted per-step tick semantics; hardware leaves
+    them at their defaults (``None``), so a hardware tick serialises
+    identically to v1 under ``model_dump(exclude_none=True)``.
+
+    Attributes:
+        stamp_ns: Tick wall-clock timestamp in nanoseconds (tick start).
+        tick_idx: 0-indexed tick counter within a run.
+        sensors_ms: ``SensorReader.read_latest`` total wall-time.
+        world_state_ms: ``WorldStateAggregator.snapshot`` wall-time.
+        inference_ms: ``Skill.step`` wall-time (the chunk dispatch cost,
+            not the full chunked inference — see ``ChunkedExecutor``).
+        safety_ms: Safety check wall-time.
+        hal_ms: ``HAL.send_action`` wall-time.
+        tick_ms: End-to-end tick wall-time including the rate-limiter
+            overhead.
+        chunk_index: Index of the action played out from a chunked
+            executor. ``None`` for non-chunked skills.
+        safety_violations: List of safety-violation reason strings emitted
+            during this tick. Non-empty implies the action was either
+            clamped or dropped per the safety policy.
+        action_applied: ``False`` when the
+            ``DeadlineOverrunPolicy`` was ``drop`` and the runner
+            elected not to publish this tick's action, **or** when a sim
+            tick is the reset-tick between episodes (no inference / env
+            step happened).
+        step_idx: 0-indexed step within the current episode. Set by
+            ``SimRunner`` on step-ticks; ``None`` on hardware ticks
+            and on sim reset-ticks.
+        episode_idx: 0-indexed episode within the current run. Set by
+            ``SimRunner`` on every tick (including reset-ticks);
+            ``None`` on hardware ticks.
+        reward: Env step reward for this tick. Set by ``SimRunner``
+            on step-ticks; ``None`` on hardware ticks and reset-ticks.
+        terminated: Whether the env signalled natural termination this
+            tick. Set by ``SimRunner``; ``None`` elsewhere.
+        truncated: Whether the env hit its step budget this tick. Set by
+            ``SimRunner``; ``None`` elsewhere.
+        trace_context: Full W3C ``traceparent`` for this tick's
+            ``rskill.tick`` span, in the form
+            ``00-<trace_id_hex>-<span_id_hex>-<flags_hex>``. Optional —
+            set by the runner when an OTel context is active so offline
+            consumers (dataset writers, post-hoc analysers) can resume
+            the trace without re-deriving it from the live span. Default
+            ``None`` for byte-identical v1 JSON under
+            ``model_dump(exclude_none=True)``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    stamp_ns: int = Field(ge=0)
+    tick_idx: int = Field(ge=0)
+    sensors_ms: float = Field(default=0.0, ge=0)
+    world_state_ms: float = Field(default=0.0, ge=0)
+    inference_ms: float = Field(default=0.0, ge=0)
+    safety_ms: float = Field(default=0.0, ge=0)
+    hal_ms: float = Field(default=0.0, ge=0)
+    tick_ms: float = Field(ge=0)
+    chunk_index: int | None = None
+    safety_violations: list[str] = Field(default_factory=list)
+    action_applied: bool = True
+    # Sim-only fields. Default None so hardware ticks
+    # round-trip byte-identically with v1 JSON under exclude_none=True.
+    step_idx: int | None = Field(default=None, ge=0)
+    episode_idx: int | None = Field(default=None, ge=0)
+    reward: float | None = None
+    terminated: bool | None = None
+    truncated: bool | None = None
+    # OTel design doc §7 P1: persist the W3C traceparent for offline
+    # consumers. The value at runtime is the live span's parent — the
+    # field is purely a serialised escape hatch for dataset writers /
+    # openral replay. Always optional so existing JSON round-trips under
+    # exclude_none=True.
+    trace_context: str | None = None
+
+
+class RunResult(BaseModel):
+    """Aggregated summary returned by ``InferenceRunner.run``.
+
+    Attributes:
+        n_ticks: Total ticks executed.
+        success: Task success when the runner has a success signal (sim,
+            scripted goal). ``None`` for open-ended hardware runs.
+        budget_violations: Count of ticks whose ``tick_ms`` exceeded the
+            rSkill manifest's ``RSkillLatencyBudget.per_chunk_ms``.
+        avg_inference_ms: Mean of ``TickResult.inference_ms``.
+        p99_inference_ms: 99th-percentile of ``TickResult.inference_ms``.
+        avg_tick_ms: Mean of ``TickResult.tick_ms``.
+        p99_tick_ms: 99th-percentile of ``TickResult.tick_ms``.
+        trace_id: OTel trace id (hex) of the run's root span. ``None`` when
+            tracing is not configured.
+        save_dir: Directory where artefacts were written, when configured.
+        metadata: Free-form metadata (runner id, host, git SHA, …).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    n_ticks: int = Field(ge=0)
+    success: bool | None = None
+    budget_violations: int = Field(default=0, ge=0)
+    avg_inference_ms: float = Field(default=0.0, ge=0)
+    p99_inference_ms: float = Field(default=0.0, ge=0)
+    avg_tick_ms: float = Field(default=0.0, ge=0)
+    p99_tick_ms: float = Field(default=0.0, ge=0)
+    trace_id: str | None = None
+    save_dir: str | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
+
+
+# ─── Failure evidence ────────────────────────────────────────────
+
+
+class _FailureEvidenceBase(BaseModel):
+    """Common base for every ``FailureEvidence`` variant.
+
+    Each variant declares ``kind: Literal["..."] = "..."`` as the
+    discriminator field. Subclasses must set ``kind`` to the exact
+    string the union dispatcher matches on.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class TimeoutEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_TIMEOUT`` — an operation missed its deadline.
+
+    Attributes:
+        kind: Discriminator (always ``"timeout"``).
+        operation: Short name of the operation that timed out (e.g.
+            ``"skill.step"``, ``"hal.read_state"``, ``"reasoner.tick"``).
+        deadline_s: Configured deadline in seconds.
+        elapsed_s: Actual elapsed wall-clock time in seconds.
+    """
+
+    kind: Literal["timeout"] = "timeout"
+    operation: str
+    deadline_s: float = Field(gt=0)
+    elapsed_s: float = Field(ge=0)
+
+
+class ForceEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_FORCE`` — measured force exceeded a safety limit.
+
+    Attributes:
+        kind: Discriminator (always ``"force"``).
+        joint_or_ee: Name of the joint or end-effector that tripped the limit.
+        measured_n: Measured force in newtons.
+        limit_n: Configured ceiling in newtons.
+    """
+
+    kind: Literal["force"] = "force"
+    joint_or_ee: str
+    measured_n: float
+    limit_n: float = Field(gt=0)
+
+
+class WorkspaceEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_WORKSPACE`` — EE pose left the safety AABB.
+
+    Attributes:
+        kind: Discriminator (always ``"workspace"``).
+        ee_name: End-effector that violated the box.
+        measured_xyz: Measured position in metres.
+        box_min: Box minimum corner (``x_min, y_min, z_min``).
+        box_max: Box maximum corner (``x_max, y_max, z_max``).
+    """
+
+    kind: Literal["workspace"] = "workspace"
+    ee_name: str
+    measured_xyz: tuple[float, float, float]
+    box_min: tuple[float, float, float]
+    box_max: tuple[float, float, float]
+
+
+class PerceptionStaleEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_PERCEPTION`` — a sensor frame went stale.
+
+    Attributes:
+        kind: Discriminator (always ``"perception"``).
+        sensor_id: ``SensorSpec.name`` of the stale sensor.
+        staleness_ms: Observed age of the last frame, in milliseconds.
+        threshold_ms: Staleness threshold that was crossed, in milliseconds.
+    """
+
+    kind: Literal["perception"] = "perception"
+    sensor_id: str
+    staleness_ms: float = Field(ge=0)
+    threshold_ms: float = Field(gt=0)
+
+
+class CriticEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_CRITIC`` — a critic flagged an action below threshold.
+
+    Attributes:
+        kind: Discriminator (always ``"critic"``).
+        critic_id: Identifier of the critic that fired (model id or hand-rolled).
+        score: Critic output in the critic's native range.
+        threshold: Configured pass threshold.
+    """
+
+    kind: Literal["critic"] = "critic"
+    critic_id: str
+    score: float
+    threshold: float
+
+
+class ControllerEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_CONTROLLER`` — a ros2_control controller faulted.
+
+    Attributes:
+        kind: Discriminator (always ``"controller"``).
+        controller_name: Failing controller (e.g. ``"joint_trajectory_controller"``).
+        state: Reported controller state (e.g. ``"inactive"``, ``"error"``).
+        detail: Free-form detail from the controller manager.
+    """
+
+    kind: Literal["controller"] = "controller"
+    controller_name: str
+    state: str
+    detail: str = ""
+
+
+class SelfVerifyEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_SELFVERIFY`` — a self-check failed.
+
+    Attributes:
+        kind: Discriminator (always ``"selfverify"``).
+        check: Short check identifier (e.g. ``"action_chunk.shape"``).
+        expected: Expected value as a string.
+        observed: Observed value as a string.
+    """
+
+    kind: Literal["selfverify"] = "selfverify"
+    check: str
+    expected: str
+    observed: str
+
+
+class HumanEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_HUMAN`` — a human triggered an intervention.
+
+    Attributes:
+        kind: Discriminator (always ``"human"``).
+        actor: Identifier of the operator (e.g. ``"slack:alice"``, ``"gui"``).
+        reason: Free-form reason given by the actor.
+    """
+
+    kind: Literal["human"] = "human"
+    actor: str
+    reason: str = ""
+
+
+class WamEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_WAM`` — a world-action-model discrepancy.
+
+    Attributes:
+        kind: Discriminator (always ``"wam"``).
+        horizon: Rollout horizon at which the discrepancy was measured.
+        discrepancy: Scalar discrepancy in the WAM's native units.
+        wam_id: Identifier of the WAM that fired.
+    """
+
+    kind: Literal["wam"] = "wam"
+    horizon: int = Field(gt=0)
+    discrepancy: float
+    wam_id: str
+
+
+class ReasonerTimeoutEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_REASONER_TIMEOUT`` — the LLM call missed its deadline.
+
+    Attributes:
+        kind: Discriminator (always ``"reasoner_timeout"``).
+        model: Model identifier (e.g. ``"claude-opus-4-7"``).
+        deadline_s: Configured deadline in seconds.
+        elapsed_s: Actual elapsed wall-clock time in seconds.
+    """
+
+    kind: Literal["reasoner_timeout"] = "reasoner_timeout"
+    model: str
+    deadline_s: float = Field(gt=0)
+    elapsed_s: float = Field(ge=0)
+
+
+class CollisionEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_COLLISION`` — a proposed motion would collide.
+
+    Attributes:
+        kind: Discriminator (always ``"collision"``).
+        collision_kind: ``"self"`` (link vs link) or ``"world"`` (link vs
+            obstacle).
+        link_a: Robot link whose collision volume tripped the check.
+        link_b_or_object: The other robot link (self-collision) or the world
+            object / occupancy region (world-collision).
+        horizon_step: Chunk step (horizon index) where the collision was first
+            detected, or ``REACTIVE_HORIZON_STEP`` (``-1``) when the hit is a
+            REACTIVE one — the robot's *measured* configuration already
+            collides, so no prediction step is involved. The C++ safety kernel
+            emits ``-1`` for that check (``check_config(q_meas, -1)`` in
+            ``cpp/openral_safety_kernel/src/lifecycle_kernel.cpp``); it is the
+            common case for Cartesian control modes, whose reactive
+            measured-state check is the guaranteed floor.
+        min_distance_m: Signed minimum distance at detection, in metres
+            (negative means interpenetration).
+        joint_positions_rad: The configuration the kernel ran forward
+            kinematics on for ``horizon_step`` — the exact vector handed to
+            ``forward_kinematics``, in the envelope's dof order, with mobile-base
+            dofs zeroed (the kernel checks the arm in ``base_link``). This is
+            what makes a stop adjudicatable: a *predicted* step's configuration
+            exists in no other artifact, because it depends on the kernel's own
+            damped-least-squares Jacobian, its lambda and its seed dt — so
+            replaying such a stop against the measured joints reads geometry the
+            kernel never checked. Empty only on a record emitted before the field
+            existed: a kernel that reports a collision has a collision model by
+            construction, and its FK buffer is always ``n_dof`` long.
+    """
+
+    #: Sentinel ``horizon_step`` for a reactive (measured-state) collision.
+    REACTIVE_HORIZON_STEP: ClassVar[int] = -1
+
+    kind: Literal["collision"] = "collision"
+    collision_kind: Literal["self", "world"]
+    link_a: str
+    link_b_or_object: str
+    horizon_step: int = Field(ge=REACTIVE_HORIZON_STEP)
+    min_distance_m: float
+    joint_positions_rad: list[float] = Field(default_factory=list)
+
+    @property
+    def is_reactive(self) -> bool:
+        """``True`` when the hit came from the measured-state (reactive) check."""
+        return self.horizon_step == CollisionEvidence.REACTIVE_HORIZON_STEP
+
+
+class SuppressedSummaryEvidence(_FailureEvidenceBase):
+    """Evidence for ``KIND_SUPPRESSED_SUMMARY`` — rolling rate-limit roll-up.
+
+    Emitted at ~1 Hz by ``openral_observability.FailureBusPublisher``
+    when one or more ``(kind, severity)`` buckets dropped events during
+    the past window.
+
+    Attributes:
+        kind: Discriminator (always ``"suppressed_summary"``).
+        window_s: Length of the summarized window, in seconds.
+        kinds: Parallel array of suppressed ``KIND_*`` values.
+        severities: Parallel array of suppressed ``SEVERITY_*`` values.
+        counts: Parallel array of dropped-event counts per bucket.
+    """
+
+    kind: Literal["suppressed_summary"] = "suppressed_summary"
+    window_s: float = Field(gt=0)
+    kinds: list[int] = Field(default_factory=list)
+    severities: list[int] = Field(default_factory=list)
+    counts: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_parallel_arrays(self) -> SuppressedSummaryEvidence:
+        """Enforce that ``kinds`` / ``severities`` / ``counts`` are parallel."""
+        if not (len(self.kinds) == len(self.severities) == len(self.counts)):
+            msg = (
+                "SuppressedSummaryEvidence requires parallel arrays "
+                f"(kinds={len(self.kinds)}, severities={len(self.severities)}, "
+                f"counts={len(self.counts)})"
+            )
+            raise ROSConfigError(msg)
+        return self
+
+
+FailureEvidence: TypeAlias = (
+    TimeoutEvidence
+    | ForceEvidence
+    | WorkspaceEvidence
+    | PerceptionStaleEvidence
+    | CriticEvidence
+    | ControllerEvidence
+    | SelfVerifyEvidence
+    | HumanEvidence
+    | WamEvidence
+    | ReasonerTimeoutEvidence
+    | CollisionEvidence
+    | SuppressedSummaryEvidence
+)
+"""Discriminated union for ``FailureTrigger.evidence_json`` payloads.
+
+The discriminator field is ``kind`` (a string Literal on each variant).
+Consumers decode an incoming ``evidence_json`` string with::
+
+    from pydantic import TypeAdapter
+    from openral_core import FailureEvidence
+
+    evidence = TypeAdapter(FailureEvidence).validate_json(msg.evidence_json)
+
+Producers serialize via ``evidence.model_dump_json()``.
+
+The union mirrors the ``KIND_*`` constants on
+``openral_msgs/msg/FailureTrigger``. Adding a new
+variant requires adding a new ``KIND_*`` constant to the IDL.
+"""
+
+
+# ─── Perception event metadata ───────────────────────────────────
+
+
+class _PerceptionEventBase(BaseModel):
+    """Common base for every ``PerceptionEventMetadata`` variant.
+
+    Each variant declares ``kind: Literal["..."] = "..."`` as the
+    discriminator field. The discriminator is identical to the
+    ``/openral/perception/<kind>`` ROS 2 topic suffix the
+    ``openral_runner.backends.gstreamer.perception_tee.PerceptionEventPublisher``
+    publishes onto ("Topology of /openral/perception/events").
+    Producers serialise via ``model_dump_json()`` and stuff the result
+    into ``PromptStamped.metadata_json``; consumers decode with
+    ``TypeAdapter(PerceptionEventMetadata).validate_json(...)``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sensor_id: str
+    """``SensorSpec.name`` of the camera that emitted the event."""
+
+
+class ObjectDetection2D(BaseModel):
+    """A single 2D detection inside an ``ObjectsMetadata`` event.
+
+    The 3D ``DetectedObject`` lives in ``WorldState``; the 2D
+    form here is what a per-camera detector (``nvinfer``, ``tflite``,
+    ``cv2``-CPU) emits before any pose lift / fusion.
+
+    Attributes:
+        label: Semantic class label as produced by the model.
+        confidence: Detection confidence in ``[0, 1]``.
+        bbox_xyxy: Axis-aligned bounding box in pixels
+            ``(x_min, y_min, x_max, y_max)``; image origin top-left.
+        det_id: Stable per-detector, per-camera identity, assigned by
+            a 2D-IoU tracker at detection time so an object can be referred to and
+            de-duplicated even when the 3D lift cannot run (RGB-only / no depth).
+            ``-1`` means untracked (legacy detectors / single-shot). Propagated
+            into ``DetectedObject.track_id`` by the lift so a physical object
+            carries one id whether it appears in the camera-space ``in_view`` line
+            (no depth) or the 3D ``scene_objects`` line (depth).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    label: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    bbox_xyxy: tuple[int, int, int, int]
+    det_id: int = -1
+
+
+class MotionMetadata(_PerceptionEventBase):
+    """Perception event for ``/openral/perception/motion``.
+
+    Emitted when a frame-difference detector measures sub-frame motion
+    above a configured threshold. ``region_bbox`` is set when the
+    detector localises the moving pixels (top-left origin in pixels);
+    ``None`` means "motion magnitude only, no localisation."
+
+    Attributes:
+        kind: Discriminator (always ``"motion"``).
+        magnitude: Mean absolute per-pixel difference, normalised to
+            ``[0, 1]`` against the encoding's full-scale range.
+        threshold: Magnitude threshold that fired the event.
+        region_bbox: Optional bounding box ``(x_min, y_min, x_max, y_max)``
+            of the moving region in pixels.
+    """
+
+    kind: Literal["motion"] = "motion"
+    magnitude: float = Field(ge=0.0, le=1.0)
+    threshold: float = Field(ge=0.0, le=1.0)
+    region_bbox: tuple[int, int, int, int] | None = None
+
+
+class ObjectsMetadata(_PerceptionEventBase):
+    """Perception event for ``/openral/perception/objects``.
+
+    Emitted by the event leg's detector element (``nvinfer`` on Jetson,
+    ``tflite`` on CPU, etc.) when one or more objects are detected.
+
+    Attributes:
+        kind: Discriminator (always ``"objects"``).
+        detections: Per-object 2D detections, ordered by descending
+            ``confidence``.
+        model_id: Identifier of the detector that fired (e.g.
+            ``"yolov8n"``, ``"nvinfer:resnet50"``).
+        frame_width: Pixel width of the frame the detector ran on; the
+            ``bbox_xyxy`` of each detection is in this pixel space (the
+            cross-frame lift scales it to the sensor's intrinsics resolution).
+        frame_height: Pixel height of that frame.
+    """
+
+    kind: Literal["objects"] = "objects"
+    detections: list[ObjectDetection2D]
+    model_id: str
+    frame_width: int = Field(gt=0)
+    frame_height: int = Field(gt=0)
+
+
+class OcrMetadata(_PerceptionEventBase):
+    """Perception event for ``/openral/perception/ocr``.
+
+    Attributes:
+        kind: Discriminator (always ``"ocr"``).
+        text: Recognised text (already stripped of leading / trailing
+            whitespace by the detector).
+        confidence: Recogniser confidence in ``[0, 1]``.
+        region_bbox: Optional bounding box ``(x_min, y_min, x_max, y_max)``
+            of the recognised region in pixels.
+    """
+
+    kind: Literal["ocr"] = "ocr"
+    text: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    region_bbox: tuple[int, int, int, int] | None = None
+
+
+class SceneChangeMetadata(_PerceptionEventBase):
+    """Perception event for ``/openral/perception/scene_change``.
+
+    Emitted when a histogram / structural-similarity detector measures a
+    frame-to-frame distance above a configured threshold — typically
+    used to wake the reasoner when the scene has changed enough to
+    warrant a re-plan.
+
+    Attributes:
+        kind: Discriminator (always ``"scene_change"``).
+        distance: Frame-to-frame distance in the detector's native
+            metric (e.g. ``cv2.HISTCMP_CHISQR_ALT`` distance, ``1 - ssim``).
+        threshold: Distance threshold that fired the event.
+        metric: Identifier of the distance metric (e.g. ``"chisqr_alt"``,
+            ``"1-ssim"``, ``"hellinger"``).
+    """
+
+    kind: Literal["scene_change"] = "scene_change"
+    distance: float = Field(ge=0.0)
+    threshold: float = Field(ge=0.0)
+    metric: str
+
+
+PerceptionEventMetadata: TypeAlias = (
+    MotionMetadata | ObjectsMetadata | OcrMetadata | SceneChangeMetadata
+)
+"""Discriminated union for ``PromptStamped.metadata_json`` payloads on the
+``/openral/perception/<kind>`` topics.
+
+The discriminator field is ``kind`` (a string ``Literal`` on each
+variant). Consumers decode an incoming ``metadata_json`` string with::
+
+    from pydantic import TypeAdapter
+    from openral_core import PerceptionEventMetadata
+
+    metadata = TypeAdapter(PerceptionEventMetadata).validate_json(msg.metadata_json)
+
+Producers serialise via ``metadata.model_dump_json()``.
+
+The four variants map 1:1 onto the four per-kind topics fixed in
+the perception-event contract (``motion``, ``objects``, ``ocr``, ``scene_change``).
+Adding a new variant requires adding a new ``/openral/perception/<kind>``
+topic to the contract — by design, new kinds get new topics, not a
+schema bump, so subscribers can subscribe to exactly the kinds they
+care about.
+"""
+
+
+# ─── Reasoner model registry ─────────────────────────────────────
+
+ReasonerDialect = Literal["anthropic", "openai"]
+"""Wire client an endpoint speaks — the only two the reasoner ships (ADR-0088)."""
+
+ReasonerHosting = Literal["cloud", "managed_local", "byo_local"]
+"""Where a reasoner model runs: a vendor's cloud, a server OpenRAL spawns and
+manages locally, or a local server the operator brings up themselves."""
+
+# The ``managed`` sentinel in ``ReasonerModel.default_endpoint`` means "OpenRAL
+# spawns the server" rather than a fixed URL — resolved to the model's managed
+# loopback endpoint (e.g. the Cosmos sidecar's ``:8901``) at client-build time.
+REASONER_MANAGED_ENDPOINT: str = "managed"
+
+
+class ReasonerModel(BaseModel):
+    """A curated reasoner LLM — a member of ``REASONER_MODELS`` (ADR-0088).
+
+    Membership in ``REASONER_MODELS`` *is* the "tested for robotics tool
+    calling" signal: every entry has been validated to reliably emit the
+    discriminated ``ReasonerToolCall`` union (per-skill ``execute_rskill__*``
+    tools, nested ``GroundedSubtask``, ``tool_choice`` honoured). There is
+    deliberately no ``robotics_tool_calling`` flag — an untested model is simply
+    not in the registry, and is reachable only through the uncurated escape hatch
+    with a warning.
+
+    This model reorganises reasoner selection away from the location-leaking
+    ``OPENRAL_REASONER_LLM_PROVIDER`` enum it replaced (ADR-0088; that spelling
+    was removed in 0.3.0): the primary choice is the *model*; *where* it runs is
+    the orthogonal, honest ``endpoint`` axis.
+
+    Attributes:
+        id: Catalog key (``"cosmos3-edge"``, ``"claude-opus-4-8"``). The value of
+            ``OPENRAL_REASONER_MODEL``.
+        display_name: Human-facing label.
+        dialect: Which wire client speaks to this model (``anthropic`` uses the
+            Messages API; ``openai`` uses Chat Completions — vLLM, OpenRouter,
+            the Cosmos sidecar, etc. are all ``openai``).
+        hosting: ``cloud`` (vendor-run), ``managed_local`` (OpenRAL spawns the
+            server), or ``byo_local`` (operator-run local server).
+        served_model_id: The id the *endpoint* expects, which may differ from
+            ``id`` (``"openai/gpt-5.5"`` on OpenRouter, ``"nvidia/Cosmos3-Edge"``
+            on the sidecar).
+        default_endpoint: Vendor URL, loopback URL, the
+            ``REASONER_MANAGED_ENDPOINT`` sentinel, or ``None`` (the
+            dialect's vendor default — e.g. the Anthropic API).
+        auth_required: Whether the resolved endpoint needs an API key.
+        tool_choice: ``"required"`` forces one tool call per tick (the reasoner
+            contract); ``"auto"`` for endpoints that reject ``"required"``.
+        max_tokens_default: Optional completion-token cap applied when the
+            operator sets none — bounds a metered gateway's up-front reservation
+            for reasoning models (GPT-5.x). ``None`` sends no cap.
+        min_gpu_vram_gb: BF16-resident VRAM floor for a comfortable local fit.
+            ``None`` for ``cloud`` models (not a local-compute question).
+        required_dtype: Dtype the local runtime must support, matched against
+            ``ComputeSpec.gpu_supported_dtypes``. ``None`` for cloud models.
+        weights_license: Informational weights-license posture for local models
+            (§1.9), e.g. ``"OpenMDW-1.1"``. ``None`` for cloud API models
+            (OpenRAL never holds their weights).
+
+    Example:
+        >>> m = REASONER_MODELS["cosmos3-edge"]
+        >>> m.dialect, m.hosting, m.auth_required
+        ('openai', 'managed_local', False)
+        >>> REASONER_MODELS["claude-opus-4-8"].dialect
+        'anthropic'
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1)
+    display_name: str = Field(min_length=1)
+    dialect: ReasonerDialect
+    hosting: ReasonerHosting
+    served_model_id: str = Field(min_length=1)
+    default_endpoint: str | None = None
+    auth_required: bool
+    tool_choice: Literal["required", "auto"] = "required"
+    max_tokens_default: int | None = None
+    min_gpu_vram_gb: float | None = None
+    required_dtype: QuantizationDtype | None = None
+    weights_license: str | None = None
+
+    @property
+    def is_local(self) -> bool:
+        """True for ``managed_local`` / ``byo_local`` (needs local compute)."""
+        return self.hosting != "cloud"
+
+
+# OpenRouter's OpenAI-compatible endpoint — the default gateway for the curated
+# GPT-5.x entries (a metered router, hence the max_tokens caps below).
+_OPENROUTER_ENDPOINT: str = "https://openrouter.ai/api/v1"
+
+# The curated set. Adding a model = adding one entry here after it clears the
+# reasoner tool-calling bar; curation lives in this one reviewable place.
+REASONER_MODELS: dict[str, ReasonerModel] = {
+    "claude-opus-4-8": ReasonerModel(
+        id="claude-opus-4-8",
+        display_name="Claude Opus 4.8 (Anthropic)",
+        dialect="anthropic",
+        hosting="cloud",
+        served_model_id="claude-opus-4-8",
+        default_endpoint=None,  # Anthropic Messages API default
+        auth_required=True,
+    ),
+    "gpt-5.5": ReasonerModel(
+        id="gpt-5.5",
+        display_name="GPT-5.5 (via OpenRouter)",
+        dialect="openai",
+        hosting="cloud",
+        served_model_id="openai/gpt-5.5",
+        default_endpoint=_OPENROUTER_ENDPOINT,
+        auth_required=True,
+        max_tokens_default=16384,
+    ),
+    "gpt-5.6": ReasonerModel(
+        id="gpt-5.6",
+        display_name="GPT-5.6 (via OpenRouter)",
+        dialect="openai",
+        hosting="cloud",
+        served_model_id="openai/gpt-5.6",
+        default_endpoint=_OPENROUTER_ENDPOINT,
+        auth_required=True,
+        max_tokens_default=16384,
+    ),
+    "cosmos3-edge": ReasonerModel(
+        id="cosmos3-edge",
+        display_name="NVIDIA Cosmos 3 Edge (4B, on-device)",
+        dialect="openai",
+        hosting="managed_local",
+        served_model_id="nvidia/Cosmos3-Edge",
+        default_endpoint=REASONER_MANAGED_ENDPOINT,
+        auth_required=False,
+        min_gpu_vram_gb=12.0,
+        required_dtype=QuantizationDtype.BF16,
+        weights_license="OpenMDW-1.1",
+    ),
+}
+
+
+# Base URLs for the named endpoints ``OPENRAL_REASONER_ENDPOINT`` accepts.
+# Exported so a deployment can reference the same constant the factory does
+# instead of retyping a URL; the properties each one implies (dialect, auth,
+# cold-start timeout, tool_choice) live in ``REASONER_ENDPOINT_PRESETS``.
+OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+# Anthropic's own API host — the value the SDK defaults to when no base_url is
+# passed. Spelled out so the ``anthropic`` endpoint preset can carry a real URL
+# instead of ``None`` (see ``ReasonerEndpointPreset.url``).
+ANTHROPIC_BASE_URL: str = "https://api.anthropic.com"
+# Ollama and vLLM are loopback daemons that enforce no auth unless fronted by a
+# gateway (or started with ``vllm serve --api-key``); ``vllm serve`` listens on
+# :8000, Ollama on :11434.
+OLLAMA_BASE_URL: str = "http://localhost:11434/v1"
+VLLM_BASE_URL: str = "http://localhost:8000/v1"
+# Google / xAI / DeepSeek's own OpenAI-compatible endpoints. Gemini's
+# OpenAI-compat shim lives under a ``/v1beta/openai/`` path.
+GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+XAI_BASE_URL: str = "https://api.x.ai/v1"
+DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+# Hugging Face's OpenAI-compatible inference router (serverless / provider-routed
+# models, e.g. ``Qwen/Qwen3-8B``). Auth via an HF access token.
+HUGGINGFACE_BASE_URL: str = "https://router.huggingface.co/v1"
+
+
+class ReasonerEndpointPreset(NamedTuple):
+    """Everything a named endpoint implies beyond its URL.
+
+    ``dialect`` makes ``OPENRAL_REASONER_DIALECT`` unnecessary for a named
+    endpoint — a preset knows its own wire format, and the escape hatch only
+    has to ask when the operator supplies a bare URL nobody can classify.
+
+    Lives in ``openral_core`` next to ``REASONER_MODELS`` so the factory
+    (``openral_reasoner.tool_use``) and ``openral doctor`` consume the SAME
+    table — doctor used to hand-mirror it to avoid importing the optional
+    reasoner package, and the mirror drifted twice.
+    """
+
+    #: Always a real URL, never ``None`` — ``None`` here would collide with
+    #: the ``endpoint is None`` "no endpoint configured" sentinel (the
+    #: ``anthropic`` preset once used ``None`` for "let the SDK pick its
+    #: default host" and became unreachable as a result).
+    url: str
+    dialect: str
+    auth_required: bool
+    #: Cold-start allowance. A self-hosted daemon (Ollama/vLLM) or the HF
+    #: serverless router can spend ~a minute materialising the model on the
+    #: first call; a warm cloud endpoint should stay on the tight default.
+    timeout_s: float
+    tool_choice: str
+
+
+# ``OPENRAL_REASONER_ENDPOINT`` accepts one of these NAMES as well as a URL.
+#
+# These carry everything the retired ``OPENRAL_REASONER_LLM_PROVIDER`` enum used
+# to know — each vendor's base URL, dialect, auth posture, cold-start timeout and
+# ``tool_choice`` quirk — so every provider that contract could reach is
+# expressible model-first, without making the operator retype a URL and
+# hand-declare a dialect for endpoints the codebase already has constants for.
+REASONER_ENDPOINT_PRESETS: dict[str, ReasonerEndpointPreset] = {
+    "anthropic": ReasonerEndpointPreset(ANTHROPIC_BASE_URL, "anthropic", True, 10.0, "required"),
+    "openrouter": ReasonerEndpointPreset(OPENROUTER_BASE_URL, "openai", True, 10.0, "required"),
+    "gemini": ReasonerEndpointPreset(GEMINI_BASE_URL, "openai", True, 10.0, "required"),
+    "xai": ReasonerEndpointPreset(XAI_BASE_URL, "openai", True, 10.0, "required"),
+    "deepseek": ReasonerEndpointPreset(DEEPSEEK_BASE_URL, "openai", True, 10.0, "required"),
+    # The HF router 400s on tool_choice="required" (INVALID_TOOL_CHOICE).
+    "huggingface": ReasonerEndpointPreset(HUGGINGFACE_BASE_URL, "openai", True, 60.0, "auto"),
+    # Loopback daemons enforce no auth unless fronted by a gateway, so an
+    # API key stays optional rather than required.
+    "ollama": ReasonerEndpointPreset(OLLAMA_BASE_URL, "openai", False, 60.0, "required"),
+    "vllm": ReasonerEndpointPreset(VLLM_BASE_URL, "openai", False, 60.0, "required"),
+}
+
+
+# ─── Reasoner tool calls ─────────────────────────────────────────
+
+
+class _ReasonerToolBase(BaseModel):
+    """Common base for every ``ReasonerToolCall`` variant.
+
+    Each variant declares ``tool: Literal["..."] = "..."`` as the
+    discriminator field. The reasoner emits exactly one
+    of these per tick via the LLM's structured-output / tool-use mode;
+    the value is then dispatched onto the ROS graph (action client,
+    service client, or publisher depending on the variant).
+
+    Variants intentionally hold **no authority over actuation**: the
+    reasoner never publishes ``ActionChunk`` itself.
+    ``ExecuteRskillTool`` is
+    indirect — it sends an action goal to ``rskill_runner_node`` which
+    in turn produces the chunk and gates it through ``safety_node``.
+
+    All variants are ``frozen=True`` and ``extra="forbid"`` so the LLM
+    cannot smuggle ad-hoc fields onto the wire.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    rationale: str = Field(
+        default="",
+        validation_alias=AliasChoices("rationale", "rational"),
+    )
+    """Optional one-line LLM rationale recorded on the reasoner span and trace.
+
+    Accepts both ``rationale`` (canonical) and ``rational`` (a common LLM
+    mis-spelling — gemma/qwen tool-use models emit it often enough that
+    rejecting the whole call as ``extra_forbidden`` would make the
+    reasoner unusable). Both spellings populate the same field; the
+    canonical name is used on the OTel span.
+    """
+
+
+class ExecuteRskillTool(_ReasonerToolBase):
+    """Tool variant — invoke an installed, capability-matched rSkill.
+
+    Dispatch: action goal on ``/openral/execute_rskill`` (the
+    ``openral_msgs/action/ExecuteRskill`` action server in F1's
+    ``rskill_runner_node``). The chunk path that follows is
+    ``Skill → /openral/candidate_action → safety_node →
+    /openral/safe_action → HAL``.
+
+    Attributes:
+        tool: Discriminator (always ``"execute_rskill"``).
+        rskill_id: ``RSkillManifest.name`` of an installed, capable skill.
+            Validated against the local registry by the reasoner at
+            palette-build time; an unknown id raises
+            ``ROSReasonerInvalidPlan``.
+        prompt: Natural-language prompt forwarded to the skill's
+            ``ExecuteRskill`` goal alongside the rskill_id. For VLA
+            skills this is the policy's task-conditioning signal
+            (SmolVLA writes it into ``observation["task"]``); for
+            wrapped-ROS skills it's carried for trace / log context
+            but the actual goal is built from ``goal_params_json``
+            merged over the manifest's ``default_goal_json``.
+        goal_params_json: Serialised JSON object carrying
+            per-skill typed parameters the LLM produces against the
+            skill's ``RSkillManifest.goal_params_schema``. Empty
+            string disables the merge (today's behaviour). Wrapped-ROS
+            skills (``kind: ros_action`` / ``ros_service``) deep-merge
+            it over ``ros_integration.default_goal_json`` at
+            configure-time; VLA skills accept the field and ignore it
+            (their prompt is already the structured signal).
+        deadline_s: Hard deadline in seconds for the action server to
+            complete the goal. ``0`` means "use the skill manifest's
+            default latency budget".
+        patience_s: Task-adaptive execution ceiling override (short for a
+            quick grab, long for a precise insertion). ``None`` → use the
+            reward model's ``default_patience_s``.
+        progress_tolerance: Override the reward model's ``plateau_tolerance``
+            when a task misbehaves (e.g. a noisy critic). ``None`` → use the
+            model default.
+    """
+
+    tool: Literal["execute_rskill"] = "execute_rskill"
+    rskill_id: str = Field(min_length=1)
+    prompt: str = ""
+    goal_params_json: str = ""
+    deadline_s: float = Field(default=0.0, ge=0.0)
+    patience_s: float | None = Field(default=None, gt=0.0)
+    progress_tolerance: float | None = Field(default=None, ge=0.0)
+
+
+class ReloadGstPipelineTool(_ReasonerToolBase):
+    """Tool variant — swap a sensor's GStreamer pipeline at runtime.
+
+    Dispatch: service call on
+    ``/openral/sensors/<sensor_id>/reload_pipeline`` with the
+    pipeline YAML payload. Lets the reasoner tune perception (switch
+    resolution, enable an ``nvinfer`` leg, swap an RTSP source) without
+    redeploying the runtime.
+
+    Attributes:
+        tool: Discriminator (always ``"reload_gst_pipeline"``).
+        sensor_id: ``SensorSpec.name`` of the camera whose pipeline is
+            being reloaded. Validated against the active runtime's
+            sensor catalog at dispatch time.
+        pipeline_yaml: Full YAML body of the new
+            ``SensorReaderConfig``. The sensor node validates this
+            against the Pydantic schema before accepting the swap.
+    """
+
+    tool: Literal["reload_gst_pipeline"] = "reload_gst_pipeline"
+    sensor_id: str = Field(min_length=1)
+    pipeline_yaml: str = Field(min_length=1)
+
+
+class LifecycleTransitionTool(_ReasonerToolBase):
+    """Tool variant — drive a ROS 2 lifecycle transition on a peer node.
+
+    Dispatch: service call on ``<node>/change_state`` with the matching
+    ``Transition`` id (``configure`` / ``activate`` / ``deactivate`` /
+    ``cleanup``). Used to bring a HAL back online, restart a faulted
+    node, or stage a controlled shutdown.
+
+    Attributes:
+        tool: Discriminator (always ``"lifecycle_transition"``).
+        node: Fully-qualified ROS node name (e.g. ``"/openral/hal/so100"``).
+        transition: One of ``"configure"``, ``"activate"``,
+            ``"deactivate"``, ``"cleanup"``. Other transitions
+            (``"shutdown"``, error-recovery) are deliberately omitted
+            from the open-core palette per CLAUDE.md §6 Layer 6 —
+            shutdown is owned by the safety supervisor, not the
+            reasoner.
+    """
+
+    tool: Literal["lifecycle_transition"] = "lifecycle_transition"
+    node: str = Field(min_length=1)
+    transition: Literal["configure", "activate", "deactivate", "cleanup"]
+
+
+class EmitPromptTool(_ReasonerToolBase):
+    """Tool variant — republish a ``PromptStamped`` onto another topic.
+
+    Dispatch: publish on ``target_topic`` (typically ``/openral/prompt``
+    for self-cascading, but any ``PromptStamped`` topic is valid).
+    Lets the reasoner stage multi-step plans, talk to a peer reasoner,
+    or feed a downstream prompt-aware skill without going through an
+    ExecuteRskill goal.
+
+    Attributes:
+        tool: Discriminator (always ``"emit_prompt"``).
+        target_topic: Absolute ROS topic name (must start with ``"/"``).
+            The reasoner's own subscription on ``/openral/prompt`` plus
+            the prompt-router's FIFO queue handle the
+            cascade.
+        text: Human-readable prompt body forwarded as
+            ``PromptStamped.text``.
+        metadata_json: Free-form JSON forwarded as
+            ``PromptStamped.metadata_json``. Empty string when no
+            structured metadata is needed.
+    """
+
+    tool: Literal["emit_prompt"] = "emit_prompt"
+    target_topic: str = Field(min_length=2, pattern=r"^/")
+    text: str = Field(min_length=1)
+    metadata_json: str = ""
+
+
+class RecallObjectTool(_ReasonerToolBase):
+    """Tool variant (**read-only**) — recall a remembered object.
+
+    Queries the scene-graph spatial memory and returns the object's
+    ``map``-frame pose plus a camera-facing approach viewpoint and any occluding
+    container to the reasoner's next reasoning step. Like every variant it
+    **holds no authority over actuation** — it only *reads*
+    memory. The dispatch that runs the query and feeds the result back to the
+    LLM is wired separately (this is the typed contract).
+
+    Attributes:
+        tool: Discriminator (always ``"recall_object"``).
+        query: Free-text or label naming the object to recall (e.g.
+            ``"the red mug"``). Mapped to a ``RecallObjectQuery`` at dispatch.
+        limit: Maximum number of ranked matches to return.
+    """
+
+    tool: Literal["recall_object"] = "recall_object"
+    query: str = Field(min_length=1)
+    limit: int = Field(default=5, ge=1, le=100)
+
+
+class ResolvePlaceTool(_ReasonerToolBase):
+    """Tool variant (**read-only**) — resolve a place/room/agent to a goal.
+
+    Queries the scene-graph memory for a navigation goal pose plus a
+    ``traversable_to`` path. Read-only; **holds no authority over actuation**.
+    Dispatch + result-return are wired separately.
+
+    Attributes:
+        tool: Discriminator (always ``"resolve_place"``).
+        reference: Free-text, id, or label of the target (e.g. ``"the kitchen"``,
+            ``"where I was standing"``). Mapped to a ``ResolvePlaceQuery``.
+    """
+
+    tool: Literal["resolve_place"] = "resolve_place"
+    reference: str = Field(min_length=1)
+
+
+class LocateInViewTool(_ReasonerToolBase):
+    """Tool variant (**read-only**) — check if an object is in a *live* camera view.
+
+    The complement to ``RecallObjectTool``: where ``recall_object`` recalls a
+    *remembered* object from the scene-graph memory, ``locate_in_view``
+    asks a live camera-mounted VLM detector (e.g. LocateAnything) to
+    look at the current frame *right now* and report whether the queried object is
+    visible — and where. It runs the detector's open-vocabulary query on demand
+    via the ``/openral/perception/locate_in_view`` ROS service and feeds the
+    answer back to the LLM as a re-prompt (the prompt cascade). Like every variant
+    it **holds no authority over actuation** — it only *reads* a
+    frame; the dispatch never gates the safety kernel.
+
+    Attributes:
+        tool: Discriminator (always ``"locate_in_view"``).
+        query: The object(s) to look for, as concrete object **noun(s)** — sent
+            verbatim as the detector's open-vocabulary query. The fast default
+            locator (``omdet-turbo-locator``) is a multi-label detector: it
+            matches each comma-separated term as one object class, so query a
+            single noun (``"mug"``) or a comma-separated list for several
+            (``"cup, bowl, ketchup bottle"``). A collective/quantified PHRASE
+            (``"the objects on the table"``, ``"everything"``, ``"all items"``)
+            is treated as one literal class name and matches NOTHING — name the
+            concrete objects instead. Referring expressions with relations
+            (``"the mug behind the bowl"``) need the ``locateanything-3b``
+            locator (set ``detector``); omdet ignores the relation.
+        camera: Optional camera selector. Empty (default) uses the detector's
+            primary camera; otherwise names one of the detector's configured
+            cameras so the reasoner can pick a viewpoint. **Not a hardcoded
+            name** — the detector is camera-agnostic and maps the id to a topic.
+        detector: Optional on-demand locator selector. Empty (default)
+            uses the deployment's default locator; otherwise an rSkill id / short
+            alias of one of the on-demand locators in the graph (e.g.
+            ``"omdet_turbo-any-locator-fp16"`` for fast simple "find X",
+            ``"locateanything_3b-any-general-nf4"`` for complex referring
+            expressions). The
+            reasoner routes to ``/openral/perception/<detector>/locate_in_view``.
+            Still **read-only** — choosing a model does not grant actuation.
+    """
+
+    tool: Literal["locate_in_view"] = "locate_in_view"
+    query: str = Field(min_length=1)
+    camera: str = ""
+    detector: str = ""
+
+
+class QuerySceneTool(_ReasonerToolBase):
+    """Tool variant (**read-only**) — ask a scene VLM a question about the live view.
+
+    Backed by a ``kind: "vlm"`` rSkill (e.g. Qwen3.5-4B NF4) running in an
+    out-of-process ZMQ sidecar. Where ``LocateInViewTool`` answers *where*
+    an object is (open-vocabulary localization via the detector), ``query_scene``
+    answers *open-ended questions about the scene's state* — task-progress and
+    success/failure verification the reasoner needs for its replanning ladder:
+    "has the robot grasped the mug?", "is the bowl on the shelf?", "did we drop
+    the object?", "is the table clear?".
+
+    It captures the current frame of the requested camera, sends it plus the
+    question to the VLM over the ``/openral/perception/query_scene`` ROS service,
+    and feeds the free-text answer back to the LLM as a re-prompt (the prompt
+    cascade). Like every variant it **holds no authority over actuation**
+     — it only *reads* a frame; the dispatch never gates the safety
+    kernel. It is not a localizer: use ``LocateInViewTool`` to find objects.
+
+    Attributes:
+        tool: Discriminator (always ``"query_scene"``).
+        question: Natural-language question about the current scene
+            (e.g. ``"Has the robot grasped the red mug?"``). Sent verbatim to
+            the VLM as the textual prompt alongside the frame.
+        camera: Optional camera selector. Empty (default) uses the perception
+            node's primary camera; otherwise names one of its configured cameras
+            so the reasoner can pick a viewpoint. **Not a hardcoded name.**
+    """
+
+    tool: Literal["query_scene"] = "query_scene"
+    question: str = Field(min_length=1)
+    camera: str = ""
+
+
+class QueryTaskProgressTool(_ReasonerToolBase):
+    """Tool variant (**read-only**) — ask the reward monitor how the task is going.
+
+    Backed by a ``kind: "reward"`` rSkill (Robometer-4B NF4) running in parallel
+    with the active VLA in an out-of-process ZMQ sidecar. Where
+    ``QuerySceneTool`` answers *open-ended* scene questions as free text,
+    ``query_task_progress`` returns a **quantitative** windowed assessment of the
+    *current task*: normalized progress and success over the last
+    ``window_s`` seconds, plus their trends and a ``stalled`` flag.
+
+    It calls the ``/openral/perception/query_task_progress`` ROS service, which
+    scores the monitor's buffered camera frames against the task instruction and
+    returns ``progress_now`` / ``success_now`` / ``progress_trend`` /
+    ``success_trend`` / ``stalled`` / ``succeeded``. The reasoner uses it to
+    decide whether to continue, escalate to ``QuerySceneTool``, advance, or
+    enter the replanning ladder. Like every variant it **holds no authority over
+    actuation** — the reward signal is advisory; the dispatch never
+    gates the safety kernel.
+
+    Attributes:
+        tool: Discriminator (always ``"query_task_progress"``).
+        window_s: How many seconds of recent frames to assess. Must be > 0;
+            clamped to the monitor's configured ``frame_window_s``.
+        task: Optional task-instruction override. Empty (default) reuses the
+            instruction the monitor was co-activated with (the active VLA's goal).
+    """
+
+    tool: Literal["query_task_progress"] = "query_task_progress"
+    window_s: float = Field(gt=0.0, default=8.0)
+    task: str = ""
+
+
+MemorySection: TypeAlias = Literal[
+    "home_map", "preferences", "lessons", "object_locations", "open_tasks"
+]
+"""The fixed sections of the self-maintained ``MEMORY.md`` core.
+
+* ``home_map`` — stable places / region-connectivity (EDIT in place).
+* ``preferences`` — distilled user-preference *rules* (TidyBot; EDIT in place).
+* ``lessons`` — distilled human corrections / hard-won lessons (DROC; APPEND).
+* ``object_locations`` — timestamped object→place log (SUPERSEDE on re-observation).
+* ``open_tasks`` — recurring commitments / open items (EDIT; remove on completion).
+"""
+
+
+class MemoryWriteTool(_ReasonerToolBase):
+    """Tool variant (**write**) — edit the robot's self-maintained ``MEMORY.md``.
+
+    The reasoner's **first write-capable tool**. It edits the persistent,
+    human-readable *semantic* memory (preferences, corrections, lessons, durable
+    home facts, object locations, open tasks) through an **explicit operation** —
+    never a free-form rewrite (Mem0 ``ADD/UPDATE/DELETE`` + Zep temporal
+    supersession). It writes ONLY to the advisory memory file and **holds no
+    authority over actuation**: a wrong memory yields a bad plan the
+    C++ kernel still vetoes (CLAUDE.md §1.1). The dispatch that applies the edit is
+    wired in a later phase — this is the typed contract.
+
+    Attributes:
+        tool: Discriminator (always ``"memory_write"``).
+        op: The edit operation — ``add`` / ``update`` / ``supersede`` / ``delete``.
+        section: Which ``MemorySection`` to edit.
+        content: The fact, as a distilled NL rule/line. Required for every op
+            except ``delete`` (validated).
+        importance: LLM-assigned salience in ``[0, 1]`` (Generative Agents), used
+            by recency-importance-relevance retrieval when the section is capped.
+        target: The existing entry this op acts on. Required for
+            ``update`` / ``supersede`` / ``delete``; omitted for ``add`` (validated).
+    """
+
+    tool: Literal["memory_write"] = "memory_write"
+    op: Literal["add", "update", "supersede", "delete"]
+    section: MemorySection
+    content: str = ""
+    importance: float = Field(default=0.5, ge=0.0, le=1.0)
+    target: str | None = None
+
+    @model_validator(mode="after")
+    def _check_op_fields(self) -> MemoryWriteTool:
+        """``content`` required unless deleting; ``target`` required unless adding."""
+        if self.op != "delete" and not self.content:
+            raise ValueError(f"MemoryWriteTool: op={self.op!r} requires non-empty `content`.")
+        if self.op in ("update", "supersede", "delete") and not self.target:
+            raise ValueError(f"MemoryWriteTool: op={self.op!r} requires a `target` entry.")
+        return self
+
+
+class MemorySearchTool(_ReasonerToolBase):
+    """Tool variant (**read-only**) — search the archival memory log.
+
+    Pages in entries evicted from the bounded ``MEMORY.md`` core into the archival
+    JSONL (MemGPT recall), so the LLM can recall an older fact — e.g. a ``stale``
+    object location used as a search prior — without loading the whole history.
+    Read-only; no actuation.
+
+    Attributes:
+        tool: Discriminator (always ``"memory_search"``).
+        query: Free-text query over archived memory.
+        section: Optional ``MemorySection`` filter.
+        limit: Maximum number of results to return.
+    """
+
+    tool: Literal["memory_search"] = "memory_search"
+    query: str = Field(min_length=1)
+    section: MemorySection | None = None
+    limit: int = Field(default=5, ge=1, le=100)
+
+
+# The smallest actionable unit is a verb applied to exactly ONE
+# specific object. A *collective* / *quantified* target ("all the objects", "the
+# items") names a SET the agent has not yet bound to perception, so it is never
+# directly actionable: it must be enumerated from the live scene and split into
+# one grounded subtask per concrete object first. Deliberately narrow —
+# quantifiers + bare generic plurals only — so a specific goal ("pick up the
+# alphabet soup") never trips it. Shared source of truth for both the
+# ``GroundedSubtask`` schema validator (below) and the reasoner node's
+# runtime execute gate (``openral_reasoner_ros.reasoner_node``).
+_COLLECTIVE_TARGET_RE: re.Pattern[str] = re.compile(
+    r"\b(?:all|every|each|both|everything)\b|\b(?:objects|items|things)\b",
+    re.IGNORECASE,
+)
+
+
+def is_collective_target(text: str) -> bool:
+    """True when ``text`` targets a *set* rather than one specific object.
+
+    A quantifier (``all``/``every``/``each``/``both``/``everything``) or a bare
+    generic plural (``objects``/``items``/``things``). Narrow by design: a
+    specific goal never trips it.
+
+    Example:
+        >>> is_collective_target("put all the objects in the basket")
+        True
+        >>> is_collective_target("pick up the alphabet soup and put it in the basket")
+        False
+    """
+    return _COLLECTIVE_TARGET_RE.search(text) is not None
+
+
+class GroundedSubtask(BaseModel):
+    """One subtask bound to exactly ONE specific object.
+
+    Makes the "smallest actionable unit" invariant a *type*: ``object_ref`` is
+    the single concrete object (or place) this subtask acts on, and ``text`` is
+    the instruction handed to the skill (the VLA prompt). The validator forbids a
+    collective/quantified ``object_ref`` or ``text`` and requires ``text`` to name
+    its ``object_ref`` — so an ungrounded "pick up the first batch of objects" is
+    not a representable value and the provider's structured-output path re-prompts
+    (the same mechanism that rejects a malformed ``ReasonerToolCall``).
+
+    Attributes:
+        object_ref: The single concrete object/place this subtask acts on
+            (``"milk"``, ``"the fridge"``). Never a quantifier or generic plural.
+        text: The instruction the skill receives, naming ``object_ref``
+            (``"pick up the milk and put it in the basket"``).
+
+    Example:
+        >>> GroundedSubtask(object_ref="milk", text="pick up the milk and bag it").render()
+        'pick up the milk and bag it'
+        >>> is_collective_target(
+        ...     GroundedSubtask(object_ref="milk", text="grab the milk").object_ref
+        ... )
+        False
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    object_ref: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_grounded(self) -> GroundedSubtask:
+        """Enforce the one-specific-object grounding invariant."""
+        obj = self.object_ref.strip()
+        text = self.text.strip()
+        if not obj:
+            raise ValueError("object_ref must name one concrete object")
+        if not text:
+            raise ValueError("subtask text must not be blank")
+        if is_collective_target(obj):
+            raise ValueError(
+                f"object_ref {obj!r} is collective/quantified — name ONE specific object "
+                "(enumerate the scene and emit one subtask per object instead)"
+            )
+        if is_collective_target(text):
+            raise ValueError(
+                f"subtask text {text!r} is collective — one specific object per subtask"
+            )
+        if obj.lower() not in text.lower():
+            raise ValueError(
+                f"subtask text {text!r} must name its object_ref {obj!r} (explicit grounding)"
+            )
+        return self
+
+    def render(self) -> str:
+        """The instruction string handed to ``MissionState`` / the skill."""
+        return self.text.strip()
+
+
+class DecomposeMissionTool(_ReasonerToolBase):
+    """Tool variant — write the reasoner's typed task queue.
+
+    The typed path for the ``decompose-mission`` playbook: the LLM
+    emits an ordered list of finer subtasks and the node applies it to the
+    deterministic ``MissionState``, replacing the free-form-JSON gap with
+    structured output (CLAUDE.md §3). Two modes, selected by ``target_task_id``:
+
+    * **populate** (``target_task_id`` empty) — build a fresh mission queue from
+      ``subtasks``, refining the single-task seed when the operator goal needs a
+      finer decomposition than a single prompt.
+    * **subdivide** (``target_task_id`` set) — *flat-splice* the named blocked
+      task in place with ``subtasks`` (``t2 → t2.1, t2.2``), bounded by
+      ``DEFAULT_MAX_SUBDIVIDE_DEPTH``; past the
+      bound the node hands off instead.
+
+    Each subtask is a ``GroundedSubtask`` (one specific object),
+    not a free string — so a collective "first batch of objects" cannot be
+    emitted. The node renders them to ``MissionState`` task text via
+    ``rendered_subtasks``.
+
+    Like every ``ReasonerToolCall`` variant it **holds no authority over
+    actuation** — it only edits the S2 task ledger; a bad
+    decomposition yields a worse plan the safety kernel still vetoes.
+
+    Attributes:
+        tool: Discriminator (always ``"decompose_mission"``).
+        subtasks: Ordered, non-empty list of ``GroundedSubtask`` — each acts
+            on exactly one specific object and becomes a ``TaskState``.
+        target_task_id: ``TaskState.task_id`` of the blocked task to subdivide
+            (e.g. ``"t2"``); empty string populates/replaces the whole queue.
+    """
+
+    tool: Literal["decompose_mission"] = "decompose_mission"
+    subtasks: list[GroundedSubtask] = Field(min_length=1)
+    target_task_id: str = ""
+
+    def rendered_subtasks(self) -> list[str]:
+        """The ordered subtask instruction strings for ``MissionState``."""
+        return [s.render() for s in self.subtasks]
+
+
+class WaitTool(_ReasonerToolBase):
+    """Tool variant — deliberate no-op: observe and wait for the next tick.
+
+    The reasoner's tool choice is forced (``tool_choice="any"`` /
+    ``"required"``), so without this variant the LLM MUST act every tick even
+    when the correct decision is "nothing to do yet" — e.g. a skill is mid-
+    execution and progress is nominal, or the mission is finished and no new
+    goal has arrived. Forcing an action in those states produces spurious
+    read-only queries or operator-prompt spam. ``wait`` makes "do nothing this
+    tick" an explicit, logged, traceable decision instead of a side effect.
+
+    Dispatch: none. The node records the call (rationale included) on the
+    reasoner span and returns — no ROS traffic, no actuation, no state change.
+
+    Attributes:
+        tool: Discriminator (always ``"wait"``).
+    """
+
+    tool: Literal["wait"] = "wait"
+
+
+ReasonerToolCall: TypeAlias = (
+    ExecuteRskillTool
+    | ReloadGstPipelineTool
+    | LifecycleTransitionTool
+    | EmitPromptTool
+    | WaitTool
+    | RecallObjectTool
+    | ResolvePlaceTool
+    | LocateInViewTool
+    | QuerySceneTool
+    | QueryTaskProgressTool
+    | MemoryWriteTool
+    | MemorySearchTool
+    | DecomposeMissionTool
+)
+"""Discriminated union over the reasoner tool variants.
+
+The discriminator field is ``tool`` (a string ``Literal`` on each
+variant). Consumers decode an LLM tool-use payload with::
+
+    from pydantic import TypeAdapter
+    from openral_core import ReasonerToolCall
+
+    call = TypeAdapter(ReasonerToolCall).validate_json(payload)
+
+Producers (LLM clients) serialise via ``call.model_dump_json()``.
+
+Actuation/effect palette: ``ExecuteRskillTool``,
+``ReloadGstPipelineTool``, ``LifecycleTransitionTool``,
+``EmitPromptTool``, ``WaitTool``. Read-only query variants (no
+actuation authority): ``RecallObjectTool``, ``ResolvePlaceTool``,
+``LocateInViewTool``, ``QuerySceneTool``,
+``QueryTaskProgressTool``, ``MemorySearchTool``. Write-to-memory:
+``MemoryWriteTool``. S2-ledger-only: ``DecomposeMissionTool``
+(populates/flat-splices ``MissionState``'s task queue, never actuation).
+
+Extending the palette requires (a) a new variant here, (b) the corresponding
+ROS-side dispatch in ``openral_reasoner_ros.reasoner_node``, (c) a CLAUDE.md
+§6.2 / §7.6 amendment if the new tool shifts the reasoner's authority surface.
+The query variants' dispatch + result-return path is wired separately; until
+then they are a typed contract not yet exposed in the live provider palette.
+"""

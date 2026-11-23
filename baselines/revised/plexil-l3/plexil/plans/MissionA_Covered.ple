@@ -1,0 +1,188 @@
+// PLEXIL baseline -- Mission A, model-covered procedure.
+//
+// The covered brief: "<X> reported a fault. Inspect the base's serviced units, identify the failed unit, restore it if
+// within your authority, verify the result, and return the rover to the dock with the arm stowed."
+// A competent procedure for that brief, authored from the covered specification only (the baselines'
+// authoring rules):
+//   identify  -- the tripped unit from the units' own telemetry (PowerUnit Lookup over the site's five units, the unit
+//                id then the parameter of every leg), not from the report, since the brief asks to identify it;
+//   restore   -- drive to its panel, dock, press the reset;
+//   verify    -- the breaker reads closed; a reset that did not take is pressed again, 3 attempts in all;
+//   return    -- stow and drive back; verify again at the dock.
+// Every capability call has at most 3 identical attempts (the library nodes' and Reset's Try, tier 1). When a leg is
+// out of attempts or a check fails for good, the plan asks mission control (RequestOperator) and commands nothing
+// more: the rover holds where it is (an escalation; recorded as ground re-authoring when it needs a new plan).
+// Nothing is keyed on why a call or a reset failed (tier 3 is forbidden).
+//
+// The root is an UncheckedSequence: a failed leg must not abort the plan before its escalation runs (a checked
+// Sequence fails, and skips every later node, as soon as one child fails). Every leg is gated on `ok`; `held` marks
+// that mission control has been asked, so exactly one escalation is sent.
+//
+// Composed from the reusable library (lib/DriveAndDock, lib/StowAndReturn). `press`'s own contract needs no
+// arm_ready first. Units, the press feature naming and each panel's look are site knowledge (site_map).
+//
+// Re-authored after the freeze for one held-out case ("the unit's module has failed"):
+// a unit that tripped on its own module's fault (BESS: BATTERY_MODULE_FAULT, ISRU plant: FILTER_CLOGGED) fails the
+// module's self-test at every reset, so no reset holds until the module is replaced. For that trip cause, before the
+// reset: take the failed module out of its bay (the tripped unit is de-energized: within the vehicle's authority), set
+// it down on a free support, fetch the serviceable spare from its stand (manifest) and put it into the bay; then the
+// covered reset and return. Modules are picked and placed like any catalogued item (lib/PickItem, lib/PlaceItem); the
+// arm is folded after each set-down, before the next drive (lib/StowArm).
+
+LibraryAction DriveAndDock(In String feature, In Real standoff_m, In Real approach_m, InOut Boolean ok);
+LibraryAction StowAndReturn(In Real dock_x, In Real dock_y, In Real dock_yaw, InOut Boolean ok);
+LibraryAction PickItem(In String target, In String part, In String item, In String support, InOut Boolean ok);
+LibraryAction PlaceItem(In String support, In String release_constraint, In String item, InOut Boolean ok);
+LibraryAction StowArm(InOut Boolean ok);
+Boolean Command press(String, String);
+String Command RequestOperator(String);
+String Lookup PowerUnit(String, String);
+Command pprint(...);
+
+MissionA_Covered: UncheckedSequence
+{
+  String Unit = "";
+  String ButtonTarget = "";
+  String Answer = "";
+  String Module = "";    // the failed module's catalogue item, when the trip cause is that module's fault
+  String ModuleTarget = "";
+  String Bay = "";       // its equipment bay (place point of role equipment_bay)
+  String Spare = "";     // the stand of its serviceable spare (manifest)
+  String SetDown = "";   // a free support near the unit for the failed module (manifest: nothing recorded on it)
+  Boolean ok = true;     // every leg so far succeeded
+  Boolean held = false;  // mission control was asked; nothing more is commanded
+
+  Identify: Sequence
+  {
+    Unit1: { SkipCondition Lookup(PowerUnit("pdu_1", "breaker")) != "tripped"; Unit = "pdu_1"; }
+    Unit2: { SkipCondition Unit != "" || Lookup(PowerUnit("pdu_2", "breaker")) != "tripped"; Unit = "pdu_2"; }
+    Unit3: { SkipCondition Unit != "" || Lookup(PowerUnit("pdu_3", "breaker")) != "tripped"; Unit = "pdu_3"; }
+    Unit4: { SkipCondition Unit != "" || Lookup(PowerUnit("bess", "breaker")) != "tripped"; Unit = "bess"; }
+    Unit5: { SkipCondition Unit != "" || Lookup(PowerUnit("isru", "breaker")) != "tripped"; Unit = "isru"; }
+    Button:
+    {
+      if (Unit == "bess") { ButtonTarget = "the round white push button on the graphite control panel with the teal border"; }
+      elseif (Unit == "isru") { ButtonTarget = "the round black push button on the white control panel with the orange border"; }
+      else { ButtonTarget = "the round red push button set into the yellow sub-panel"; }
+      endif
+    }
+  }
+  // decisions on live state are taken when the node runs (if/endif): a SkipCondition is watched the whole time a
+  // node waits in its Sequence, so a later branch would be skipped the moment an earlier step changed that state
+  NoTrippedUnit:
+  {
+    if (Unit == "") {
+      ok = false;
+      held = true;
+      Answer = RequestOperator("Power telemetry shows no tripped unit; the reported fault cannot be located. Holding; requesting instructions.");
+    }
+    endif
+  }
+  // the module's trip cause and serials: the case brief; bays, stands and what stands on them: site survey + manifest
+  // (interaction.json points / objects; return_stand/slot_0 carries the return container, so the BESS module goes on
+  // the free BESS receiving stand next to the unit); each module's look: its catalogue preview; handle and release
+  // constraint: the catalogue grasp interface, the same collar handle as every item of lib/PickItem's callers
+  FailedModule:
+  {
+    if (ok && Unit == "bess" && Lookup(PowerUnit(Unit, "trip_cause")) == "BATTERY_MODULE_FAULT") {
+      Module = "battery module";
+      ModuleTarget = "the battery module: a black drum-shaped module on a black base, with amber windows around its round face, and a black lifting post on top";
+      Bay = "bess_cradle/tray";
+      Spare = "depot_spares_stand/slot_0";
+      SetDown = "bess_stand/slot_0";
+    }
+    elseif (ok && Unit == "isru" && Lookup(PowerUnit(Unit, "trip_cause")) == "FILTER_CLOGGED") {
+      Module = "filter cartridge";
+      ModuleTarget = "the filter cartridge: a grey ribbed cylindrical canister with a yellow band near its top, and a black lifting post on top";
+      Bay = "isru_filter/tray";
+      Spare = "isru_stand/slot_0";
+      SetDown = "isru_return_stand/slot_0";
+    }
+    endif
+  }
+  ReplaceModule: UncheckedSequence
+  {
+    String Part = "the slot on the narrow neck of the black lifting post on top, between the transverse head above and the collar below (fingers close on opposite sides of the neck)";
+    PreCondition ok && Module != "";
+    ToBay:     { PreCondition ok; LibraryCall DriveAndDock(feature = Bay, standoff_m = 1.2, approach_m = 1.2, ok = ok); }
+    TakeOut:   { PreCondition ok; LibraryCall PickItem(target = ModuleTarget, part = Part, item = Module, support = Bay, ok = ok); }
+    ToSetDown: { PreCondition ok; LibraryCall DriveAndDock(feature = SetDown, standoff_m = 1.2, approach_m = 1.2, ok = ok); }
+    SetOut:    { PreCondition ok; LibraryCall PlaceItem(support = SetDown, release_constraint = "below_overhang", item = Module, ok = ok); }
+    Fold1:     { PreCondition ok; LibraryCall StowArm(ok = ok); }
+    ToSpare:   { PreCondition ok; LibraryCall DriveAndDock(feature = Spare, standoff_m = 1.2, approach_m = 1.2, ok = ok); }
+    TakeSpare: { PreCondition ok; LibraryCall PickItem(target = ModuleTarget, part = Part, item = Module, support = Spare, ok = ok); }
+    BackToBay: { PreCondition ok; LibraryCall DriveAndDock(feature = Bay, standoff_m = 1.2, approach_m = 1.2, ok = ok); }
+    Install:   { PreCondition ok; LibraryCall PlaceItem(support = Bay, release_constraint = "below_overhang", item = Module, ok = ok); }
+    Fold2:     { PreCondition ok; LibraryCall StowArm(ok = ok); }
+  }
+  NotReplaced:
+  {
+    if (!ok && !held) {
+      held = true;
+      Answer = RequestOperator("Replacing the " + Module + " of " + Unit + ": a call failed 3 times. No procedure applies; holding, requesting instructions.");
+    }
+    endif
+  }
+  ToUnit: { PreCondition ok; LibraryCall DriveAndDock(feature = Unit + "_panel/press", standoff_m = 1.2, approach_m = 1.2, ok = ok); }
+  NotReached:
+  {
+    if (!ok && !held) {
+      held = true;
+      Answer = RequestOperator("Could not reach the panel of " + Unit + ": a call failed 3 times. No procedure applies; holding, requesting instructions.");
+    }
+    endif
+  }
+  Reset: Try
+  {
+    PreCondition ok;
+    Reset1: Sequence
+    {
+      PostCondition ok;
+      Press1: { EndCondition isKnown(ok); ok = press(ButtonTarget, Unit + "_panel/press"); }
+      Check1: { PreCondition ok; ok = Lookup(PowerUnit(Unit, "breaker")) == "closed"; }
+    }
+    Reset2: Sequence
+    {
+      PostCondition ok;
+      Setup2: { ok = true; }
+      Press2: { EndCondition isKnown(ok); ok = press(ButtonTarget, Unit + "_panel/press"); }
+      Check2: { PreCondition ok; ok = Lookup(PowerUnit(Unit, "breaker")) == "closed"; }
+    }
+    Reset3: Sequence
+    {
+      PostCondition ok;
+      Setup3: { ok = true; }
+      Press3: { EndCondition isKnown(ok); ok = press(ButtonTarget, Unit + "_panel/press"); }
+      Check3: { PreCondition ok; ok = Lookup(PowerUnit(Unit, "breaker")) == "closed"; }
+    }
+  }
+  ResetFailed:
+  {
+    if (!ok && !held) {
+      held = true;
+      Answer = RequestOperator("The reset of " + Unit + " did not restore it after 3 attempts; trip cause: "
+                               + Lookup(PowerUnit(Unit, "trip_cause")) + ". No procedure applies; holding, requesting instructions.");
+    }
+    endif
+  }
+  Return: { PreCondition ok; LibraryCall StowAndReturn(dock_x = 0.0, dock_y = 0.0, dock_yaw = 0.0, ok = ok); }
+  NotReturned:
+  {
+    if (!ok && !held) {
+      held = true;
+      Answer = RequestOperator("Could not return to the dock: a call failed 3 times. No procedure applies; holding, requesting instructions.");
+    }
+    endif
+  }
+  FinalCheck:
+  {
+    if (ok && Lookup(PowerUnit(Unit, "breaker")) != "closed") {
+      ok = false;
+      held = true;
+      Answer = RequestOperator(Unit + " tripped again after the reset; trip cause: " + Lookup(PowerUnit(Unit, "trip_cause"))
+                               + ". No procedure applies; holding, requesting instructions.");
+    }
+    endif
+  }
+  Done: { pprint("MissionA_Covered unit:", Unit, "ok:", ok, "operator:", Answer); }
+}

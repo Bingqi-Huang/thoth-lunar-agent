@@ -1,0 +1,121 @@
+"""Shared loader helpers for openral_sim policy adapters.
+
+Consolidates three things ``openral_sim.policies.pi05``,
+``openral_sim.policies.rldx``, and ``openral_sim.policies.smolvla``
+each need on their ``_build_*``:
+
+1. **Manifest resolution** (``load_manifest_for_spec``) — pull the
+   ``RSkillManifest`` from ``spec.weights_uri`` when it's a bare
+   rSkill reference; ``None`` for ``hf://``/local/explicit-scheme URIs so
+   callers decide whether a missing manifest is fatal. RLDX uses this too
+   (its sidecar holds the processor) as the source of truth for
+   ``state_contract``/``image_preprocessing``/``n_action_steps``.
+
+2. **Lazy torch + lerobot import** (``lazy_import_lerobot``) — SmolVLA
+   and π0.5 defer ``torch``/``lerobot`` so installing ``openral-sim``
+   never pulls them transitively (CLAUDE.md §3). Returns
+   ``(torch, make_pre_post_processors)``; adapter-specific
+   ``policy_class`` is resolved by the caller.
+
+3. **Processor pipeline materialisation** — ``make_pre_post_processors``
+   needs a ``pretrained_path`` carrying ``policy_preprocessor.json`` +
+   ``policy_postprocessor.json``; the choice between
+   ``openral_rskill._vla_core.materialize_processor_dir`` (manifest
+   only) and ``openral_sim.policies._processors.resolve_processor_dir``
+   (manifest with snapshot fallback) is adapter-specific, passed as a callable.
+
+Deliberately small: the pi05 quantization branch is not wrapped here
+(SmolVLA never quantizes, RLDX delegates to its sidecar) — see
+``openral_sim._quantization`` for the generic dtype/bnb helpers.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from openral_core.exceptions import ROSConfigError
+
+if TYPE_CHECKING:
+    from openral_core import RSkillManifest
+
+
+def load_manifest_for_spec(spec: Any) -> RSkillManifest | None:
+    """Load the rSkill manifest pinned in ``spec.weights_uri``.
+
+    Returns the parsed ``openral_core.RSkillManifest`` when
+    ``spec.weights_uri`` is a bare rSkill reference (name, local path
+    like ``rskills/smolvla-libero``, or HF repo id with no explicit
+    scheme); returns ``None`` for ``hf://``, ``local://``, ``file://``,
+    ``http://``, or ``https://`` URIs so the caller can decide whether
+    the missing manifest is fatal (SmolVLA raises; pi05 / RLDX fall
+    back to the URI directly).
+
+    The function is intentionally tolerant of ``spec=None`` /
+    ``spec.weights_uri=None`` -- both shapes resolve to ``None``.
+
+    Args:
+        spec: A ``VLASpec``-shaped object (anything with a
+            ``weights_uri`` attribute).
+
+    Returns:
+        Parsed manifest or ``None``.
+    """
+    weights_uri = str(getattr(spec, "weights_uri", "") or "")
+    if not weights_uri or weights_uri.startswith(
+        ("hf://", "local://", "file://", "http://", "https://")
+    ):
+        return None
+    from openral_rskill.loader import load_rskill_manifest
+
+    return load_rskill_manifest(weights_uri)
+
+
+def lazy_import_lerobot(
+    adapter_name: str,
+    *,
+    install_hint: str = "just sync --all-packages --group libero",
+) -> tuple[Any, Any]:
+    """Import torch + lerobot's ``make_pre_post_processors`` factory.
+
+    Both the SmolVLA and π0.5 adapters defer torch + lerobot imports to
+    keep a bare ``openral-sim`` install free of the ~2 GiB of CUDA /
+    transformers dependencies. The install-hint string is identical
+    between the two; centralising it here keeps the message in sync
+    when the recommended sync group changes.
+
+    Args:
+        adapter_name: Human-readable adapter name (``"SmolVLA"`` /
+            ``"π0.5"`` / ...) inlined into the ``ROSConfigError`` so
+            the operator sees which adapter triggered the failure.
+        install_hint: Override the default
+            ``just sync --all-packages --group libero`` hint when an
+            adapter pulls a different optional group (e.g.
+            ``"just sync --all-packages --group metaworld"``).
+
+    Returns:
+        ``(torch, make_pre_post_processors)``. The caller is expected
+        to import the adapter-specific ``Policy`` class separately,
+        since the registry shape varies (``PI05Policy`` vs
+        ``SmolVLAPolicy`` vs custom ACT modules) and pulling the
+        choice into this helper would force every adapter to share
+        the same lerobot dispatch convention.
+
+    Raises:
+        ROSConfigError: If any of the lazy imports fail.
+    """
+    try:
+        import torch
+        from lerobot.policies.factory import make_pre_post_processors
+        from openral_rskill import _lerobot_compat  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - opt-in
+        raise ROSConfigError(
+            f"{adapter_name} adapter requires torch + lerobot; "
+            f"install with: {install_hint} (underlying: {exc!r})"
+        ) from exc
+    return torch, make_pre_post_processors
+
+
+__all__ = [
+    "lazy_import_lerobot",
+    "load_manifest_for_spec",
+]

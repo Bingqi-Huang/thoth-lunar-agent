@@ -1,0 +1,47 @@
+# RoboCasa kitchen — deterministic cup counter→sink PnP.
+#
+# Generalization-matrix sibling of robocasa_baguette.yaml: same panda_mobile
+# digital twin and full OpenRAL stack (SLAM + Nav2 + OctoMap kernel gate), but a
+# different fixture pair (sink instead of cabinet) and a different payload
+# geometry (cup: tall, hollow, small footprint vs the baguette's long thin bar).
+# Used to check that the attached-object collision stack is not overfitted to
+# the baguette scene.
+#
+# Run: openral deploy sim --config scenes/deploy/robocasa_sink_cup.yaml
+# Setup: just sync --group robocasa  +  uv pip install -e _external/robocasa --no-deps
+
+scene:
+  id: robocasa/PickPlaceCounterToSink
+  backend: mujoco
+  # 512² for the same reason as robocasa_baguette.yaml: at 128² the open-vocab
+  # detector cannot ground the object. VLA policies downsample their own input.
+  observation_height: 512
+  observation_width: 512
+  backend_options:
+    mode: prebuilt
+    prebuilt_task: PickPlaceCounterToSink
+    robots: ["PandaMobile"]
+    controller: OSC_POSE
+    obj_groups: cup
+
+# Pin the complete kitchen layout / robot start, not only the object group.
+seed: 1
+
+# ADR-0097 place-phase declaration — field-by-field rationale (goal scoping,
+# clock domain, why no region) in scenes/deploy/robocasa_baguette.yaml.
+#
+# target_id CORRECTED against a live run (Spark, seed 1): #142's guess
+# `sim:sink_main_group_1_main` (modal name, 12/60 layouts) was WRONG — HAL
+# refused it fail-closed (target names no MuJoCo body), nothing armed, so the
+# cost was a validation round, not a collision. Seed-1 body table names the
+# sink `sink_island_group_main` (body 319, parent `world`, children
+# `_handle`/`_spout`) — the fixture root, correct/tightest target. Read off
+# the MuJoCo body table, NOT `env.fixture_refs["sink"]` (a nameless tuple in
+# this env); recipe (filter token "sink") in robocasa_baguette.yaml.
+# timeout_s — 300 s (raised from #142's 120 s, a benchmark horizon that
+# doesn't bound `deploy sim`; live baguette run used 92 s of it before grasp).
+place_declaration:
+  target_id: "sim:sink_island_group_main"
+  object_id: ""
+  timeout_s: 300.0
+  stamp_ns: 0

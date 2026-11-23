@@ -1,0 +1,250 @@
+// The one frozen domain of the EUROPA->PLEXIL baseline, for both missions (the
+// authoring rules): the rover's base, arm posture and jaws, every inventoried item's
+// location, every serviced unit's panel, and the capabilities that change them -- navigate_to_feature,
+// dock_at_feature, navigate_to_pose, arm_ready, stow, pick, place, press, scan_label. Mission A ("every unit restored,
+// arm stowed, rover at dock") and Mission B ("item X from S on D, arm stowed, rover at dock") differ only in their goals,
+// and each has pick/place and press available.
+//
+// The brief can name the cargo by its serial, and then only that unit
+// delivered is a success. The inventory record is a record, not an observation, and items of one kind are identical but
+// for the serial on their data plates: an item's `Plate` says whether its serial has been read where it stands
+// (scan_label, the one activity that reads it). A serial-naming brief adds the goal "the named unit's plate read"
+// ahead of its delivery (host.py); where the host believes an item stands is its fact, revised from what a scan reads.
+//
+// An activity's parameters are the capability's arguments (host.py's capability_call, see its
+// traceability table); a parameter with no reason to vary in this domain is pinned with `eq` at its contract default.
+// Durations are bounded by the contracts' `default_deadline_s`.
+
+class Location
+{
+  string name;
+  Location(string _name) { name = _name; }
+}
+
+// the named planar poses of the site map (the dock)
+class NamedPose extends Location
+{
+  NamedPose(string _name) { super(_name); }
+}
+
+// a surveyed site interaction point and the two base stances the contracts define for it
+class Feature
+{
+  string name;
+  Location approach;  // navigate_to_feature: standoff_m out along the normal
+  Location work;      // dock_at_feature, standoff 0: the arm reaches the feature
+  Feature(string _name, Location _approach, Location _work)
+  {
+    name = _name;
+    approach = _approach;
+    work = _work;
+  }
+}
+
+class Base extends Timeline
+{
+  predicate At { Location loc; }
+  predicate Moving { Location to; }
+}
+
+// where a movable item is: on a surveyed support, or in the rover's own jaws. `pick`/`place` are the only
+// activities that move it -- nothing else changes an item's location in this domain.
+class ItemLoc extends Timeline
+{
+  predicate On { Feature support; }
+  predicate Held {}
+}
+
+// whether an item's serial has been read on its data plate where it stands (scan_label): until then which of the
+// identical items of its kind stands on a support is only the record's word
+class Plate extends Timeline
+{
+  predicate Unread {}
+  predicate Read { Feature support; }
+}
+
+// every item of the inventory record (manifest), by serial number, on its recorded support
+class Item
+{
+  string name;
+  ItemLoc loc;
+  Plate plate;
+  Item(string _name) { name = _name; loc = new ItemLoc(); plate = new Plate(); }
+}
+
+// arm_ready/stow move the arm between its two named postures; pick/place need Ready and change Jaws/ItemLoc
+// together. Neither posture nor jaws models the arm's continuous motion -- contracts.yaml's own capabilities are
+// single, whole-operation calls, not a joint-space trajectory the domain has any reason to plan over.
+class Posture extends Timeline
+{
+  predicate Stowed {}
+  predicate Ready {}
+}
+
+class Jaws extends Timeline
+{
+  predicate Empty {}
+  predicate Holding { Item item; }
+}
+
+// a serviced unit's breaker as its own telemetry reports it (power_status): tripped = Faulted, closed = Restored
+class Panel extends Timeline
+{
+  predicate Faulted {}
+  predicate Restored {}
+}
+
+class Unit
+{
+  string name;
+  Panel panel;
+  Feature button;  // which surveyed feature presses this unit's reset -- a structural fact, like a Feature's own stances
+  Unit(string _name, Feature _button) { name = _name; panel = new Panel(); button = _button; }
+}
+
+class LunarBot
+{
+  Base base;
+  Posture posture;
+  Jaws jaws;
+  LunarBot() { base = new Base(); posture = new Posture(); jaws = new Jaws(); }
+
+  action navigate_to_feature { Feature feature; float standoff_m; eq(standoff_m, 1.2); leq(duration, 400); }
+  action dock_at_feature { Feature feature; float standoff_m; eq(standoff_m, 0.0); leq(duration, 240); }
+  action navigate_to_pose { NamedPose pose; leq(duration, 400); }
+  action arm_ready { float tolerance_rad; eq(tolerance_rad, 0.08); leq(duration, 120); }
+  action stow { float tolerance_rad; eq(tolerance_rad, 0.08); leq(duration, 120); }
+  // pick's contract does not itself require Ready (it plans its own way from wherever the arm is); Ready is
+  // required here because that is the covered instance's own verified order (the agent's and PLEXIL's covered calls);
+  // it is not an unverified shortcut the solver would otherwise be free to take.
+  // target/part (pick) and release_constraint (place) are natural-language/catalogue text the solver has no reason
+  // to reason over (there is exactly one way to describe an item); host.py's capability_call fills them in from
+  // the baselines' shared item table (baselines/item_descriptions.json).
+  action pick { Item item; Feature support; leq(duration, 900); }
+  action place { Item item; Feature support; leq(duration, 600); }
+  // press's own contract needs no particular starting posture ("plans its own way from wherever the arm is") and
+  // does not itself need arm_ready -- but it does reach into the panel to press the button and does not fold back
+  // to the travel posture afterward (contracts.yaml: "the tool goes in ... then withdraws", not "returns to
+  // stowed"), so it transitions posture from Stowed (the covered instance's own starting posture) to Ready, which is
+  // what leaves `stow` something real to do.
+  action press { Unit unit; Feature feature; leq(duration, 420); }
+  // scan_label's contract: `support` and the kind of `item` expected there (the host sends the item's catalogue name)
+  action scan_label { Feature support; Item item; leq(duration, 300); }
+}
+
+// Nav2 drives from wherever the base is
+LunarBot::navigate_to_feature
+{
+  met_by(condition object.base.At from);
+  equals(effect object.base.Moving m);
+  eq(m.to, feature.approach);
+  meets(effect object.base.At to);
+  eq(to.loc, feature.approach);
+}
+
+// contract: closes the last metre onto the work pose, entered along the feature's axis -- from its approach point
+LunarBot::dock_at_feature
+{
+  met_by(condition object.base.At from);
+  eq(from.loc, feature.approach);
+  equals(effect object.base.Moving m);
+  eq(m.to, feature.work);
+  meets(effect object.base.At to);
+  eq(to.loc, feature.work);
+}
+
+LunarBot::navigate_to_pose
+{
+  met_by(condition object.base.At from);
+  equals(effect object.base.Moving m);
+  eq(m.to, pose);
+  meets(effect object.base.At to);
+  eq(to.loc, pose);
+}
+
+LunarBot::arm_ready
+{
+  met_by(condition object.posture.Stowed from);
+  meets(effect object.posture.Ready to);
+}
+
+// stow's own contract refuses a load in the jaws (openral_ext/capability_server/node.py: folding a held item
+// through the rover is a hardware limit, not a task rule) -- the domain states the same refusal as a precondition.
+// `contained_by`, not `met_by`, for jaws.Empty: stow does not itself transition the jaws (unlike posture, which it
+// does), it only requires them to already read empty throughout -- the same relation nasa/europa's own Rover
+// example uses for a cross-timeline check the action does not itself cause (Instrument::TakeSample's
+// `contained_by(condition object.navigator.At at)`, Rover::Go's `contained_by(condition
+// object.instrument.location.Stowed)`). Using `met_by` here instead let the solver satisfy it with a token that
+// was never actually connected back to the real jaws state (verified empirically: it produced a `place` with no
+// preceding `pick` at all, "solved" only because the precondition was never really checked).
+LunarBot::stow
+{
+  met_by(condition object.posture.Ready from);
+  contained_by(condition object.jaws.Empty j);
+  meets(effect object.posture.Stowed to);
+}
+
+// both need the base already docked at the support's work stance (dock_at_feature, standoff 0) -- the same
+// precondition the covered instance actually needs (the agent and PLEXIL dock before every pick/place). Making this a
+// real precondition, not an externally-dictated step, is the point of using EUROPA at all: given only the
+// mission's own goals, the solver has to derive navigate_to_feature+dock_at_feature itself to satisfy it.
+// `contained_by` for posture/base, the same cross-timeline reason as stow's jaws check above -- pick/place do not
+// themselves move the base or change posture. `met_by` stays for jaws/item.loc: those are the same timelines
+// pick/place's own effects transition, exactly like Rover::Go's `met_by(condition object.navigator.At _from)`.
+LunarBot::pick
+{
+  contained_by(condition object.posture.Ready p);
+  met_by(condition object.jaws.Empty j);
+  contained_by(condition object.base.At bp);
+  eq(bp.loc, support.work);
+  met_by(condition item.loc.On from);
+  eq(from.support, support);
+  meets(effect object.jaws.Holding held);
+  eq(held.item, item);
+  meets(effect item.loc.Held to);
+}
+
+LunarBot::place
+{
+  contained_by(condition object.posture.Ready p);
+  met_by(condition object.jaws.Holding held);
+  eq(held.item, item);
+  contained_by(condition object.base.At bp);
+  eq(bp.loc, support.work);
+  met_by(condition item.loc.Held from);
+  meets(effect object.jaws.Empty j);
+  meets(effect item.loc.On to);
+  eq(to.support, support);
+}
+
+// the unit's reset button, docked at: its breaker closes. `feature` is kept as its own action parameter (not just
+// read off unit.button) so it is directly readable in the activity's own parameter list, the same reason pick/place
+// keep `support` alongside `item` -- constrained to actually be the unit's own button, not left for the solver to
+// pick freely.
+LunarBot::press
+{
+  eq(feature, unit.button);
+  contained_by(condition object.base.At bp);
+  eq(bp.loc, feature.work);
+  met_by(condition object.posture.Stowed from);
+  meets(effect object.posture.Ready to);
+  met_by(condition unit.panel.Faulted pf);
+  meets(effect unit.panel.Restored pt);
+}
+
+// contracts.yaml scan_label: docked at the support (dock_at_feature, standoff 0) with the jaws empty; the wrist camera
+// views the lid of the item believed there and the arm folds back to its travel posture (Stowed at both ends here: a
+// Ready arm is stowed first, which stow's own rule allows only with empty jaws too). Planned, it reads that item's serial
+// there; what it actually reads is the host's fact (host.py facts_from_scan), and anything else ends it off-plan.
+LunarBot::scan_label
+{
+  contained_by(condition item.loc.On on);
+  eq(on.support, support);
+  contained_by(condition object.base.At bp);
+  eq(bp.loc, support.work);
+  contained_by(condition object.jaws.Empty j);
+  contained_by(condition object.posture.Stowed p);
+  met_by(condition item.plate.Unread u);
+  meets(effect item.plate.Read r);
+  eq(r.support, support);
+}

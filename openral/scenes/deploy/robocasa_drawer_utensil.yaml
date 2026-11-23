@@ -1,0 +1,71 @@
+# RoboCasa kitchen — deterministic utensil counter→drawer PnP.
+# Generalization-matrix sibling of robocasa_baguette.yaml (same panda_mobile
+# twin + full stack): place target is a drawer reached down into, payload is a
+# thin flat utensil with finer primitive decomposition than the baguette —
+# checks the collision stack isn't overfit to that scene.
+#
+# NOT the fridge scene's initial-configuration defect (assumed twice, wrongly,
+# by analogy) — but it is LINK-model marginal. Unpinned seed 1 (layout 29/style
+# 24): robot0_link1 43.3 mm from stack_2_left_group_3_door_g2. That 43.3 mm does
+# NOT clear the kernel's real criterion (`corner_slop(link) + 21.65 mm` =
+# 75.05 mm for panda_link1) — an earlier note wrongly claimed it did (same
+# mistake #154 made for the fridge scene). At the shipped `layout_ids: [3]` pin,
+# a live octomap round (2026-08-25) measured the kernel at -1.94 mm on
+# panda_link1: a marginal real stop. Left pinned at 3 anyway — re-scored with
+# exact link geometry (not the manifest OBB) the same state reads +20.01 mm and
+# does not stop, so the staged tighter-primitive work (#166) fixes this with no
+# scene change; revisit if #166 stalls. Pin exists for reproducibility, not to
+# fix a base-placement defect (there isn't one here).
+#
+# Run: openral deploy sim --config scenes/deploy/robocasa_drawer_utensil.yaml
+# Setup: just sync --group robocasa  +  uv pip install -e _external/robocasa --no-deps
+
+scene:
+  id: robocasa/PickPlaceCounterToDrawer
+  backend: mujoco
+  observation_height: 512
+  observation_width: 512
+  backend_options:
+    mode: prebuilt
+    prebuilt_task: PickPlaceCounterToDrawer
+    robots: ["PandaMobile"]
+    controller: OSC_POSE
+    obj_groups: utensil
+    # DO NOT REMOVE — pins reproducibility (CLAUDE.md §1.8). Seed alone doesn't
+    # pin the kitchen: layout, style, fixtures, which qualifying TOP_DRAWER the
+    # task resolves, door-open amounts and spawn deviation share one `env.rng`,
+    # so pinning `layout_ids` is not a no-op even when it names the layout
+    # already drawn (`[29]` here yields style 29/80.4 mm, not the unpinned
+    # draw's style 24/43.3 mm). Layout 3 measured: robot0_link1 77.5 mm from
+    # stack_1_right_group_2_door_g1, 0 contacts, 3x the 25 mm occupancy grid.
+    # Layout 30 (correct for the fridge scene) is WRONG here (0.000 mm) — the
+    # two scenes park the base against different fixtures.
+    layout_ids: [3]
+
+seed: 1
+
+# ADR-0097 place-phase declaration — DELIBERATELY ABSENT, pending a live run.
+# See robocasa_baguette.yaml for field shapes/rationale. This is the one scene
+# where the target can't be named honestly from the authoring host.
+#
+# `PickPlaceCounterToDrawer` resolves `register_fixture_ref("drawer",
+# TOP_DRAWER)` — any Drawer with z in [0.7, 0.9]. Drawers aren't named in layout
+# files; the generated name `<stack>_<group>_<level>` (e.g. `stack_1_main_group_2`)
+# recurs across layouts pointing at a DIFFERENT drawer each time, and each layout
+# has 2-31 qualifying candidates, so — unlike sink/fridge, where a wrong guess
+# simply fails to resolve — a guessed name here would likely resolve to a real
+# receptacle elsewhere and arm the witness there (hazard HZ-0097-2).
+# `env.fixture_refs["drawer"].name` does not exist (tuples, name None — same
+# issue that shipped wrong names for sink/fridge in #142). Grepping the MuJoCo
+# body table for "drawer" is also unsafe here: at seed 1 the only "drawer"
+# matches belong to the FRIDGE's freezer, not this task's counter drawer
+# (`stack_2_left_group_3_*`) — a name that resolves cannot fail closed.
+# Stays undeclared until a live run identifies the actual resolved
+# `stack_<n>_<side>_group_<level>` body (fixture identity, not a name match).
+# Shape to add once known (recipe/timeout rationale in robocasa_baguette.yaml):
+#
+#   place_declaration:
+#     target_id: "sim:<that fixture>_main"
+#     object_id: ""
+#     timeout_s: 300.0
+#     stamp_ns: 0

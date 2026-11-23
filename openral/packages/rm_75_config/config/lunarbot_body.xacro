@@ -1,0 +1,87 @@
+<?xml version="1.0"?>
+<!--
+  LunarBot's own body around the RM-75, for MoveIt's self-collision model.
+
+  rm_75_config was the arm alone: `rm_group` planned in `base_link` with nothing but the seven links to
+  avoid, so a "collision-free" plan could sweep the deck, the wheels or the gripper through the rover.
+  Boxes below are the collision geometry SRB simulates (`lunarbot.usdc` per-link collision bounds in
+  the chassis frame), not the visual hull; the sensor mast has
+  no collider in the simulator and is deliberately absent here too, so what MoveIt avoids is what the
+  simulator would collide with. The arm mount is the articulation's own `base_link` pose
+  (-0.4475, 0, 0.727), identity rotation (confirmed live from SRB's TF).
+
+  Making `chassis_base_link` the URDF root also makes it MoveIt's planning frame, so a goal in the
+  rover frame needs no TF re-expression; `tcp_frame` (Link7 + 0.14 m tool offset, the same frame the
+  sensor bridge publishes) is a fixed link so a goal can constrain the TCP directly.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:include filename="eg2_collision.xacro"/>
+  <xacro:macro name="lunarbot_body">
+    <link name="chassis_base_link">
+      <!-- deck slab: the chassis collision box, x +-0.661, y +-0.336, z 0.485..0.612 -->
+      <collision name="deck">
+        <origin xyz="0 0 0.5485" rpy="0 0 0"/>
+        <geometry><box size="1.322 0.672 0.127"/></geometry>
+      </collision>
+      <!-- wheels as boxes bounding the 0.1453 m radius, 0.082 m wide cylinders -->
+      <collision name="wheel_front_left">
+        <origin xyz="0.4925 0.468 0.1455" rpy="0 0 0"/>
+        <geometry><box size="0.291 0.082 0.291"/></geometry>
+      </collision>
+      <collision name="wheel_front_right">
+        <origin xyz="0.4925 -0.468 0.1455" rpy="0 0 0"/>
+        <geometry><box size="0.291 0.082 0.291"/></geometry>
+      </collision>
+      <collision name="wheel_rear_left">
+        <origin xyz="-0.5225 0.468 0.1455" rpy="0 0 0"/>
+        <geometry><box size="0.291 0.082 0.291"/></geometry>
+      </collision>
+      <collision name="wheel_rear_right">
+        <origin xyz="-0.5225 -0.468 0.1455" rpy="0 0 0"/>
+        <geometry><box size="0.291 0.082 0.291"/></geometry>
+      </collision>
+    </link>
+    <!-- The rover's other actuated joints. They carry no geometry (the wheels' envelope is already on
+         chassis_base_link above and steering barely changes it), but the model must KNOW them: the robot
+         publishes one 21-joint /joint_states, and MoveIt's CurrentStateMonitor logged an ERROR per unknown
+         joint per message — ~600 lines/s, enough to drown the deploy log. -->
+    <xacro:macro name="passive_joint" params="name parent:=chassis_base_link axis:='0 0 1' type:=revolute lower:=-3.15 upper:=3.15">
+      <link name="${name}_link"/>
+      <joint name="${name}" type="${type}">
+        <parent link="${parent}"/>
+        <child link="${name}_link"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <axis xyz="${axis}"/>
+        <xacro:if value="${type == 'revolute'}">
+          <limit lower="${lower}" upper="${upper}" effort="0" velocity="0"/>
+        </xacro:if>
+        <xacro:if value="${type == 'continuous'}">
+          <limit effort="0" velocity="0"/>
+        </xacro:if>
+      </joint>
+    </xacro:macro>
+    <xacro:passive_joint name="chassis_to_front_left_steering_joint"/>
+    <xacro:passive_joint name="chassis_to_front_right_steering_joint"/>
+    <xacro:passive_joint name="chassis_to_rear_left_steering_joint"/>
+    <xacro:passive_joint name="chassis_to_rear_right_steering_joint"/>
+    <xacro:passive_joint name="front_left_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
+    <xacro:passive_joint name="front_right_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
+    <xacro:passive_joint name="rear_left_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
+    <xacro:passive_joint name="rear_right_steering_to_wheel_joint" axis="0 1 0" type="continuous"/>
+    <xacro:eg2_collision_model />
+
+    <joint name="chassis_to_arm_mount" type="fixed">
+      <parent link="chassis_base_link"/>
+      <child link="base_link"/>
+      <origin xyz="-0.4475 0 0.727" rpy="0 0 0"/>
+    </joint>
+
+    <!-- tool centre point: Link7 + _TCP_OFFSET (SRB lunarbot.py / sensor bridge `tcp_frame`) -->
+    <link name="tcp_frame"/>
+    <joint name="link7_to_tcp" type="fixed">
+      <parent link="Link7"/>
+      <child link="tcp_frame"/>
+      <origin xyz="0 0 0.14" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+</robot>

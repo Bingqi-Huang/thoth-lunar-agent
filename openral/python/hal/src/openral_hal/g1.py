@@ -1,0 +1,654 @@
+"""HAL adapter for the Unitree G1 humanoid (MuJoCo digital twin).
+
+Wraps the upstream DeepMind ``mujoco_menagerie`` G1 MJCF
+(``unitree_g1/g1.xml``, vendored via ``robot_descriptions``) as an
+``openral_hal.HAL`` Protocol implementation, extending the
+``openral_hal.UR5eHAL`` / ``openral_hal.FrankaPandaHAL`` /
+``openral_hal.SO100MujocoHAL`` pattern to a 29-DoF bipedal humanoid.
+
+The default HAL is a **digital-twin contract validator** with the
+ADR-0087 kinematic glide. ``walking_enabled=True`` selects ADR-0089's
+pinned MuJoCo Playground ONNX controller and matching dynamics for
+gravity-on sim walking (simulation-only Python policy; the production
+C++ S0 controller is future work — see
+`docs/architecture/repo-state-map.html` for the planned production S0
+block; the walking controller must never be reused by a real HAL). The
+suite validates the 29-DoF joint-position action layout, lifecycle
+wiring (``connect → read_state → send_action → estop``), joint
+indexing, ``RobotDescription`` round-trip, embodiment/VLA tag plumbing,
+and the optional BODY_TWIST-to-walking controller path.
+
+Joint inventory: the menagerie MJCF has 30 joints (29 actuated + 1
+floating base, not exposed on ``RobotDescription`` — implicit world
+state, not Skill-commanded) and 29 position actuators in a fixed order:
+
+    legs  : 2 x (hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll)
+    waist : yaw, roll, pitch
+    arms  : 2 x (shoulder_pitch, shoulder_roll, shoulder_yaw, elbow,
+                 wrist_roll, wrist_pitch, wrist_yaw)
+
+i.e. 12 + 3 + 14 = 29. qpos addresses for the actuated joints are
+``7..35`` (first 7 qpos slots are the floating base); actuator indices
+are ``0..28``, aligned 1:1 with the joint order above.
+
+The wrist endpoint is a bare joint — this menagerie variant ships no
+hand actuators, so there is no gripper to map. A future
+``g1_with_hands`` variant would need a hand-aware subclass.
+
+Example:
+    >>> from openral_hal import G1MujocoHAL, G1_DESCRIPTION
+    >>> hal = G1MujocoHAL(gravity_enabled=False)  # doctest: +SKIP
+    >>> hal.connect()  # doctest: +SKIP
+    >>> state = hal.read_state()  # doctest: +SKIP
+    >>> len(state.position) == len(G1_DESCRIPTION.joints) == 29  # doctest: +SKIP
+    True
+    >>> hal.disconnect()  # doctest: +SKIP
+"""
+
+from __future__ import annotations
+
+import math
+import time
+
+import structlog
+from openral_core import BODY_TWIST_DIM
+from openral_core.exceptions import ROSConfigError
+from openral_core.schemas import (
+    Action,
+    AssetRefs,
+    CameraSimPlacement,
+    ControlMode,
+    EmbodimentKind,
+    HalEntrypoints,
+    IntrinsicsPinhole,
+    JointSpec,
+    JointType,
+    RobotCapabilities,
+    RobotDescription,
+    SafetyEnvelope,
+    SensorModality,
+    SensorSpec,
+    SimDescription,
+    UrdfAsset,
+)
+
+from openral_hal._g1_walking import G1WalkingController, ensure_g1_walking_assets
+from openral_hal._mujoco_arm import MujocoArmHAL
+
+# Twist components a kinematic-glide base does not actuate (linear-z,
+# angular-x, angular-y).  Mirrors ``panda_mobile._PLANAR_TWIST_EPS``.
+_PLANAR_TWIST_EPS = 1e-9
+
+log = structlog.get_logger(__name__)
+
+__all__ = ["G1_DESCRIPTION", "G1MujocoHAL"]
+
+
+# ── Canonical joint order ─────────────────────────────────────────────────────
+# Matches the menagerie MJCF: 6 (left leg) + 6 (right leg) + 3 (waist)
+# + 7 (left arm) + 7 (right arm) = 29 actuated joints.  Verified at
+# import time by ``tests/sim/test_g1_hal_mujoco.py::TestMenagerieSchema``.
+
+_G1_LEFT_LEG_JOINTS: tuple[str, ...] = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+)
+_G1_RIGHT_LEG_JOINTS: tuple[str, ...] = (
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+)
+_G1_WAIST_JOINTS: tuple[str, ...] = (
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+)
+_G1_LEFT_ARM_JOINTS: tuple[str, ...] = (
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+)
+_G1_RIGHT_ARM_JOINTS: tuple[str, ...] = (
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+)
+_G1_JOINT_NAMES: tuple[str, ...] = (
+    *_G1_LEFT_LEG_JOINTS,
+    *_G1_RIGHT_LEG_JOINTS,
+    *_G1_WAIST_JOINTS,
+    *_G1_LEFT_ARM_JOINTS,
+    *_G1_RIGHT_ARM_JOINTS,
+)
+
+
+# ── Joint limits ─────────────────────────────────────────────────────────────
+# Position limits (rad) come from the menagerie MJCF, verbatim — the
+# menagerie pins them to the upstream Unitree G1 URDF / data sheet.
+# Velocity + effort are conservative published-spec values: the G1
+# Edition 6f spec sheet lists ~30 N·m peak for the small-actuator
+# joints (wrist / waist) and ~88 N·m for the large ones (hip / knee).
+# These show up in ``JointSpec.effort_limit`` / ``velocity_limit`` for
+# capability matching only — MuJoCo's ``mj_step`` does not honour them
+# (its actuators use ``ctrlrange`` from the MJCF instead).
+
+_G1_POSITION_LIMITS: dict[str, tuple[float, float]] = {
+    "left_hip_pitch_joint": (-2.5307, 2.8798),
+    "left_hip_roll_joint": (-0.5236, 2.9671),
+    "left_hip_yaw_joint": (-2.7576, 2.7576),
+    "left_knee_joint": (-0.087267, 2.8798),
+    "left_ankle_pitch_joint": (-0.87267, 0.5236),
+    "left_ankle_roll_joint": (-0.2618, 0.2618),
+    "right_hip_pitch_joint": (-2.5307, 2.8798),
+    "right_hip_roll_joint": (-2.9671, 0.5236),
+    "right_hip_yaw_joint": (-2.7576, 2.7576),
+    "right_knee_joint": (-0.087267, 2.8798),
+    "right_ankle_pitch_joint": (-0.87267, 0.5236),
+    "right_ankle_roll_joint": (-0.2618, 0.2618),
+    "waist_yaw_joint": (-2.618, 2.618),
+    "waist_roll_joint": (-0.52, 0.52),
+    "waist_pitch_joint": (-0.52, 0.52),
+    "left_shoulder_pitch_joint": (-3.0892, 2.6704),
+    "left_shoulder_roll_joint": (-1.5882, 2.2515),
+    "left_shoulder_yaw_joint": (-2.618, 2.618),
+    "left_elbow_joint": (-1.0472, 2.0944),
+    "left_wrist_roll_joint": (-1.97222, 1.97222),
+    "left_wrist_pitch_joint": (-1.61443, 1.61443),
+    "left_wrist_yaw_joint": (-1.61443, 1.61443),
+    "right_shoulder_pitch_joint": (-3.0892, 2.6704),
+    "right_shoulder_roll_joint": (-2.2515, 1.5882),
+    "right_shoulder_yaw_joint": (-2.618, 2.618),
+    "right_elbow_joint": (-1.0472, 2.0944),
+    "right_wrist_roll_joint": (-1.97222, 1.97222),
+    "right_wrist_pitch_joint": (-1.61443, 1.61443),
+    "right_wrist_yaw_joint": (-1.61443, 1.61443),
+}
+
+# Conservative velocity limits — the G1 spec lists ~12 rad/s peak for
+# hip / knee, ~20 rad/s for wrists.  Halved here for the safety
+# envelope (CLAUDE.md §1.1 — refuse a request before it can damage the
+# hardware).
+_G1_VELOCITY_LIMITS_BY_GROUP: dict[str, float] = {
+    "hip": 6.0,
+    "knee": 6.0,
+    "ankle": 6.0,
+    "waist": 6.0,
+    "shoulder": 6.0,
+    "elbow": 6.0,
+    "wrist": 10.0,
+}
+_G1_EFFORT_LIMITS_BY_GROUP: dict[str, float] = {
+    "hip": 88.0,
+    "knee": 88.0,
+    "ankle": 30.0,
+    "waist": 88.0,
+    "shoulder": 30.0,
+    "elbow": 30.0,
+    "wrist": 30.0,
+}
+
+
+def _g1_group(joint_name: str) -> str:
+    """Return the kinematic group for *joint_name* (``hip`` / ``knee`` / ``wrist`` / …)."""
+    for token in ("hip", "knee", "ankle", "waist", "shoulder", "elbow", "wrist"):
+        if token in joint_name:
+            return token
+    raise ROSConfigError(f"Unknown G1 joint group for joint {joint_name!r}.")
+
+
+def _g1_parent_child(joint_name: str) -> tuple[str, str]:
+    """Return ``(parent_link, child_link)`` for *joint_name*.
+
+    The names follow the menagerie URDF convention — ``pelvis`` for the
+    floating-base root, then ``<side>_<segment>_link`` for the body
+    above each joint.  Strict accuracy isn't necessary (these fields
+    are descriptive metadata for the JointSpec, not used by the HAL
+    contract), but using stable names keeps ``RobotDescription``
+    diffs readable.
+    """
+    # The "previous" link in each chain.  ``waist_*`` lifts off the pelvis;
+    # the arms / shoulders lift off the upper-torso end of the waist chain.
+    prev_link: dict[str, str] = {
+        "left_hip_pitch_joint": "pelvis",
+        "left_hip_roll_joint": "left_hip_pitch_link",
+        "left_hip_yaw_joint": "left_hip_roll_link",
+        "left_knee_joint": "left_hip_yaw_link",
+        "left_ankle_pitch_joint": "left_knee_link",
+        "left_ankle_roll_joint": "left_ankle_pitch_link",
+        "right_hip_pitch_joint": "pelvis",
+        "right_hip_roll_joint": "right_hip_pitch_link",
+        "right_hip_yaw_joint": "right_hip_roll_link",
+        "right_knee_joint": "right_hip_yaw_link",
+        "right_ankle_pitch_joint": "right_knee_link",
+        "right_ankle_roll_joint": "right_ankle_pitch_link",
+        "waist_yaw_joint": "pelvis",
+        "waist_roll_joint": "waist_yaw_link",
+        "waist_pitch_joint": "waist_roll_link",
+        "left_shoulder_pitch_joint": "torso_link",
+        "left_shoulder_roll_joint": "left_shoulder_pitch_link",
+        "left_shoulder_yaw_joint": "left_shoulder_roll_link",
+        "left_elbow_joint": "left_shoulder_yaw_link",
+        "left_wrist_roll_joint": "left_elbow_link",
+        "left_wrist_pitch_joint": "left_wrist_roll_link",
+        "left_wrist_yaw_joint": "left_wrist_pitch_link",
+        "right_shoulder_pitch_joint": "torso_link",
+        "right_shoulder_roll_joint": "right_shoulder_pitch_link",
+        "right_shoulder_yaw_joint": "right_shoulder_roll_link",
+        "right_elbow_joint": "right_shoulder_yaw_link",
+        "right_wrist_roll_joint": "right_elbow_link",
+        "right_wrist_pitch_joint": "right_wrist_roll_link",
+        "right_wrist_yaw_joint": "right_wrist_pitch_link",
+    }
+    parent = prev_link[joint_name]
+    # The child link of the joint is named after the joint itself, dropping
+    # the ``_joint`` suffix and appending ``_link``.
+    child = joint_name.removesuffix("_joint") + "_link"
+    return parent, child
+
+
+def _g1_joint_specs() -> list[JointSpec]:
+    specs: list[JointSpec] = []
+    for name in _G1_JOINT_NAMES:
+        group = _g1_group(name)
+        parent, child = _g1_parent_child(name)
+        specs.append(
+            JointSpec(
+                name=name,
+                joint_type=JointType.REVOLUTE,
+                parent_link=parent,
+                child_link=child,
+                position_limits=_G1_POSITION_LIMITS[name],
+                velocity_limit=_G1_VELOCITY_LIMITS_BY_GROUP[group],
+                effort_limit=_G1_EFFORT_LIMITS_BY_GROUP[group],
+                has_torque_sensor=True,  # G1 publishes joint torque feedback
+                actuator_kind="bldc",
+            )
+        )
+    return specs
+
+
+# ── RobotDescription ─────────────────────────────────────────────────────────
+# ``EmbodimentKind.HUMANOID`` because the G1 is bipedal; this triggers
+# the eval / dispatcher pathways that recognise a humanoid embodiment
+# (GR00T N1.x heads, ``humanoid_everyday_g1`` policies, etc.).  The
+# floating-base joint is intentionally NOT enumerated — it's implicit
+# world state, not something a Skill commands.
+
+G1_DESCRIPTION = RobotDescription(
+    name="g1",
+    embodiment_kind=EmbodimentKind.HUMANOID,
+    base_frame="pelvis",
+    joints=_g1_joint_specs(),
+    # No end-effector in this menagerie variant — the wrist is a bare
+    # joint chain.  Future ``g1_with_hands`` revs would add Inspire / Dex-3
+    # hands as ``EndEffectorSpec`` entries here.
+    end_effectors=[],
+    # Forward egocentric head camera (ADR-0087).  The menagerie MJCF ships
+    # no <camera>, so the generic HAL camera rig splices this onto
+    # ``torso_link`` at head height (~1.2 m world when standing), looking
+    # forward with a slight downward pitch. ``vla_feature_key`` matches the
+    # InternVLA-N1 VLN rSkill's ``sensors_required`` so the skill loader
+    # auto-wires it as the policy's egocentric view.
+    sensors=[
+        SensorSpec(
+            name="head",
+            modality=SensorModality.RGB,
+            frame_id="head_camera",
+            parent_frame="torso_link",
+            rate_hz=15.0,
+            intrinsics=IntrinsicsPinhole(
+                width=640, height=480, fx=343.0, fy=343.0, cx=320.0, cy=240.0
+            ),
+            encoding="rgb8",
+            vla_feature_key="observation.images.head",
+            sim_placement=CameraSimPlacement(
+                parent_body="torso_link",
+                pos=(0.06, 0.0, 0.40),
+                target=(1.06, 0.0, 0.33),
+            ),
+        )
+    ],
+    capabilities=RobotCapabilities(
+        locomotion=["bipedal"],
+        can_lift_kg=3.0,
+        has_dexterous_hands=False,
+        has_force_control=True,
+        has_vision=True,  # head camera above (rigged into the sim MJCF)
+        bimanual=True,
+        # BODY_TWIST uses ADR-0087's kinematic glide by default and ADR-0089's
+        # pinned walking controller when the deploy scene opts in.
+        supported_control_modes=[ControlMode.JOINT_POSITION, ControlMode.BODY_TWIST],
+        supported_vla_embodiments=["g1", "humanoid_everyday_g1"],
+        # `mobile_base` is the canonical class tag BODY_TWIST nav skills
+        # match on (InternVLA-N1 VLN, nav2-navigate-to-pose).
+        embodiment_tags=["g1", "unitree_g1", "humanoid", "mobile_base"],
+    ),
+    safety=SafetyEnvelope(
+        # Generous workspace envelope — the G1 stands ≈1.3 m tall and
+        # reaches ≈0.7 m horizontally.  The S0 cerebellum (planned, M2)
+        # is the real enforcer; this envelope is a Python-side belt
+        # for the contract-validation path.
+        max_ee_speed_m_s=1.5,
+        max_joint_speed_factor=0.5,
+        max_force_n=100.0,
+        max_torque_nm=88.0,
+        deadman_required=True,
+    ),
+    sdk_kind="open",
+    # The G1 sim HAL is the only execution path today; a future
+    # ``G1RealHAL`` over ``unitree_sdk2`` will derive its
+    # ``RobotDescription`` from this sim baseline via
+    # ``make_real_description`` (matches the UR / Franka / Sawyer / ALOHA
+    # pattern) and will be tracked by a follow-up issue.  Until then the
+    # manifest under ``robots/g1/robot.yaml`` mirrors this sim baseline.
+    hal=HalEntrypoints(sim="openral_hal.g1:G1MujocoHAL", real=None),
+    # Floating-base humanoid — qpos is offset by 7 (3 position + 4 quaternion);
+    # qvel is offset by 6 (3 linear vel + 3 angular vel).  ``MujocoArmHAL``
+    # derives both offsets from ``floating_base=True``.
+    assets=AssetRefs(
+        urdf=UrdfAsset(ref="rd:g1_description"),
+        mjcf="rd:g1_mj_description",
+    ),
+    sim=SimDescription(
+        floating_base=True,
+    ),
+)
+
+
+# ── HAL ──────────────────────────────────────────────────────────────────────
+
+
+class G1MujocoHAL(MujocoArmHAL):
+    """HAL adapter for the Unitree G1 humanoid (MuJoCo digital twin).
+
+    Drives the 29 actuated joints of the menagerie ``unitree_g1`` MJCF
+    through MuJoCo's position-controlled actuators.  Exposes a
+    29-D ``openral_core.Action`` matching the joint order in
+    ``G1_DESCRIPTION`` (left leg 6 → right leg 6 → waist 3 → left
+    arm 7 → right arm 7).
+
+    .. warning::
+
+       The default mode does **not** provide balance; it uses ADR-0087's
+       upright kinematic pin. ``walking_enabled=True`` is a sim-only learned
+       controller, not the production C++ S0 controller required for hardware.
+
+    Args:
+        mjcf_path: Optional override for the MJCF file path.  When
+            ``None``, the file is fetched lazily from
+            ``robot_descriptions``
+            (``mujoco_menagerie/unitree_g1/g1.xml``).
+        settle_steps: Number of MuJoCo physics steps performed in
+            ``send_action``.  Defaults to ``1``; raise it in tests
+            that assert the body has converged at the commanded pose.
+        gravity_enabled: When ``False``, gravity is zeroed at
+            ``connect()`` time — required for the contract-validation
+            tests because the floating base falls otherwise.
+        staleness_limit_s: Maximum age of a cached state.
+
+    Example:
+        >>> from openral_hal import G1MujocoHAL  # doctest: +SKIP
+        >>> hal = G1MujocoHAL(gravity_enabled=False)  # doctest: +SKIP
+        >>> hal.connect()  # doctest: +SKIP
+        >>> state = hal.read_state()  # doctest: +SKIP
+        >>> len(state.position)  # 29 actuated joints  # doctest: +SKIP
+        29
+        >>> hal.disconnect()  # doctest: +SKIP
+    """
+
+    def __init__(
+        self,
+        *,
+        mjcf_path: str | None = None,
+        settle_steps: int = 1,
+        gravity_enabled: bool = True,
+        staleness_limit_s: float = 0.5,
+        body_twist_dt_s: float = 0.05,
+        walking_enabled: bool = False,
+    ) -> None:
+        """Initialise the G1 HAL; no MuJoCo state is created until ``connect()``.
+
+        All wiring (MJCF URI, floating-base offsets) lives in
+        ``G1_DESCRIPTION.sim``.
+
+        Args:
+            mjcf_path: Optional override for the MJCF file path.
+            settle_steps: MuJoCo physics steps per ``send_action``.
+            gravity_enabled: When ``False``, gravity is zeroed at connect.
+            staleness_limit_s: Maximum age of a cached state.
+            body_twist_dt_s: Logical control timestep one BODY_TWIST
+                action integrates the glide base by (matches
+                ``SimAttachedHAL`` / ``PandaMobileHAL``).
+            walking_enabled: Use the pinned MuJoCo Playground ONNX walking
+                controller instead of the kinematic glide.
+        """
+        walking_policy_path: str | None = None
+        if walking_enabled:
+            if not gravity_enabled:
+                raise ROSConfigError("G1 walking requires gravity_enabled=True.")
+            if mjcf_path is not None:
+                raise ROSConfigError(
+                    "G1 walking uses its pinned policy-tuned MJCF; mjcf_path cannot override it."
+                )
+            mjcf_path, walking_policy_path = ensure_g1_walking_assets()
+        self._init_from_description(
+            G1_DESCRIPTION,
+            mjcf_path=mjcf_path,
+            settle_steps=settle_steps,
+            gravity_enabled=gravity_enabled,
+            staleness_limit_s=staleness_limit_s,
+        )
+        if body_twist_dt_s <= 0.0:
+            raise ROSConfigError("G1MujocoHAL body_twist_dt_s must be > 0.")
+        self._body_twist_dt_s = body_twist_dt_s
+        self._walking_policy_path = walking_policy_path
+        self._walking_controller: G1WalkingController | None = None
+        # Kinematic-glide base pin (ADR-0087): ``(x, y, yaw, z0)`` world pose
+        # the free joint is re-pinned to every physics step.  Captured lazily
+        # from the MJCF default qpos on first use after connect.
+        self._base_pin: tuple[float, float, float, float] | None = None
+        # Last commanded base twist, ``base_link`` frame; zeroed by any
+        # non-BODY_TWIST action (odom publisher contract, like PandaMobileHAL).
+        self._last_body_twist: tuple[float, float, float, float, float, float] = (0.0,) * 6
+
+    # ── Kinematic-glide base (ADR-0087) ──────────────────────────────────────
+
+    @property
+    def base_pose(self) -> tuple[float, float, float]:
+        """Current base ``(x, y, yaw)`` for tests / odom publishers."""
+        if self._walking_controller is not None:
+            return self._current_base_pose()
+        x, y, yaw, _z0 = self._pin()
+        return (x, y, yaw)
+
+    @property
+    def base_twist(self) -> tuple[float, float, float, float, float, float]:
+        """Last commanded base body twist (``base_link`` frame); zeroed on non-twist actions."""
+        return self._last_body_twist
+
+    def connect(self) -> None:
+        """Connect and re-arm the base pin (recaptured from the fresh qpos)."""
+        super().connect()
+        self._base_pin = None
+        if self._walking_policy_path is not None:
+            try:
+                import mujoco as mj  # noqa: PLC0415  # reason: optional sim-only dep
+
+                assert self._model is not None and self._data is not None
+                keyframe_id = mj.mj_name2id(self._model, mj.mjtObj.mjOBJ_KEY, "knees_bent")
+                if keyframe_id < 0:
+                    raise ROSConfigError("G1 walking MJCF is missing the 'knees_bent' keyframe.")
+                mj.mj_resetDataKeyframe(self._model, self._data, keyframe_id)
+                mj.mj_forward(self._model, self._data)
+                self._walking_controller = G1WalkingController(self._walking_policy_path)
+                self._walking_controller.initialize(self._data)
+            except ROSConfigError:
+                super().disconnect()
+                raise
+
+    def disconnect(self) -> None:
+        """Release the walking controller and MuJoCo model."""
+        self._walking_controller = None
+        super().disconnect()
+
+    def send_action(self, action: Action) -> None:
+        """Route BODY_TWIST to the glide base; everything else to the arm path.
+
+        A BODY_TWIST action Euler-integrates the planar twist ``(vx, vy, wz)``
+        into the pinned free-joint pose (body frame rotated into world by the
+        current yaw, one ``body_twist_dt_s`` per action — the
+        ``PandaMobileHAL`` convention), then advances physics ``settle_steps``
+        ticks with the base pinned.  The 29 joint actuators keep holding their
+        last targets, so navigation composes with a held upper-body pose.
+        """
+        if action.control_mode != ControlMode.BODY_TWIST.value:
+            self._last_body_twist = (0.0,) * 6
+            super().send_action(action)
+            return
+
+        self._require_connected("send_action")
+        self._validate_action(action)
+        import mujoco as mj  # noqa: PLC0415  # reason: optional sim-only dep
+
+        assert self._data is not None and self._model is not None
+        vx, vy, _vz, _wx, _wy, wz = (float(v) for v in action.body_twist[0])  # type: ignore[index]  # reason: _validate_action guarantees body_twist
+        self._last_body_twist = (vx, vy, 0.0, 0.0, 0.0, wz)
+        if self._walking_controller is not None:
+            self._walk((vx, vy, wz))
+            return
+        x, y, yaw, z0 = self._pin()
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        x += (cy * vx - sy * vy) * self._body_twist_dt_s
+        y += (sy * vx + cy * vy) * self._body_twist_dt_s
+        yaw += wz * self._body_twist_dt_s
+        yaw = (yaw + math.pi) % (2.0 * math.pi) - math.pi
+        self._base_pin = (x, y, yaw, z0)
+
+        for _ in range(self._settle_steps):
+            self._pin_base()
+            mj.mj_step(self._model, self._data)
+        self._last_state_time = time.monotonic()
+        self._last_action_ns = time.monotonic_ns()
+        log.debug(
+            "hal.send_action",
+            robot=self.description.name,
+            control_mode=action.control_mode,
+            body_twist=self._last_body_twist,
+        )
+
+    _step_while_active = False
+
+    def idle_step(self, wall_dt_s: float | None = None) -> bool:
+        """HOLD-step with the glide base pinned (it would free-fall otherwise)."""
+        if self._connected and self._data is not None:
+            self._last_body_twist = (0.0,) * 6
+            if self._walking_controller is not None:
+                # ponytail: pin only while idle; replace with a zero-command
+                # standing policy when one is published and validated.
+                self._base_pin = None
+                self._walking_controller.reset_state()
+            self._pin_base()
+        return super().idle_step(wall_dt_s=wall_dt_s)
+
+    def reset_to_pose(self, pose: list[float]) -> None:
+        """Reset the joint pose and walking policy state."""
+        super().reset_to_pose(pose)
+        self._base_pin = None
+        if self._walking_controller is not None:
+            self._walking_controller.reset_state()
+
+    def _validate_action(self, action: Action) -> None:
+        if action.control_mode == ControlMode.BODY_TWIST.value:
+            if not action.body_twist:
+                raise ROSConfigError(
+                    "G1MujocoHAL.send_action: empty Action.body_twist for BODY_TWIST."
+                )
+            row = action.body_twist[0]
+            if len(row) != BODY_TWIST_DIM:
+                raise ROSConfigError(
+                    f"G1MujocoHAL: BODY_TWIST expects {BODY_TWIST_DIM} floats "
+                    f"(vx, vy, vz, wx, wy, wz); got {len(row)}."
+                )
+            if any(abs(row[i]) > _PLANAR_TWIST_EPS for i in (2, 3, 4)):
+                raise ROSConfigError(
+                    "G1MujocoHAL: BODY_TWIST row carries non-zero linear-z / "
+                    "angular-x / angular-y; the glide base is planar — only "
+                    "vx, vy, wz are actuated."
+                )
+            return
+        super()._validate_action(action)
+
+    def _per_step_update(self, targets: list[float]) -> None:
+        """Re-pin the glide base inside the arm settle loop (gravity holds otherwise)."""
+        del targets
+        self._pin_base()
+
+    def _pin(self) -> tuple[float, float, float, float]:
+        """Return the glide-base pin ``(x, y, yaw, z0)``, capturing it on first use."""
+        if self._base_pin is None:
+            self._require_connected("base_pose")
+            assert self._data is not None
+            qw, qx, qy, qz = (float(self._data.qpos[i]) for i in range(3, 7))
+            yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+            self._base_pin = (
+                float(self._data.qpos[0]),
+                float(self._data.qpos[1]),
+                yaw,
+                float(self._data.qpos[2]),
+            )
+        return self._base_pin
+
+    def _current_base_pose(self) -> tuple[float, float, float]:
+        self._require_connected("base_pose")
+        assert self._data is not None
+        qw, qx, qy, qz = (float(self._data.qpos[i]) for i in range(3, 7))
+        yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        return (float(self._data.qpos[0]), float(self._data.qpos[1]), yaw)
+
+    def _walk(self, command: tuple[float, float, float]) -> None:
+        import mujoco as mj  # noqa: PLC0415  # reason: optional sim-only dep
+
+        assert self._model is not None and self._data is not None
+        assert self._walking_controller is not None
+        steps = max(1, round(self._body_twist_dt_s / float(self._model.opt.timestep)))
+        self._base_pin = None
+        for _ in range(steps):
+            self._walking_controller.apply(self._model, self._data, command)
+            mj.mj_step(self._model, self._data)
+        self._last_state_time = time.monotonic()
+        self._last_action_ns = time.monotonic_ns()
+        log.debug(
+            "hal.send_action",
+            robot=self.description.name,
+            control_mode=ControlMode.BODY_TWIST.value,
+            body_twist=self._last_body_twist,
+            walking=True,
+        )
+
+    def _pin_base(self) -> None:
+        """Write the pinned upright pose into the free joint and zero its velocity.
+
+        The pin is what keeps the gravity-on twin standing: without an S0
+        balance controller the free joint would integrate a fall.  Roll and
+        pitch are clamped to zero (upright), yaw/x/y come from the glide.
+        """
+        assert self._data is not None
+        x, y, yaw, z0 = self._pin()
+        half = 0.5 * yaw
+        self._data.qpos[0:7] = (x, y, z0, math.cos(half), 0.0, 0.0, math.sin(half))
+        self._data.qvel[0:6] = 0.0

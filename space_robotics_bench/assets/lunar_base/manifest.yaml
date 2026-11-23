@@ -1,0 +1,1064 @@
+description: Third-party source assets for the lunar base scene. Raw downloads land in raw/<category>/<slug>/ and
+  are git-ignored; run fetch_assets.py to reproduce.
+assets:
+- id: Z1-01
+  slug: mars_one_base
+  category: habitat
+  name: '"Mars One" Mission - Base'
+  author: admone
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/83ced347037f47aba8473147d65df074
+  fetch:
+    type: sketchfab
+    uid: 83ced347037f47aba8473147d65df074
+  notes: 30 separate modules on lander legs; unit-less (~986 wide), rescale.
+  tags:
+  - 30 parts
+- id: Z1-02
+  slug: nasa_habitat_demonstration_unit
+  category: habitat
+  name: Habitat Demonstration Unit
+  author: NASA
+  license: NASA-Media-Usage (public domain; no insignia in AI imagery)
+  page: https://github.com/nasa/NASA-3D-Resources
+  fetch:
+    type: url
+    urls:
+    - https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/3D%20Models/Habitat%20Demonstration%20Unit/Habitat%20Demonstration%20Unit%20%28part%201%29.glb
+    - https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/3D%20Models/Habitat%20Demonstration%20Unit/Habitat%20Demonstration%20Unit%20%28part%202%29.glb
+  notes: Paint out NASA meatball on texture.
+  tags: []
+- id: Z1-03
+  slug: halley_vi_dorm_pod
+  category: habitat
+  name: Halley VI Antarctic Research Station Dorm Pod
+  author: Andre Lages
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/88dbccb1cb6e487585a6505d64cb36e8
+  fetch:
+    type: sketchfab
+    uid: 88dbccb1cb6e487585a6505d64cb36e8
+  notes: Module on ski legs; repaint blue to white.
+  tags: []
+- id: Z1-04
+  slug: gazebo_moon_base_dome
+  category: habitat
+  name: Moon base dome
+  author: OpenRobotics
+  license: CC-BY-4.0
+  page: https://app.gazebosim.org/OpenRobotics/fuel/models/Moon base dome
+  fetch:
+    type: fuel
+    owner: OpenRobotics
+    model: Moon base dome
+  notes: 36 parts incl. separate Door mesh; ~256 MB.
+  tags:
+  - door
+- id: Z1-05
+  slug: idss_docking_system
+  category: habitat
+  name: International Docking System (IDSS)
+  author: ArcturusVFX
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/678890a8c41f48ff8782ea2ec8e7b0a1
+  fetch:
+    type: sketchfab
+    uid: 678890a8c41f48ff8782ea2ec8e7b0a1
+  notes: Hatch, petals, latches as parts; real scale 1.52 m.
+  tags:
+  - hatch
+- id: Z1-07
+  slug: ratchet_wrench
+  category: tools
+  name: ratchet_wrench
+  author: Poly Haven
+  license: CC0-1.0
+  page: https://polyhaven.com/a/ratchet_wrench
+  fetch:
+    type: polyhaven
+    asset: ratchet_wrench
+    resolution: 2k
+  notes: Rigged hand tool.
+  tags:
+  - graspable
+- id: Z1-08
+  slug: adjustable_wrench
+  category: tools
+  name: adjustable_wrench
+  author: Poly Haven
+  license: CC0-1.0
+  page: https://polyhaven.com/a/adjustable_wrench
+  fetch:
+    type: polyhaven
+    asset: adjustable_wrench
+    resolution: 2k
+  notes: Hand tool.
+  tags:
+  - graspable
+- id: Z1-09
+  slug: hytorc_torque_wrench
+  category: tools
+  name: HYTORC LION Gun – Electric torque wrench
+  author: HYTORC Benelux
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/bcc47ca2a2204e13881cba04c19f840b
+  fetch:
+    type: sketchfab
+    uid: bcc47ca2a2204e13881cba04c19f840b
+  notes: Pistol-grip power tool; 1.09 M faces, decimate.
+  tags:
+  - graspable
+- id: Z1-10
+  slug: retro_multimeter
+  category: tools
+  name: retro_multimeter
+  author: Poly Haven
+  license: CC0-1.0
+  page: https://polyhaven.com/a/retro_multimeter
+  fetch:
+    type: polyhaven
+    asset: retro_multimeter
+    resolution: 2k
+  notes: Hand-held inspection instrument.
+  tags:
+  - graspable
+- id: Z2-01
+  slug: utility_box_02
+  category: power
+  name: utility_box_02
+  author: Poly Haven
+  license: CC0-1.0
+  page: https://polyhaven.com/a/utility_box_02
+  fetch:
+    type: polyhaven
+    asset: utility_box_02
+    resolution: 2k
+  notes: PDU body 0.92x0.43x1.12 m; split doors into links.
+  tags:
+  - pdu
+- id: Z2-02
+  slug: power_box_01
+  category: power
+  name: power_box_01
+  author: Poly Haven
+  license: CC0-1.0
+  page: https://polyhaven.com/a/power_box_01
+  fetch:
+    type: polyhaven
+    asset: power_box_01
+    resolution: 2k
+  notes: Breaker board; door is a separate node.
+  tags:
+  - pdu
+  - door
+- id: Z2-03
+  slug: electrical_distribution_cabinet
+  category: power
+  name: Electrical Distribution Cabinet
+  author: Arsen Ismailov
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/5dd2ce8a5baf4efca7179ed821084a21
+  fetch:
+    type: sketchfab
+    uid: 5dd2ce8a5baf4efca7179ed821084a21
+  notes: White panel face with switches and lamps.
+  tags:
+  - pdu
+- id: Z2-04
+  slug: electric_distribution_box
+  category: power
+  name: Electric Distribution Box
+  author: Avadhoot
+  license: CC-BY-SA-4.0
+  page: https://sketchfab.com/3d-models/b5e233fbe3bf49b2a21fd186b07b190b
+  fetch:
+    type: sketchfab
+    uid: b5e233fbe3bf49b2a21fd186b07b190b
+  notes: Open door over breaker rows; derivatives must stay CC-BY-SA.
+  tags:
+  - pdu
+  - door
+- id: Z2-05
+  slug: distribution_box_knife_switches
+  category: power
+  name: Distribution_Box
+  author: Evgenii Sobolev
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/18b306c360d24cac9f5cbbfe96cfed41
+  fetch:
+    type: sketchfab
+    uid: 18b306c360d24cac9f5cbbfe96cfed41
+  notes: Open door, knife switches.
+  tags:
+  - pdu
+- id: Z2-06
+  slug: solar_inverter_isolator
+  category: power
+  name: Solar Inverter Subsystem
+  author: avredu
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/aa2ec0ed329342b6a059e3eeab806e22
+  fetch:
+    type: sketchfab
+    uid: aa2ec0ed329342b6a059e3eeab806e22
+  notes: Rotary isolator handles = graspable switch.
+  tags:
+  - switch
+- id: Z2-07
+  slug: portable_generator
+  category: power
+  name: portable_generator
+  author: Poly Haven
+  license: CC0-1.0
+  page: https://polyhaven.com/a/portable_generator
+  fetch:
+    type: polyhaven
+    asset: portable_generator
+    resolution: 2k
+  notes: Dial, switch, toggle are separate nodes.
+  tags:
+  - switch
+- id: Z2-08
+  slug: nasa_orbital_replacement_unit
+  category: power
+  name: Orbital Replacement Unit
+  author: NASA
+  license: NASA-Media-Usage (public domain; no insignia in AI imagery)
+  page: https://github.com/nasa/NASA-3D-Resources
+  fetch:
+    type: url
+    urls:
+    - https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/3D%20Models/Orbital%20Replacement%20Unit/Orbital%20Replacement%20Unit.glb
+  notes: Swap box; re-mass <=1 kg, fit a 25 mm handle.
+  tags: []
+- id: Z2-09
+  slug: scifi_power_battery
+  category: power
+  name: Simple Sci-fi power battery
+  author: model_R
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/4663e0ac1b0c4df48c05f6b0a2c5477e
+  fetch:
+    type: sketchfab
+    uid: 4663e0ac1b0c4df48c05f6b0a2c5477e
+  notes: Battery module with handles; 18 parts.
+  tags:
+  - oru
+- id: Z2-10
+  slug: box_energy_storage
+  category: power
+  name: 集成箱式储能系统 - Integrated Box Energy Storage System
+  author: MrdT
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/4b2d126ea84f4634899d885befe96394
+  fetch:
+    type: sketchfab
+    uid: 4b2d126ea84f4634899d885befe96394
+  notes: White battery racks and heat exchangers.
+  tags: []
+- id: Z2-11
+  slug: photovoltaic_panels
+  category: power
+  name: Photovoltaic Panels
+  author: mfb64
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/cc9b7d59031e44ddb873056effece590
+  fetch:
+    type: sketchfab
+    uid: cc9b7d59031e44ddb873056effece590
+  notes: Framed PV module to tile into arrays.
+  tags:
+  - solar
+- id: Z2-12
+  slug: pv_racks_trackers
+  category: power
+  name: 光伏发电板架集合-Photovoltaic panels
+  author: MrdT
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/5f71fce4fa394726bba185ae54e53498
+  fetch:
+    type: sketchfab
+    uid: 5f71fce4fa394726bba185ae54e53498
+  notes: Pole-mounted trackers; 1.42 M faces, decimate.
+  tags:
+  - solar
+- id: Z2-13
+  slug: solar_module_mast
+  category: power
+  name: 'HW: Detalisation - Solar Module'
+  author: M8ZA
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/b2b6dbc3405e41978f005536719516bf
+  fetch:
+    type: sketchfab
+    uid: b2b6dbc3405e41978f005536719516bf
+  notes: Mast-mounted power module; lattice mast component.
+  tags:
+  - solar
+- id: Z2-14
+  slug: lattice_telecom_tower
+  category: power
+  name: telecom tower
+  author: UL
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/103135f81b8e42b9986d9b217a749ca6
+  fetch:
+    type: sketchfab
+    uid: 103135f81b8e42b9986d9b217a749ca6
+  notes: Mast body for a vertical array.
+  tags:
+  - solar
+- id: Z2-16
+  slug: src_solar_array
+  category: power
+  name: solar_array
+  author: Open Robotics / NASA Space Robotics Challenge
+  license: Apache-2.0
+  page: https://github.com/osrf/srcsim
+  fetch:
+    type: github_dir
+    repo: osrf/srcsim
+    ref: 2225f67
+    path: models/solar_array
+  notes: Ground array with cable socket.
+  tags:
+  - socket
+- id: Z2-16b
+  slug: src_solar_panel
+  category: power
+  name: solar_panel
+  author: Open Robotics / NASA Space Robotics Challenge
+  license: Apache-2.0
+  page: https://github.com/osrf/srcsim
+  fetch:
+    type: github_dir
+    repo: osrf/srcsim
+    ref: 2225f67
+    path: models/solar_panel
+  notes: Folding solar panel, 3 links.
+  tags:
+  - joints
+- id: Z2-17
+  slug: modular_electric_cables
+  category: power
+  name: modular_electric_cables
+  author: Poly Haven
+  license: CC0-1.0
+  page: https://polyhaven.com/a/modular_electric_cables
+  fetch:
+    type: polyhaven
+    asset: modular_electric_cables
+    resolution: 2k
+  notes: Conduits, junction boxes, connectors.
+  tags: []
+- id: Z2-18
+  slug: ring_main_unit_10kv
+  category: power
+  name: 10kV high-voltage ring main unit - 高压环网柜
+  author: MrdT
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/630e2c585c2142a095b9ddd51de8ef88
+  fetch:
+    type: sketchfab
+    uid: 630e2c585c2142a095b9ddd51de8ef88
+  notes: White switch cabinets on railed platform.
+  tags: []
+- id: Z3-01
+  slug: industrial_antenna
+  category: comms
+  name: Industrial Antenna
+  author: Ricardo_PG
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/001970c2594e4aa6bef46e63fc9e0c5a
+  fetch:
+    type: sketchfab
+    uid: 001970c2594e4aa6bef46e63fc9e0c5a
+  notes: Large dish on pedestal.
+  tags: []
+- id: Z3-02
+  slug: satellite_comms
+  category: comms
+  name: Satellite Comms
+  author: Duane's Mind
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/4be56951da39429a963ee12140bbff57
+  fetch:
+    type: sketchfab
+    uid: 4be56951da39429a963ee12140bbff57
+  notes: Base/arm/dish separate -> pan/tilt.
+  tags:
+  - 3 parts
+- id: Z3-03
+  slug: src_satellite_dish
+  category: comms
+  name: satellite_dish
+  author: Open Robotics / NASA Space Robotics Challenge
+  license: Apache-2.0
+  page: https://github.com/osrf/srcsim
+  fetch:
+    type: github_dir
+    repo: osrf/srcsim
+    ref: 2225f67
+    path: models/satellite_dish
+  notes: Yaw/pitch revolute joints driven by handwheels.
+  tags:
+  - joints
+- id: Z3-04
+  slug: nasa_radome
+  category: comms
+  name: Radome
+  author: NASA
+  license: NASA-Media-Usage (public domain; no insignia in AI imagery)
+  page: https://github.com/nasa/NASA-3D-Resources
+  fetch:
+    type: url
+    urls:
+    - https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/3D%20Models/Radome/Radome.glb
+  notes: Geodesic comm housing.
+  tags: []
+- id: Z3-05
+  slug: bts_antennas
+  category: comms
+  name: BTS Antennas Asset (Parabolic & Sectoral)
+  author: Astroregal
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/5e7feb9be34f4a128b213b9d6d6069a7
+  fetch:
+    type: sketchfab
+    uid: 5e7feb9be34f4a128b213b9d6d6069a7
+  notes: Microwave dish + sector antenna.
+  tags: []
+- id: Z3-06
+  slug: mast_5g
+  category: comms
+  name: 5G Telecommunications Mast
+  author: ThomasRedfern12
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/c9ea1b7b2e9043deb8c082e392deb4bc
+  fetch:
+    type: sketchfab
+    uid: c9ea1b7b2e9043deb8c082e392deb4bc
+  notes: Slim mast with base cabinet.
+  tags: []
+- id: Z3-07
+  slug: server_rack
+  category: comms
+  name: Server rack
+  author: Osho
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/5320622f6c0741b7aed399bfa2965dc4
+  fetch:
+    type: sketchfab
+    uid: 5320622f6c0741b7aed399bfa2965dc4
+  notes: Avionics rack look.
+  tags: []
+- id: Z3-08
+  slug: comms_room_assets
+  category: comms
+  name: Comms Room - Assets
+  author: Evan Petrov
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/566a5b112384401aad622de6832b1c5c
+  fetch:
+    type: sketchfab
+    uid: 566a5b112384401aad622de6832b1c5c
+  notes: Racks, consoles, radio units.
+  tags: []
+- id: Z3-09a
+  slug: rov_plug_m_to_f
+  category: comms
+  name: M to F plug
+  author: hmoyen
+  license: CC-BY-4.0
+  page: https://app.gazebosim.org/hmoyen/fuel/models/M to F plug
+  fetch:
+    type: fuel
+    owner: hmoyen
+    model: M to F plug
+  notes: Wet-mate plug with T-handle.
+  tags:
+  - plug
+- id: Z3-09b
+  slug: rov_plug_f_to_m
+  category: comms
+  name: F to M plug
+  author: hmoyen
+  license: CC-BY-4.0
+  page: https://app.gazebosim.org/hmoyen/fuel/models/F to M plug
+  fetch:
+    type: fuel
+    owner: hmoyen
+    model: F to M plug
+  notes: Wet-mate plug with T-handle.
+  tags:
+  - plug
+- id: Z3-09c
+  slug: rov_electrical_panel_socket
+  category: comms
+  name: Electrical Panel Bare Model
+  author: hmoyen
+  license: CC-BY-4.0
+  page: https://app.gazebosim.org/hmoyen/fuel/models/Electrical Panel Bare Model
+  fetch:
+    type: fuel
+    owner: hmoyen
+    model: Electrical Panel Bare Model
+  notes: Socket panel for the plugs.
+  tags:
+  - socket
+- id: Z4-02
+  slug: apollo_lm_detailed
+  category: landers
+  name: Apollo 11 Lunar Module
+  author: CMFDesign
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/d5eea68f5d464515a6fb2d2aee7ac979
+  fetch:
+    type: sketchfab
+    uid: d5eea68f5d464515a6fb2d2aee7ac979
+  notes: 451 k faces.
+  tags: []
+- id: Z4-03
+  slug: starship_s25
+  category: landers
+  name: SpaceX Starship Ship S25 & Booster 9
+  author: Clarence365
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/f76be07d358f454b8396d4e8f1cc5329
+  fetch:
+    type: sketchfab
+    uid: f76be07d358f454b8396d4e8f1cc5329
+  notes: Distant HLS backdrop only.
+  tags: []
+- id: Z4-01b
+  slug: omnilrs_im2_athena
+  category: landers
+  name: IM-2 Athena (Nova-C)
+  author: OmniLRS
+  license: BSD-3-Clause
+  page: https://github.com/OmniLRS/OmniLRS
+  fetch:
+    type: git_lfs
+    repo: OmniLRS/OmniLRS
+    ref: '5429512'
+    paths:
+    - assets/USD_Assets/common/lander/IM2_Athena
+  notes: Nova-C class lander USD.
+  tags: []
+- id: Z4-01
+  slug: srb_landers
+  category: landers
+  name: Resilience / Peregrine / Vikram / Apollo
+  author: Space Robotics Bench
+  license: see srb_assets attributions
+  page: https://github.com/AndrejOrsula/srb_assets
+  fetch:
+    type: local
+    path: assets/srb_assets/robot/lander
+  notes: Already in this repo.
+  tags: []
+- id: Z4-04
+  slug: nasa_sli_carrier
+  category: logistics
+  name: Super Lightweight Interchangeable
+  author: NASA
+  license: NASA-Media-Usage (public domain; no insignia in AI imagery)
+  page: https://github.com/nasa/NASA-3D-Resources
+  fetch:
+    type: url
+    urls:
+    - https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/3D%20Models/Super%20Lightweight%20Interchangeable/Super%20Lightweight%20Interchangeable.glb
+  notes: Truss cargo carrier.
+  tags: []
+- id: Z4-05
+  slug: artvip_clamshell_tool_box_1
+  category: logistics
+  name: clamshell_tool_box_1
+  author: X-Humanoid (ArtVIP)
+  license: Apache-2.0
+  page: https://huggingface.co/datasets/X-Humanoid/ArtVIP
+  fetch:
+    type: hf_dataset
+    repo: X-Humanoid/ArtVIP
+    path: Articulated_objects/household_items/toolbox/clamshell_tool_box_1
+  notes: Isaac Sim USD; lid + latch revolute joints.
+  tags:
+  - joints
+  - isaac-ready
+- id: Z4-06
+  slug: scifi_crate_1
+  category: logistics
+  name: Sci-Fi crate / ammunition box (1)
+  author: ul1tka
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/69fe3211493c4a4db26ad0c4e2e49a83
+  fetch:
+    type: sketchfab
+    uid: 69fe3211493c4a4db26ad0c4e2e49a83
+  notes: White case with handles; rescale.
+  tags: []
+- id: Z4-07
+  slug: scifi_crate_2
+  category: logistics
+  name: Sci-Fi crate / ammunition box (2)
+  author: ul1tka
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/342efe4d70f94d37a4edd66a15c39502
+  fetch:
+    type: sketchfab
+    uid: 342efe4d70f94d37a4edd66a15c39502
+  notes: Smaller variant; rescale.
+  tags: []
+- id: Z4-08
+  slug: pelican_case
+  category: logistics
+  name: Case – Pelican 472-PWC-M9-2 Style
+  author: maria_minchenko
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/d4b448ffbf464d84a14c80307d8fea1c
+  fetch:
+    type: sketchfab
+    uid: d4b448ffbf464d84a14c80307d8fea1c
+  notes: Hard case; retexture white.
+  tags: []
+- id: Z4-09
+  slug: nasa_crew_lock_bag
+  category: logistics
+  name: Crew Lock Bag
+  author: NASA
+  license: NASA-Media-Usage (public domain; no insignia in AI imagery)
+  page: https://github.com/nasa/NASA-3D-Resources
+  fetch:
+    type: url
+    urls:
+    - https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/3D%20Models/Crew%20Lock%20Bag/Crew%20Lock%20Bag.glb
+  notes: Spares bag with handle.
+  tags: []
+- id: Z4-10
+  slug: server_racking_system
+  category: logistics
+  name: Server Racking System
+  author: wpanayides
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/6fe2cacf836b4aed96c650b286db5486
+  fetch:
+    type: sketchfab
+    uid: 6fe2cacf836b4aed96c650b286db5486
+  notes: Open-frame spares rack.
+  tags: []
+- id: Z4-11
+  slug: modular_shelving_metal
+  category: logistics
+  name: Modular Shelving Unit (Metal)
+  author: Sebastian Webster
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/6a1f71934d434585aa598b004f056ca9
+  fetch:
+    type: sketchfab
+    uid: 6a1f71934d434585aa598b004f056ca9
+  notes: Metal shelving.
+  tags: []
+- id: Z4-12
+  slug: artvip_poison_cabinet
+  category: logistics
+  name: poison_cabinet
+  author: X-Humanoid (ArtVIP)
+  license: Apache-2.0
+  page: https://huggingface.co/datasets/X-Humanoid/ArtVIP
+  fetch:
+    type: hf_dataset
+    repo: X-Humanoid/ArtVIP
+    path: Articulated_objects/lab_items/lab_cabinet/poison_cabinet
+  notes: Isaac Sim USD; 8 revolute doors.
+  tags:
+  - joints
+  - isaac-ready
+- id: Z1-06
+  slug: artvip_drawer_kit_10
+  category: logistics
+  name: drawer_kit_10
+  author: X-Humanoid (ArtVIP)
+  license: Apache-2.0
+  page: https://huggingface.co/datasets/X-Humanoid/ArtVIP
+  fetch:
+    type: hf_dataset
+    repo: X-Humanoid/ArtVIP
+    path: Articulated_objects/household_items/toolbox/drawer_kit_10
+  notes: Isaac Sim USD; 5 prismatic drawers.
+  tags:
+  - joints
+  - isaac-ready
+- id: Z4-13
+  slug: agv_trolley
+  category: logistics
+  name: Industrial 3D AGV Trolley Free low-poly 3D model
+  author: Cels
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/016a066401a3489dafa98669d3a4b3f1
+  fetch:
+    type: sketchfab
+    uid: 016a066401a3489dafa98669d3a4b3f1
+  notes: White AGV with cage cart.
+  tags: []
+- id: Z4-14
+  slug: scaffold_stairs
+  category: logistics
+  name: Scaffold Stairs Steel construction
+  author: dchant design
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/d2230c5644234b3781cd7b2a6cec9638
+  fetch:
+    type: sketchfab
+    uid: d2230c5644234b3781cd7b2a6cec9638
+  notes: Stair tower for access.
+  tags: []
+- id: Z5-01
+  slug: nasa_rassor
+  category: isru
+  name: RASSOR
+  author: NASA
+  license: NASA-Media-Usage (public domain; no insignia in AI imagery)
+  page: https://github.com/nasa/NASA-3D-Resources
+  fetch:
+    type: url
+    urls:
+    - https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/3D%20Models/Regolith%20Advanced%20Surface%20Systems%20Operations%20Robot%20%28RASSOR%29/Regolith%20Advanced%20Surface%20Systems%20Operations%20Robot%20%28RASSOR%29.glb
+  notes: Lunar excavator; untextured.
+  tags: []
+- id: Z5-02
+  slug: chemical_tank_skid
+  category: isru
+  name: Chemical tank
+  author: Mkc
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/63c001e74ff5402fbcf1338479c9c0c5
+  fetch:
+    type: sketchfab
+    uid: 63c001e74ff5402fbcf1338479c9c0c5
+  notes: Twin vessels on skid.
+  tags: []
+- id: Z5-03
+  slug: large_storage_tanks
+  category: isru
+  name: Large Industrial Storage Tanks
+  author: Duane's Mind
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/bd3ac97071104b64bc388a155b64f79e
+  fetch:
+    type: sketchfab
+    uid: bd3ac97071104b64bc388a155b64f79e
+  notes: Spherical tanks with stairs.
+  tags: []
+- id: Z5-04
+  slug: drc_handle_wheel_valve
+  category: isru
+  name: 'DRC Practice: Handle Wheel valve'
+  author: OpenRobotics
+  license: CC0-1.0
+  page: 'https://app.gazebosim.org/OpenRobotics/fuel/models/DRC Practice: Handle Wheel valve'
+  fetch:
+    type: fuel
+    owner: OpenRobotics
+    model: 'DRC Practice: Handle Wheel valve'
+  notes: Revolute joint; wheel + crank.
+  tags:
+  - joint
+- id: Z5-04b
+  slug: drc_hand_wheel_valve
+  category: isru
+  name: 'DRC Practice: Hand wheel valve'
+  author: OpenRobotics
+  license: CC0-1.0
+  page: 'https://app.gazebosim.org/OpenRobotics/fuel/models/DRC Practice: Hand wheel valve'
+  fetch:
+    type: fuel
+    owner: OpenRobotics
+    model: 'DRC Practice: Hand wheel valve'
+  notes: Revolute joint.
+  tags:
+  - joint
+- id: Z5-04c
+  slug: drc_wheel_valve
+  category: isru
+  name: 'DRC Practice: Wheel valve'
+  author: OpenRobotics
+  license: CC0-1.0
+  page: 'https://app.gazebosim.org/OpenRobotics/fuel/models/DRC Practice: Wheel valve'
+  fetch:
+    type: fuel
+    owner: OpenRobotics
+    model: 'DRC Practice: Wheel valve'
+  notes: Revolute joint.
+  tags:
+  - joint
+- id: Z5-04d
+  slug: drc_ball_valve
+  category: isru
+  name: 'DRC Practice: Ball Valve'
+  author: OpenRobotics
+  license: CC0-1.0
+  page: 'https://app.gazebosim.org/OpenRobotics/fuel/models/DRC Practice: Ball Valve'
+  fetch:
+    type: fuel
+    owner: OpenRobotics
+    model: 'DRC Practice: Ball Valve'
+  notes: Lever ball valve, revolute joint.
+  tags:
+  - joint
+- id: Z5-05
+  slug: modular_industrial_pipes_01
+  category: isru
+  name: modular_industrial_pipes_01
+  author: Poly Haven
+  license: CC0-1.0
+  page: https://polyhaven.com/a/modular_industrial_pipes_01
+  fetch:
+    type: polyhaven
+    asset: modular_industrial_pipes_01
+    resolution: 2k
+  notes: Flanges + handwheel valve.
+  tags: []
+- id: Z5-06
+  slug: gas_bottles_set
+  category: isru
+  name: Gas Bottles Set
+  author: Gamefruit
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/d671d93577b546b3bc8eda586ee75b31
+  fetch:
+    type: sketchfab
+    uid: d671d93577b546b3bc8eda586ee75b31
+  notes: O2/N2 bottle look.
+  tags: []
+- id: Z5-07
+  slug: cable_reels
+  category: isru
+  name: Cable reels
+  author: Lassi Kaukonen
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/53d00d26d6e14cd5bca1d7cedd4eb3b4
+  fetch:
+    type: sketchfab
+    uid: 53d00d26d6e14cd5bca1d7cedd4eb3b4
+  notes: Photogrammetry reels; movable obstruction.
+  tags: []
+- id: Z5-08
+  slug: light_tower
+  category: isru
+  name: Light Tower
+  author: krambulini
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/9addea6a4129438b83a1fc3ed4a784ec
+  fetch:
+    type: sketchfab
+    uid: 9addea6a4129438b83a1fc3ed4a784ec
+  notes: Trailer floodlight tower.
+  tags: []
+- id: Z0-01
+  slug: scifi_charger
+  category: dock
+  name: Sci-fi electrical charger | Free Download
+  author: JonParrish
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/f09b75dca41b40f6b1c3c64eca138094
+  fetch:
+    type: sketchfab
+    uid: f09b75dca41b40f6b1c3c64eca138094
+  notes: Charger column; tone down glow.
+  tags: []
+- id: Z0-02
+  slug: ev_charging_station_a
+  category: dock
+  name: EV Charging Station A
+  author: Kirk
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/aa2af6b5d2f54ac395cfc7e132f25282
+  fetch:
+    type: sketchfab
+    uid: aa2af6b5d2f54ac395cfc7e132f25282
+  notes: Canopy + charger post.
+  tags: []
+- id: Z0-03
+  slug: charging_station_set
+  category: dock
+  name: New energy vehicle charging station - 新能源车充电站
+  author: MrdT
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/1930fe67b1d84a3a9dbcf4cb50c58a8f
+  fetch:
+    type: sketchfab
+    uid: 1930fe67b1d84a3a9dbcf4cb50c58a8f
+  notes: Posts, cabinets, plug/holster geometry.
+  tags: []
+- id: V-01
+  slug: mmsev
+  category: vehicles
+  name: '[MMSEV] Space Exploration Vehicle (SEV)'
+  author: Marco_Romero
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/d2f3b528edec4e2e8b938019d68632d0
+  fetch:
+    type: sketchfab
+    uid: d2f3b528edec4e2e8b938019d68632d0
+  notes: Crew rover, 4K PBR, real scale.
+  tags: []
+- id: V-02
+  slug: exomars_rover
+  category: vehicles
+  name: ESA ExoMars Rover
+  author: Marian
+  license: CC-BY-4.0
+  page: https://sketchfab.com/3d-models/4148a592193549c59c778a69fd45df5a
+  fetch:
+    type: sketchfab
+    uid: 4148a592193549c59c778a69fd45df5a
+  notes: 77 named parts.
+  tags: []
+- id: V-03
+  slug: lrv_deutsches_museum
+  category: vehicles
+  name: Mondfahrzeug (Lunar Rover)
+  author: Deutsches Museum | Digital
+  license: CC-BY-SA-4.0
+  page: https://sketchfab.com/3d-models/acb3f8645a69493cb211a62b40d66aab
+  fetch:
+    type: sketchfab
+    uid: acb3f8645a69493cb211a62b40d66aab
+  notes: Museum scan; derivatives must stay CC-BY-SA.
+  tags: []
+- id: V-04
+  slug: nasa_space_exploration_vehicle
+  category: vehicles
+  name: Space Exploration Vehicle
+  author: NASA
+  license: NASA-Media-Usage (public domain; no insignia in AI imagery)
+  page: https://github.com/nasa/NASA-3D-Resources
+  fetch:
+    type: url
+    urls:
+    - https://raw.githubusercontent.com/nasa/NASA-3D-Resources/master/3D%20Models/Space%20Exploration%20Vehicle/Space%20Exploration%20Vehicle.glb
+  notes: NASA SEV, 12 wheels.
+  tags: []
+- id: T-01
+  slug: lola_site01_connecting_ridge
+  category: terrain
+  name: LOLA 5 m/px DEM, Site01 Connecting Ridge
+  author: NASA GSFC PGDA (Barker et al. 2021)
+  license: Public domain (NASA)
+  page: https://pgda.gsfc.nasa.gov/products/78
+  fetch:
+    type: url
+    urls:
+    - https://pgda.gsfc.nasa.gov/data/LOLA_5mpp/Site01/Site01_final_adj_5mpp_surf.tif
+    - https://pgda.gsfc.nasa.gov/data/LOLA_5mpp/Site01/Site01_final_adj_5mpp_slp.tif
+    - https://pgda.gsfc.nasa.gov/data/LOLA_5mpp/README
+  notes: Macro relief + horizon; south polar stereographic, MOON_ME/DE421.
+  tags: []
+- id: T-02
+  slug: omnilrs_regolith_rocks
+  category: terrain
+  name: LunarRegolith8k textures, lunar rocks, crater profiles
+  author: OmniLRS
+  license: BSD-3-Clause
+  page: https://github.com/OmniLRS/OmniLRS
+  fetch:
+    type: git_lfs
+    repo: OmniLRS/OmniLRS
+    ref: '5429512'
+    paths:
+    - assets/Textures/LunarRegolith8k
+    - assets/USD_Assets/rocks/lunar_rocks
+    - assets/Terrains/crater_spline_profiles.pkl
+  notes: Regolith PBR, rock set, crater spline profiles for the procedural generator.
+  tags: []
+- id: M-01
+  slug: foil002
+  category: materials
+  name: Foil002
+  author: ambientCG
+  license: CC0-1.0
+  page: https://ambientcg.com/view?id=Foil002
+  fetch:
+    type: url
+    urls:
+    - https://ambientcg.com/get?file=Foil002_2K-JPG.zip
+  notes: Gold foil -> MLI blankets.
+  tags: []
+- id: M-02
+  slug: solarpanel002
+  category: materials
+  name: SolarPanel002
+  author: ambientCG
+  license: CC0-1.0
+  page: https://ambientcg.com/view?id=SolarPanel002
+  fetch:
+    type: url
+    urls:
+    - https://ambientcg.com/get?file=SolarPanel002_2K-JPG.zip
+  notes: Solar cell surface.
+  tags: []
+- id: M-03
+  slug: paintedmetal012
+  category: materials
+  name: PaintedMetal012
+  author: ambientCG
+  license: CC0-1.0
+  page: https://ambientcg.com/view?id=PaintedMetal012
+  fetch:
+    type: url
+    urls:
+    - https://ambientcg.com/get?file=PaintedMetal012_2K-JPG.zip
+  notes: White painted metal (aerospace finish).
+  tags: []
+- id: M-04
+  slug: metalplates015a
+  category: materials
+  name: MetalPlates015A
+  author: ambientCG
+  license: CC0-1.0
+  page: https://ambientcg.com/view?id=MetalPlates015A
+  fetch:
+    type: url
+    urls:
+    - https://ambientcg.com/get?file=MetalPlates015A_2K-JPG.zip
+  notes: Panelled metal plates.
+  tags: []
+- id: M-05
+  slug: metal032
+  category: materials
+  name: Metal032
+  author: ambientCG
+  license: CC0-1.0
+  page: https://ambientcg.com/view?id=Metal032
+  fetch:
+    type: url
+    urls:
+    - https://ambientcg.com/get?file=Metal032_2K-JPG.zip
+  notes: Brushed/bare metal.
+  tags: []
+- id: M-06
+  slug: diamondplate009
+  category: materials
+  name: DiamondPlate009
+  author: ambientCG
+  license: CC0-1.0
+  page: https://ambientcg.com/view?id=DiamondPlate009
+  fetch:
+    type: url
+    urls:
+    - https://ambientcg.com/get?file=DiamondPlate009_2K-JPG.zip
+  notes: Walkway plate.
+  tags: []
+- id: Z2-15
+  slug: irosa_roll_out_solar_array
+  category: power
+  name: ISS Roll-Out Solar Arrays (iROSA) 1:100
+  author: 'Printables #958363'
+  license: CC0-1.0
+  page: https://www.printables.com/model/958363
+  fetch:
+    type: manual
+    reason: Printables requires a login to download.
+  notes: Untextured STL; blanket + boom geometry for a VSAT-style array.
+  tags:
+  - solar

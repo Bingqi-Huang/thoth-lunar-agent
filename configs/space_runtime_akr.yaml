@@ -1,0 +1,83 @@
+# Thoth's harness configuration. Mission-generic: nothing here names a mission, a site feature or an ordering.
+
+# ---- invariant / authority guard --------------------------------------------------------------------------------
+guard:
+  # authority class (contracts.yaml `authority_class`) -> outcome without an operator approval on record
+  authority:
+    routine: allow
+    approval_required: approval_required
+    prohibited: deny
+  # hard execution invariants: {name, why, applies_to: [capabilities | all_effects], requires: {fact path: value}}.
+  # Only documented hard operating limits belong here (space-context limits enter with the scenarios that exercise them).
+  invariants: []
+  # an active fault prohibits these capability groups; every other fault is context for the agent
+  fdir_prohibits:
+    estop: [all_effects]
+  # authority by what a call acts on: {name, why, applies_to, target_arg (the argument naming a site point), target_role
+  # (the site survey's role of that point), when_unit (fields of that point's unit in the units' own telemetry),
+  # outcome}. Classes of operation, never a mission step; a matching call needs an operator approval of (capability,
+  # target) on record.
+  target_authority:
+    - name: energized_equipment_removal
+      why: >-
+        taking a module out of an energized unit's bay alters operating infrastructure and cuts its load; it needs
+        ground authorization first (14 CFR 1214.403: authorization before altering or removing station property)
+      applies_to: [pick]
+      target_arg: support
+      target_role: equipment_bay
+      when_unit: {energized: true}
+      outcome: approval_required
+
+# ---- independent effect verification ----------------------------------------------------------------------------
+# Effects are established from robot-observable evidence the boundary returns (AMCL base estimate, arm kinematics, jaw
+# encoder) against the commanded goal -- never from the skill's own success flag alone, never from simulator truth.
+verification:
+  base:
+    # Nav2 goal checker (openral_nav2_bringup/config/nav2_lunar_bot.yaml: xy_goal_tolerance 0.25)
+    navigate: {position_m: 0.25, yaw_rad: 0.3}
+    # move_base_to_pose closes to 0.03 m / 0.03 rad on the same estimate; twice that as the verification band
+    dock: {position_m: 0.06, yaw_rad: 0.06}
+  tcp:
+    tolerance_factor: 1.5  # x the call's own position tolerance
+    # MoveIt plans meet the tolerance at the planned goal; the executed trajectory ends 0.009-0.030 m from it:
+    # added to the band of plan_* effects
+    plan_execution_m: 0.025
+    approach_band_m: 0.02  # approach_target: tool-to-target distance within this of the stand-off (servo tolerance 0.008 m x 2.5)
+  jaw:  # EG2 jaw angle, rad: 0.10 closed on nothing, 0.82 open
+    empty_max_rad: 0.12
+    open_min_rad: 0.6
+  hold:  # item_held after pick: the item's image moves less than this fraction of a left-behind item's lift displacement
+    flow_fraction: 0.35
+    near_m: 0.6  # fallback when the skill did not record its gripper's own reach
+    beyond_gripper_m: 0.12  # a held item lies within this of the gripper's own surface, outside its silhouette
+    min_pixels: 200
+    min_lift_m: 0.05
+  press:  # pressed: the tool reached this far past the face the view measured, and is this far back off it again
+    min_contact_m: 0.005
+    min_retreat_m: 0.04
+  place:  # item_placed: jaws open, tool this far from the release point, the scene still between two frames
+    min_clear_m: 0.10
+    near_m: 1.0
+    settle_moved_mm: 3.0  # the item counts as still if the region moved less than this at its own depth
+  scan:  # labels_read: the wrist camera within this of the scan view it was sent to
+    view_m: 0.03
+
+# ---- reasoner -----------------------------------------------------------------------------------------------------
+reasoner:
+  prompts: prompts/agent  # every text the model reads: system.md (standing), step.md (per-step template), tools.yaml
+  model: DeepSeek-V4.1-Flash-1017  # the one model for planning and camera questions
+  endpoint: https://YOUR-OPENAI-COMPATIBLE-ENDPOINT/v1
+  api_key_env: SPACE_REASONER_API_KEY  # the OpenAI-compatible gateway; key from SPACE_LLM_API_KEY or a file outside the repo (run_d0 AKR_KEY_FILE); the scene VLM runs there too
+  timeout_s: 600
+  # thinking mode on, planner and camera questions
+  thinking: true
+  retry_cap_per_call: 3  # ReasonerCore's identical-call cap
+  max_steps: 80  # the run's skill budget: every skill dispatched to the robot, the executor's own sensing
+                 # included; not planner calls, ground requests, telemetry or free reads -> skill_budget_exhausted
+
+# ---- AKR executor; strategy, mission key and injected faults come with the run (AKR_*) ----
+akr:
+  vocabulary: configs/akr_vocabulary.yaml
+  cap_L: 16  # executed elements per episode (the cap L): at least the longest shortest valid plan over the declared actions (experiments/akr/plan_length.py)
+  planner_call_guard: 200  # infrastructure guard on planner calls (not the mission budget: that is reasoner.max_steps,
+                           # 80 skill calls); a run that reaches it ends with reason planner_call_guard, an anomaly

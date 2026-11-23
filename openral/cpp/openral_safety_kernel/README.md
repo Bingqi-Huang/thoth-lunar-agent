@@ -1,0 +1,1125 @@
+# openral_safety_kernel — C++ safety kernel
+
+> Layer 6 (Safety). Separate process, real-time validator on the
+> chunk-rate boundary. Replaces F5's Python pass-through
+> (`packages/openral_safety/SafetyPassthroughNode`) behind the same
+> topic contract. **Python proposes, C++ disposes.** (CLAUDE.md §1.5).
+>
+> The `spark:~/openral-runs/…` validation rounds cited throughout this file are
+> catalogued — with what each concluded and what is still open — in
+> [`docs/reference/collision-validation-evidence.md`](../../docs/reference/collision-validation-evidence.md).
+
+## Topic contract
+
+| Direction | Topic / Service | Type | QoS |
+| --- | --- | --- | --- |
+| sub | `/openral/candidate_action` | `openral_msgs/ActionChunk` | RELIABLE, VOLATILE, KL=1 |
+| sub | `/openral/estop` | `std_msgs/Empty` | RELIABLE, VOLATILE, KL=10 |
+| pub | `/openral/safe_action` | `openral_msgs/ActionChunk` | RELIABLE, VOLATILE, KL=1 |
+| pub | `/openral/estop` | `std_msgs/Empty` | RELIABLE, VOLATILE, KL=10 |
+| pub | `/openral/failure/safety` | `openral_msgs/FailureTrigger` | RELIABLE, VOLATILE, KL=50 |
+| pub | `/openral/safety_status` | `openral_msgs/SafetyStatus` | RELIABLE, **TRANSIENT_LOCAL**, KL=1 |
+| pub | `/diagnostics` | `diagnostic_msgs/DiagnosticArray`, 1 Hz | default |
+| srv | `/openral/estop_reset` | `std_srvs/Trigger` | — |
+
+### `/openral/safety_status` — current state, not events (ADR-0096)
+
+The only **latched** topic here. `/openral/estop` and
+`/openral/failure/safety` are `VOLATILE` by design: they are event
+streams, so a subscriber that connects after the fact sees nothing and
+neither carries a notion of *current* state. `SafetyStatus` carries
+exactly that — `latched`, `drop_reason`, `detail`, `rskill_id`,
+`trace_id`, `header.stamp` — on the "description/static" QoS class, so a
+dashboard opened mid-mission or a runner reconnecting after a crash
+reads the truth immediately.
+
+Published on **every transition**:
+
+| Path | `latched` | `drop_reason` |
+| --- | --- | --- |
+| lifecycle activation | current latch | `DROP_NONE` when clear |
+| envelope violation | `true` | `KIND_FORCE` / `KIND_WORKSPACE` / `KIND_CONTROLLER` |
+| geometric collision | `true` | `KIND_COLLISION` |
+| external `/openral/estop` | `true` | `DROP_EXTERNAL_ESTOP` |
+| `envelope_unconfigured` drop | `false` | `DROP_ENVELOPE_UNCONFIGURED` |
+| world/voxel/state unavailable or overflow | `false` | `DROP_{WORLD,VOXEL,STATE}_UNAVAILABLE`, `DROP_{WORLD,VOXEL}_OVERFLOW` |
+| attached payload unverifiable (ADR-0092) | `false` | `DROP_ATTACHED_UNAVAILABLE`, `DROP_ATTACHED_OVERFLOW` |
+| chunk accepted after a drop | `false` | `DROP_NONE` |
+| `/openral/estop_reset` succeeded | `false` | `DROP_NONE` |
+
+Two rules make the durable value trustworthy (hazard-log HZ-0096-1):
+
+1. **Publish on every activation**, not only on the next fault — a
+   restarted kernel must overwrite the stale sample a still-connected
+   consumer is holding within one activation cycle.
+2. **Re-stamp at 1 Hz** on the `/diagnostics` heartbeat, so
+   `header.stamp` is standing evidence the publisher is alive.
+   Consumers treat a status older than their liveness window as
+   *unknown, not safe*.
+
+The publication is transition-gated on the `(latched, drop_reason)`
+pair, so a drop that repeats for every chunk (an unconfigured envelope,
+a stale world model) publishes once and is refreshed by the heartbeat,
+never per chunk on the 30-200 Hz path.
+
+This is observability only: it adds a publisher, and changes no
+enforcement decision anywhere in the kernel.
+
+## Quickstart
+
+```bash
+# 1. Build the envelope file from the robot + skill manifests.
+uv run python -m openral_safety.envelope_loader \
+    --robot robots/so100_follower/robot.yaml \
+    --skill rskills/smolvla-libero/rskill.yaml \
+    --out /tmp/openral_safety_envelope.yaml
+
+# 2. Build and launch the C++ kernel.
+colcon build --packages-select openral_safety_kernel
+source install/setup.bash
+ros2 launch openral_safety_kernel kernel_only.launch.py \
+    envelope_file:=/tmp/openral_safety_envelope.yaml
+```
+
+## Lifecycle
+
+`unconfigured → configure → activate → deactivate → cleanup → shutdown`
+
+- **configure**: reads the envelope YAML; refuses to advance on
+  schema mismatch or unset path. Opens publishers / subscribers /
+  service. Starts the 1 Hz `/diagnostics` timer.
+- **activate**: activates managed lifecycle publishers so messages flow.
+- **deactivate**: stops outbound publication; subscribers keep
+  receiving (the fault latch still trips on external estop).
+- **cleanup**: releases all resources; clears the fault latch and
+  counters.
+
+## Fault latch + recovery
+
+On envelope violation OR external `/openral/estop`:
+
+1. Drop the candidate chunk (no republish on `/openral/safe_action`).
+2. Publish `FailureTrigger` on `/openral/failure/safety` with
+   `kind=KIND_FORCE | KIND_WORKSPACE | KIND_CONTROLLER`,
+   `severity=SEVERITY_ABORT`, `evidence_json` (Pydantic-deserialisable),
+   `rskill_id` and `trace_id` from the chunk.
+3. Publish `std_msgs/Empty` on `/openral/estop`.
+4. Publish the latched `SafetyStatus` (`latched=true`, the same numeric
+   kind the `FailureTrigger` carries) on `/openral/safety_status`.
+5. Set `fault_latch=true`. All further candidates drop with reason
+   `estop_latched`.
+
+Recovery is manual: `ros2 service call /openral/estop_reset
+std_srvs/srv/Trigger`. The service refuses to clear the latch until
+`estop_reset_cooldown_s` (default 500 ms) has passed since the last
+estop publish — `ROSEStopRequested` is never auto-cleared
+(CLAUDE.md §10).
+
+## Observability
+
+The kernel emits one OTel `safety.check` span per candidate chunk over
+OTLP/HTTP — the same wire format the in-tree dashboard
+(`openral dashboard`, default port 4318) ingests on `/v1/traces`. Spans
+carry:
+
+| Attribute | Value |
+| --- | --- |
+| `safety.check_name` | `"envelope"` |
+| `safety.kernel` | `"cpp"` (closed-set; surfaces in Identity card) |
+| `safety.severity` | `"info"` (pass), `"warn"` (latched / unconfigured), `"violation"` |
+| `safety.drop_reason` | `estop_latched`, `envelope_unconfigured`, `force`, `workspace`, or `controller` |
+| `safety.violation_{reason,joint,value,limit}` | populated on `violation` |
+| `safety.sweep_min_distance_m` | collision stops only — see below |
+| `rskill.id` | `ActionChunk.rskill_id` (short-prefix form the dashboard latches) |
+
+On a violation the span also fires an
+`openral.event.safety_violation` event so the dashboard's counted
+events ledger ticks.
+
+### Collision evidence: one pair, one distance
+
+A collision stop publishes `CollisionEvidence` whose `link_a`,
+`link_b_or_object` and `min_distance_m` all describe **the same** geometry
+pair — the deepest pair that actually tripped the check. `min_distance_m` is
+never the sweep-wide minimum: a collision sweep also measures pairs that stayed
+clear of the margin and pairs the gate deliberately exempted (see the exemption
+ladder below), and quoting one of those against the cell that stopped the
+robot sends diagnosis after a penetration that never happened.
+
+The sweep-wide minimum is still useful, so it is reported **separately and
+never in the evidence payload**: `sweep_min_distance_m=` in the
+`safety.collision` log line, and the `safety.sweep_min_distance_m` span
+attribute. `sweep_min_distance_m <= min_distance_m` always. A large gap between
+the two means something deep is being tolerated on purpose — usually a grasped
+payload's own occupancy residue — not that the stop was deep.
+
+### Distance-graded velocity scaling (#188) — off by default
+
+A third verdict between "accept at full rate" and "stop the robot": an
+**accepted** chunk near an obstacle can be republished slower.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `collision_scale_proximity_m` | **`0.0`** | Band width above each check's own gate margin. **`0` disables the mechanism and reproduces the pre-#188 republish exactly.** |
+| `collision_scale_k` | `20.0` | Exponential steepness. |
+| `collision_scale_min` | `0.1` | Floor on the scale. |
+
+The scale is `exp(k · (slack − proximity))`, clamped into
+`[collision_scale_min, 1.0]` — exactly `1.0` at the top of the band, decaying
+toward the margin. `slack` is the smallest clearance **above its own gate
+margin** seen anywhere in the chunk's sweep. Slack rather than raw distance
+because every check carries a different margin and the predictive steps inflate
+theirs with look-ahead depth; slack is the only margin-agnostic way to compare
+them.
+
+**The band also widens the voxel broad-phase window, and it has to.** The cell
+scan is sized by the gate margin (`reach = r + margin + half_side`), so a cell
+that is *clear* but inside the band was never visited and never folded into
+`sweep_min_distance`. On a real map the minimum therefore jumped from "nothing
+in range" straight to a tripping cell, and the scale went 1.0 → E-stop with
+nothing in between — the mechanism was dead code. `check_voxel_collision` and
+`check_attached_voxel_collision` now take a `band_m` that widens the **window
+only**; a cell still trips at `margin` and nothing else. `band_m` defaults to
+`0.0`, so the shipped window is byte-for-byte unchanged and the extra cells are
+scanned only by a deployment that arms the band — which is also where that
+scan's cost is paid.
+
+Three further properties are load-bearing:
+
+1. **It never changes a verdict.** The scale is applied after the chunk has
+   already been accepted. It cannot turn an accept into a drop, or a drop into
+   an accept, and the latch below the margin is untouched. Scaling *down* a
+   rate also preserves every envelope bound the chunk already satisfied
+   (`|s·v| ≤ |v|`), so the scaled chunk needs no re-validation and travels no
+   further than the swept volume the predictive check just cleared.
+2. **Only rate-shaped modes are scaled** — `JOINT_VELOCITY`, `CARTESIAN_DELTA`,
+   `CARTESIAN_TWIST`. Multiplying an *absolute* target (`JOINT_POSITION`,
+   `CARTESIAN_POSE`, `JOINT_TRAJECTORY`) by 0.37 does not slow the arm: it
+   commands a pose a third of the way to the origin — a large unrequested
+   motion in an arbitrary direction, issued in the name of safety. Gripper,
+   dex-hand and composite-mode rows are not motion rates either. `BODY_TWIST`
+   is excluded on evidence: FK zeroes the base dofs, so nothing measured here
+   describes where the *base* is going (that is Nav2's collision monitor, #186).
+3. **Pairs below their margin that did not trip are ignored.** Not tripping
+   there means the pair is exempted — an attached payload's attach-time contact
+   baseline, an ACM row, a live place allowance — and an exemption says that
+   contact is allowed, so it must not also mean "slow down".
+
+   **This is a filter on the exempted pair, not on its surroundings, and the
+   difference matters.** A payload resting on a shelf exempts the contact cell;
+   the neighbouring cells along the same shelf surface are not exempt and
+   present a small positive slack of their own. At a 25 mm grid with a 0.02 m
+   attached margin they sit around 5 mm of slack, which in a 0.05 m band at
+   k = 20 is ≈ 0.41. So a robot holding a payload against a surface **will**
+   run reduced for as long as it does. That is defensible — it is genuinely
+   close to something — but it is a standing slowdown, not an edge case, and
+   the A/B battery has to price it.
+
+Scaling is disclosed three ways, and the difference between them is
+load-bearing: `safety.velocity_scale` / `safety.scale_slack_m` span attributes
+on every scaled chunk; a `safety.collision_scaled` log line that is
+**transition-gated** (emitted when the scale moves by ≥ 0.1 or the band is
+cleared, because the accept path runs at 30–200 Hz and its pass-through case is
+documented as touching no string); and a `scaled` key on the 1 Hz
+`/diagnostics` heartbeat, which is the continuous count. Reading only the log
+undercounts, by design.
+
+**Why a band at all.** The 2026-08-26 five-round battery put 11 of 15 stops
+inside what 25 mm voxel quantisation alone explains, and every one of them was
+mission-ending. PACS ([arXiv:2511.06385](https://arxiv.org/abs/2511.06385))
+measures the shape of the fix on robomimic + a dynamic obstacle: 0.70 success
+unfiltered, **0.04** under reactive projection, **0.72** under chunk-level
+graded braking. Slowing along the policy's own path is close to free; filtering
+the policy's output destroys the task.
+
+**It ships disabled.** This is a WG-gated enforcement surface, and what earns
+it a non-zero band is the A/B five-round battery on the validation-matrix
+scenes, not the parameter's existence. `OPENRAL_COLLISION_SCALE_PROXIMITY_M`
+(plus `_K` / `_MIN`) is the seam `deploy_e2e.launch.py` reads, so the band can be
+swept across rounds without a rebuild; the round records which values it ran
+with (`ValidationRoundMetadata.collision_scale`), so an armed round and a
+baseline round can be told apart from their own artifacts.
+
+**What one A/B pair on `robocasa_baguette` (seed 1) actually showed.** The band
+fires on real geometry — 24 scaling events, down to **0.389** at 2.8 mm of
+slack in a 0.05 m band, on both the arm's `CARTESIAN_DELTA` and the base's
+`JOINT_VELOCITY` chunks. It did **not** prevent the stop: the armed round still
+ended `estop-collision-within-quantization`, on the attached payload at
+**−1.79 mm**.
+
+That is worth reading carefully rather than as a failure. PACS's result is about
+*dynamic obstacles*, where slowing buys the policy time to react. The stop class
+here is *static map quantisation* — the arm is a millimetre or two inside a cell
+whose own edge is uncertain by up to 25 mm, and approaching it more slowly does
+not move the cell. Approach speed is not what makes that stop happen, so Path A
+alone should not be expected to convert this class; it is the approach-band half
+of a pair whose contact-adjacent half is Path B (#189, declared-target
+geometry). The band's own job — slow near obstacles, never latch, never turn an
+accept into a drop — it did.
+
+**One pair is not evidence.** The same scene, same seed, same rSkill completed
+with the band disabled and stopped with it armed — and an earlier baseline at a
+different SHA stopped where this one completed. The scene is not deterministic
+run to run, which is exactly why the acceptance criterion is a **five-round**
+battery per arm and not a single comparison.
+
+**One binding precondition before it is turned on for a given policy.** PACS's
+result holds because velocity is deliberately kept out of the policy's
+observations — slowing the robot is then invisible to the policy and cannot
+push it out of distribution. That is not true of every adapter here:
+`python/sim/src/openral_sim/policies/xvla.py` feeds gripper `qvel` (`:203`)
+**and** arm `joints["vel"]` (`:207`), so a scaled chunk changes what XVLA sees
+next tick.
+
+**This is an operator precondition, not a control the kernel enforces**, and
+the distinction is worth being exact about: the band is a kernel parameter and
+the kernel has no idea which policy produced a chunk. Setting
+`OPENRAL_COLLISION_SCALE_PROXIMITY_M` for a round that happens to run XVLA arms
+it for XVLA. **Do not arm the band on an XVLA scene** until that observation
+coupling is re-analysed; if this needs to be enforced rather than remembered,
+the launch layer is where the adapter id is actually known.
+
+**`xvla` and `xr1` are different model families** — a similarity of name, not of
+adapter. `xr1.py` sends EE pose + axis-angle + gripper and no velocity, so the
+validation matrix's default skill
+(`OpenRAL/rskill-xr1-panda_mobile-robocasa365-nf4`, `model_family: xr1`) is not
+excluded and the A/B battery does run on it. Only `rskills/xvla-libero` uses the
+`xvla` family.
+
+What is still owed is the **step-index / elapsed-time audit**, and it is not
+vacuous: both `xr1` and `rldx` keep multi-frame histories (XR-1 samples a 7-deep
+state history at offsets 0/2/4/6; RLDX a 7-frame video history). A history of
+*poses* at a fixed stride encodes velocity implicitly, so a scaled chunk does
+change what those policies see across frames even though neither is handed a
+velocity. That is weaker coupling than XVLA's explicit `joints["vel"]`, but it
+is not none.
+
+### Collision evidence: and the configuration it was measured at
+
+The payload also carries `joint_positions_rad`: the configuration forward
+kinematics was run on for the reported `horizon_step`, in the envelope's dof
+order with mobile-base dofs zeroed (the arm is checked in `base_link`). It is
+the same vector `check_config` FK'd, captured where the hit is reported, so it
+cannot describe a different pose than the verdict does.
+
+This matters most for a **predicted** step, whose configuration exists in no
+other artifact: it is the kernel's own damped-least-squares Jacobian
+integration of the candidate chunk, at this kernel's `collision_predict_lambda`
+and its `collision_seed_dt_s`. Adjudicating such a stop against the measured
+joints reads geometry the kernel never checked — the drawer-opening run that
+motivated the field reported two links 5.34 mm interpenetrating while offline
+mesh adjudication at the *recorded* joints put the same pair 53 mm apart.
+
+Every number in the payload is serialized at `max_digits10` and round-trips to
+the identical double. That is a requirement, not tidiness: the default six
+significant digits round a joint angle to ~1e-6 rad, which at a metre of reach
+is millimetres of end-effector error — the same order as the distances this
+evidence exists to adjudicate. An empty array means a record predating the
+field: a kernel that reports a collision necessarily has a model loaded (the
+whole block is behind that gate) and its FK buffer is always `n_dof` long.
+
+The W3C `traceparent` carried on `ActionChunk.trace_id` is extracted
+with the stock propagator and used as the parent context, so each
+`safety.check` span is a child of the producer's `rskill.tick`.
+
+Endpoint resolution follows the standard OTel env vars:
+
+```bash
+# Point at the dashboard / Jaeger / any OTLP/HTTP collector.
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+ros2 launch openral_safety_kernel kernel_only.launch.py \
+    envelope_file:=/tmp/openral_safety_envelope.yaml
+```
+
+When the env var is unset the kernel falls back to
+`http://localhost:4318` (the dashboard's default bind).
+`BatchSpanProcessor` ferries spans off the chunk-callback thread, so
+the validator stays allocation-free
+(`test_no_alloc.cpp` still pins the guarantee).
+
+## Attached-payload exemption ladder (ADR-0092)
+
+A grasped payload is checked as robot geometry against the occupancy map —
+the carried object must still collide with cabinets and people. Two contacts
+are legitimate and indistinguishable from real penetration by depth alone,
+so the kernel grants exactly two bounded exemptions inside
+`check_attached_voxel_collision`, nothing else. An exempted cell reaches
+`sweep_min_distance` only; it can never be the cell an E-stop names.
+
+**1. Support-contact witness (ADR-0092 D6).** Attachment says what the robot is
+carrying, not that the payload is free of its environment: a grasped baguette
+is still lying on the counter. World State attests that one contact at attach
+time on the existing `attached_objects` path — a support identity, a contact
+point and outward normal in the **attached object's own frame**, a patch
+radius, and the **physical** contact depth. The kernel exempts a cell only when
+it is inside the patch laterally *and* no higher above the attested support
+plane than
+
+```
+half_resolution · (|n.x|+|n.y|+|n.z|)  +  attested depth  +  slack  +  resolution
+└─ exact half-width of the voxel cube ┘    └─ physical ─┘    └1 mm┘   └ co-planar ┘
+      projected on the support normal                                    headroom
+```
+
+That first term is what makes the witness work under coarse maps. A surface
+cell's cube overshoots the true surface it discretises, so a 1 mm physical
+contact reads as up to ~15 mm of cube penetration at 25 mm resolution — the
+2026-08-13 baguette run E-stopped on exactly that, `-15.70 mm` reported against
+six real MuJoCo contacts of `-0.87..-1.37 mm`. Measuring depth against the
+attested plane instead of the cell cube accounts for the inflation *exactly*,
+by geometry, rather than absorbing it into a widened tolerance that would also
+license real penetration.
+
+Fourth term: the **2026-08-15 co-planar headroom calibration** (hazard log
+Entry 012, "Calibration 2026-08-15", 5-run baguette battery
+`spark:~/openral-runs/2026-08-15-baguette-battery`). The battery refuted
+"sliding" (run 4 moved the payload 10.2 mm during the stop; the lateral
+patch gate, 135.7 mm, never came near the 84-86 mm actual offset) and named
+the real class: **adjacent co-planar structure** (a raised edge, a
+neighbouring stack on the same surface) sits ~1 voxel above the attested
+plane during genuine support contact — round-8 r2 measured `+42.9 mm`
+against a ~15-19 mm envelope, excess `+24.4 mm` = one 25 mm voxel. The bound
+gains one full voxel, **inside the existing lateral patch** (height only,
+never reach; patch radius untouched). At sim's 25 mm cells with a 5 mm
+attested depth: envelope = `12.5 + 5 + 1 + 25 = 43.5 mm`, so r2's `+42.9 mm`
+clears it by 0.6 mm and a `+55 mm` protrusion does not
+(`…TheRound8CoplanarCellIsInsideTheWidenedEnvelope`,
+`…SolidAboveTheCoplanarBandStillStops`, `…TheWidenedEnvelopeIsHeightOnlyNotReach`).
+
+Past that bound, solid genuinely above the attested support face still
+stops the robot, and a payload sinking into its support raises that height
+mm-for-mm until it does (`…DeepeningIntoTheSupportStillStops`, now 40 mm of
+sink; `…ProtrusionInsideThePatchStillStops`, now two cells up). Cost
+accepted with the calibration: within the attested patch, one voxel more of
+whatever the kernel can't tell apart from support contact is exempt — same
+accepted-trade class as HZ-0092-1's identity-blindness-within-patch, one
+voxel more of height.
+
+The witness is **latched, and it dies on separation**: once nothing it would
+exempt is still in contact, its bit clears and the kernel never sets it again.
+Only a genuinely new attestation — keyed on `(object_id, support_id,
+stamp_ns)`, so the heartbeated attachment snapshot cannot resurrect it —
+re-arms it. Lift and re-contact is a new violation; so is a regrasp; so is any
+contact against a surface the witness does not name. No attestation at all —
+which is what the vision attachment producer emits, honestly — means no
+exemption.
+
+Layer-2 does not get unbounded trust: `support_witness_max_patch_radius_m`
+(0.5) and `support_witness_max_penetration_m` (0.01) cap what an attestation
+may claim, and a witness beyond them fails the whole attachment message closed.
+
+**The witness's evidence is occupancy, so the clearing is partitioned against
+it.** The liveness test is not kinematic: `update_support_contact_witnesses`
+keeps a bit alive only while some **occupied** cell the witness would exempt is
+still within `margin` of the payload. That is deliberate — the attested plane
+lives in the *object* frame and rides up with a lifted payload, so a purely
+geometric separation test would measure the payload against itself and never
+fire; only the map can say the support is still there. It also means the witness
+is destroyed by anything that removes the support surface from the map, and
+`openral_octomap_bridge`'s payload clearing is exactly such a thing: a resting
+payload's bottom cell layer *is* the counter's top cell layer. Clearing it took
+the witness's evidence with it — 2/2 on 2026-08-14, `support_witness_separated
+live=0x0 was=0x1` 2.7 s after arming with ground truth +0.000 mm still touching,
+then the same contact E-stopping unexempted (`sweep_min == min_distance`) as
+soon as a support cell returned to the map.
+
+So the cells are divided, exhaustively, between the two mechanisms: within the
+payload's reach a cell is either **cleared by the bridge** or **exempted here**,
+never neither and never both. The bridge's `support_patch_withholds` is this
+kernel's `support_contact_exempts` with `slack = 0` — the same along-normal
+bound, so the withheld region is the support half-space slab and not the patch
+cylinder — and what it withholds is therefore a subset of what this exempts
+**for the object that attested it**: no withheld cell can be the cell that stops
+the robot against that object. (This kernel exempts per object; the bridge
+withholds per message, so with two payloads attached the containment is one step
+looser — the two scope conditions are stated in
+[`packages/openral_octomap_bridge/README.md`](../../packages/openral_octomap_bridge/README.md).)
+Everything else around the payload — its own silhouette, its residue
+above the widened slab — still clears and still stops the robot if it comes
+back. The 2026-08-15 height calibration moved that line by one voxel on both
+sides at once: the bridge's `+ resolution` term is added in the same commit, so
+the co-planar band is withheld here rather than cleared there, and
+`withheld ⊆ exempt` stays true by construction rather than by luck. The two predicates are a deliberate cross-package mirror (consolidating
+them would put `octomap` and `tf2` one link from this kernel) and must move
+together: `SupportContactWitness.ThePartitionedClearingLeavesTheWitnessIts
+Evidence` and `…ClearingTheAttestedPatchKillsTheWitnessAndTheReturningCellStops`
+pin this side, `PayloadClearing.TheAttestedSupportSurfaceSurvivesTheClearing`
+the other. Nothing in the kernel changed for this: the bridge stopped destroying
+the evidence.
+
+**Pick and place are the same witness, on the same slot, sequentially
+(ADR-0097).** Entry 012's anti-scope — a *new* contact mid-carry is never
+exempt — is correct for an accidental wall-brush and wrong for the intentional
+contact that ends a place: round-5
+(`spark:~/openral-runs/2026-08-14-round5/baguette/seed1_run2`) stopped the
+flagship counter→cabinet insertion at `-1.78 mm` with the payload 66–67 mm
+inside the target cabinet, because nothing distinguished "the payload arrived
+at its declared destination" from "the payload grazed a wall."
+
+ADR-0097 supplies that distinction **outside this kernel**, and deliberately so.
+A typed place-phase declaration (`openral_msgs/PlaceDeclaration`, carried
+dispatch → HAL → World State) gates the *producer*: while it is in force, and
+only for measured support contact **on the declared target**, World State
+attests a second `SupportContactWitness`. This kernel gains nothing — no
+declaration input, no place-specific predicate, no second witness slot.
+`support_contact_exempts` does not branch on `evidence_kind` and cannot tell the
+two phases apart, which is exactly what keeps its own rule evidence-based:
+a declaration with no measured contact exempts nothing, and measured contact
+with no attestation exempts nothing.
+
+The single per-object slot is reused sequentially, which is the common case and
+the one the producer enforces: the pick witness dies at separation from the
+counter, and the place witness arrives later as a genuinely new attestation
+under the same `(object_id, support_id, stamp_ns)` re-arm rule. Everything else
+is unchanged and symmetric — the same caps, the same fail-closed ingest, the
+same hysteresis, and the same anti-scope *inside the declared target*: the
+cabinet's back panel is not the shelf the payload attested against, so it still
+stops the robot. `SupportContactWitness.DeclaredPlaceContactRidesTheSame
+ExemptionAsThePick`, `…TheSameInsertionWithNoDeclarationStillStops`,
+`…TheDeclaredShelfIsExemptButTheCabinetAroundItIsNot`,
+`…DeepeningIntoTheDeclaredPlaceSurfaceStillStops`,
+`…PickAndPlaceShareOneSlotSequentially` and
+`…AWrongDeclaredTargetChangesWhichContactNeverHowMuch` pin all of it, and
+`…NewContactOutsideThePatchStillStopsMidCarry` is untouched.
+
+**The declaration-scoped approach allowance is a *margin* change, not a third
+exemption (ADR-0097's 2026-08-14 amendment).** Round-6
+(`spark:~/openral-runs/2026-08-14-round6/baguette/seed1_carry_*`) showed the
+place witness above cannot arm for an enclosed target even with a correct
+declaration and a payload genuinely headed for it: the E-stop fired at
+`horizon_step 0` on `attached:sim:obj_main` vs `voxel_178099` at
+`min_distance = -4.9 mm`, with the payload still 22–30 mm from real shelf
+contact. Nothing was wrong with the declaration — inserting through a cabinet
+opening means passing within margin distance of voxel-quantised walls, and at
+25 mm cells that quantisation closes the opening's predicted clearance before
+the payload arrives. A witness *earned by touching* can never arm if the payload
+is stopped before it can touch. Open-top targets never hit this; enclosed ones
+cannot clear it structurally.
+
+So the kernel does gain one input for the amendment, and exactly one:
+`VoxelGrid::place_region`, a bounded oriented box supplied by the declaration's
+producer (`openral_msgs/PlaceRegion`, riding the same
+dispatch → HAL → World State path as the attestation, on
+`WorldStateStamped.place_declaration`). While it is live, cells whose **centre**
+lies inside that box are gated for the declared payload at
+`margin - min(1.5 × resolution, 40 mm)` instead of `margin`. That is the whole
+delta. In particular:
+
+* **It is not an exemption.** A cell deeper than the reduced margin still stops
+  the robot, and the reported `min_distance` is the pair's true distance —
+  `CollisionHit::place_allowance_active` and the `place_allowance_active=` log
+  key say the margin had been reduced, without changing the number quoted for it
+  (CLAUDE.md §1.4). `…DeepeningPastTheAllowanceInsideTheRegionStillStops`.
+* **`min(1.5 × voxel, 40 mm)` is an absolute cap, never purely
+  resolution-scaled** (`kMaxPlaceApproachAllowanceM`,
+  `kPlaceApproachAllowanceVoxels`, both read through
+  `place_approach_allowance_cap` so the geometry and the
+  `safety.place_region_armed` log line cannot quote different numbers). Both are
+  maintainer-set binding conditions, not implementation choices: at real
+  hardware's 5 cm grid the voxel-relative half alone would be 75 mm, which is
+  HZ-0095-2's episode in a new form; the ceiling caps it at 40 mm.
+  `…ACoarserGridNeverWidensTheAllowance` runs the whole thing on a 50 mm lattice
+  to prove that, and pins the amendment's own worked example (40 mm, not 75).
+
+  The cap was `min(one voxel, 25 mm)` until **ADR-0097's Second Amendment
+  (2026-08-15)**, hazard log HZ-0097-4's "Calibration 2026-08-15". Run 1 of the
+  battery (`spark:~/openral-runs/2026-08-15-baguette-battery/run1`) was the
+  allowance's first in-vivo firing: `26.48 mm` of predictive-check penetration at
+  a ground-truth `-2.43 mm` contact — `1.48 mm` short. Since the map-vs-truth
+  error at a placement pose is itself about one voxel, a one-voxel allowance is
+  sized to absorb exactly the discretization and leaves nothing for the contact
+  the witness is earned by making: structurally marginal, not occasionally short.
+  At 25 mm cells the cap is now `37.5 mm`, ~11 mm of headroom over that reading
+  (`…TheRun1FieldPenetrationNowReachesContact`). One footnote worth keeping: a
+  50 mm-tall payload passing a 25 mm cell saturates at exactly 37.5 mm of overlap
+  on every axis, so the flagship baguette's own geometry cannot reach past the
+  calibrated cap — `…DeepeningPastTheAllowanceInsideTheRegionStillStops` carries a
+  deeper payload to prove the hard stop behind the reduced margin at 38.2 mm and
+  40 mm.
+* **Arm-vs-world is untouched**, as is payload-vs-world outside the box, and any
+  payload the declaration does not name (`…ArmVsWorldIsUntouchedByALiveRegion`,
+  `…OutsideTheDeclaredRegionTheMarginIsUnchanged`,
+  `…TheAllowanceFollowsTheDeclaredPayloadOnly`).
+* **The kernel stays producer-agnostic.** Sim measures the box from the declared
+  body's MuJoCo subtree; real hardware will measure it from the perception stack
+  through a seam that does not exist yet, so no allowance is applied on real
+  hardware today. The kernel does not derive a region and does not branch on who
+  measured one. It does re-check the bounds it will accept
+  (`ingest_place_region`: finite, positive, ≤ 1.5 m per side, ≤ 8 m³) and refuses
+  a region whose `frame_id` does not match the occupancy grid's.
+* **Refusal means "no allowance", not "drop the message"** — the opposite
+  fail-closed direction from a malformed attestation, and for a reason: a bad
+  region can only ever make the kernel *more* permissive, so ignoring it restores
+  exactly the pre-amendment margin (`…DegenerateAndOversizedRegionsGrantNothing`,
+  `…AMapWithNoResolutionGrantsNothing`).
+* **It dies with the declaration.** Retraction, the declaration's own timeout
+  backstop (re-evaluated per candidate action, not only at ingest), detach, a
+  failed attachment ingest, and a re-framed grid all clear it
+  (HZ-0097-3/HZ-0097-4 mitigation 4). Two tests pin the two clock-domain gates
+  the 2026-08-14 fix leans on:
+  `…StalledAttachmentStreamRefusesEveryCandidateEvenWithAnArmedRegion` (a stale
+  attachment stream refuses every candidate action outright, so an armed region
+  cannot outlive the freshness gate that vouches for the payload) and
+  `…PlaceDeclarationBackstopExpiresTheAllowancePerCandidate` (the declaration
+  ages out in the kernel's own clock while the stream stays fresh, and the very
+  next candidate stops on the cell the allowance had been clearing).
+
+**The declared target's own geometry, so the payload is measured against the
+receptacle rather than against the cubes it was quantised into (ADR-0098,
+collision-safety survey Path B).** The allowance above is a bound on
+*quantisation error*, applied blind: the region box says WHERE the declared
+receptacle is and never WHAT it is, so every cell inside it gets the same
+`min(1.5 × voxel, 40 mm)` whether the declared body put that cell there or not.
+That is why the survey measured the mechanism binding on only 2 of 15 stops —
+the route out is not a better checker but a better world model.
+
+`openral_msgs/PlaceRegion` therefore carries a second, optional field:
+`geometry`, the declared target's own `AttachedCollisionPrimitive`s posed in the
+region's frame. Empty — the default, and what every producer that cannot measure
+geometry publishes — is byte-for-byte the pre-ADR-0098 behaviour. When it is
+present, a cell inside the region is adjudicated against the modelled body:
+`place_target_distance` measures the payload against the declared primitives
+with the same certified routines every other check uses, and the gate for that
+pair moves to the surface.
+
+* **The standoff margin does not apply to the body the robot was dispatched to
+  touch.** A margin is a standoff for geometry the robot must *not* touch; the
+  declared target is the one body in the map it was sent to place into, so it is
+  gated as an intended-contact pair at zero clearance — the negatable per-pair
+  margin contract Tesseract's `ContactAllowedValidator` and MoveIt's
+  `touch_links` both express (survey §17.2, §3.2). This is not an exemption: the
+  pair still trips at the surface, the advisory band still covers the
+  millimetres of arrival overshoot, and past the band the latched stop is
+  unchanged (`…TheStandoffMarginDoesNotApplyToTheBodyItWasDispatchedToTouch`).
+* **Against truth this is strictly more conservative than the box alone.** The
+  blanket allowance lets the payload sit 37.5 mm inside a cube whose near face
+  may be a whole voxel in front of the real surface, so what it permits against
+  the real body is unknowable. This permits penetration of the real body of
+  zero (`…NeverLetsThePayloadReachTheModelledSurface`).
+* **Against the cube it is looser, and bounded.** It is looser by exactly the
+  amount the cube over-stated the surface, and never by more than the blanket
+  allowance already in force: the modelled distance is substituted only while
+  `d_target <= d_cell + allowance`. A model claiming more clearance than the
+  map's own quantisation could explain — a primitive fitted too small, an
+  articulated door measured in a pose it has since left — is refused outright and
+  the pair falls back to the blanket path bit for bit
+  (`…GeometryClaimingMoreClearanceThanTheCapFallsBackToTheBox`).
+* **The evidence names the body, not the cell.** `CollisionHit::
+  place_target_adjudicated` marks a pair whose distance is to the declared
+  geometry, and the node reports it as `place:<target_id>#<cell>` instead of
+  `voxel_<cell>`. Quoting one geometry's distance under another's identity is
+  what `CollisionHit` forbids and what #187 landed to stop
+  (`…ADeclaredTargetsGeometryAdjudicatesAndNamesTheBody`).
+* **The same fail-closed posture, one notch stricter.** A malformed shape or a
+  list past `kMaxPlaceTargetPrimitives` (64, matching
+  `openral_core.PlaceRegion.MAX_GEOMETRY_PRIMITIVES`) refuses the **whole
+  region**, not just the geometry: a producer that names a target and then
+  describes it with a shape the kernel cannot measure is not one whose box is
+  trusted either (#142/#146). Half a receptacle is a worse model than none,
+  because the missing half would be adjudicated as if it were not there
+  (`…TheIngestRefusesWhatItCannotMeasure`).
+* **Everything undeclared keeps the voxel grid.** Arm-vs-world, payload-vs-world
+  outside the region, and any payload the declaration does not name are all
+  untouched — the geometry only ever refines the pairs the allowance already
+  covered.
+
+**Past the allowance there is now one more outcome, and it is a refusal rather
+than a latch (issue #176).** The allowance above is calibrated for a payload
+*reaching* its support through a voxel-inflated opening. A payload that has
+**arrived** reads deeper still, and for reasons that are all map discretisation
+and none of them force: `insertPointCloud` marks the cell *containing* the ray
+endpoint (so the kernel's surface starts up to one resolution early) and the
+payload is a fitted convex primitive that bulges past the real object. The
+2026-08-26 `oriented-grid-2` round measured exactly that — the baguette place
+read **−38.22 mm** against a 37.5 mm allowance, **0.72 mm** over, while the
+ground-truth probe put the physical contact at **−1.4 mm**. Under the old rule
+that ended the run and required `/openral/estop_reset`.
+
+So a hit carries `CollisionHit::advisory`, and the node refuses the chunk
+without latching or asserting `/openral/estop` when it is set. Every bound is
+required, and any one of them failing gives the latched stop unchanged:
+
+* **payload only.** `advisory` is set inside `check_attached_voxel_collision`
+  and nowhere else — a robot link against the world is the stop it always was,
+  at any depth, declared place or not (`…ARobotLinkIsNeverAdvisoryHoweverShallow`).
+* **declared region only.** It requires `place_approach_allowance > 0`, which is
+  returned only for a cell inside the producer-measured region for the declared
+  object (`…AnUndeclaredPayloadIsNeverAdvisory`).
+* **bounded in depth.** `min(0.2 × voxel, 5 mm)` past the allowance
+  (`kPlaceAdvisoryDepthVoxels`, `kMaxPlaceAdvisoryDepthM`, read through
+  `place_advisory_depth`) — ~7× the measured 0.72 mm overshoot, and deliberately
+  no more. Per-cell penetration saturates near the allowance itself (measured:
+  −37.50 mm deepest at 25 mm, −50.00 mm at 50 mm), so a full-voxel band would
+  cover the entire reachable range and stop bounding anything
+  (`…TheBandStaysASmallFractionOfTheAllowance`, `…TheBandEndsExactlyWhereItSaysItDoes`).
+* **bounded in repetition.** `place_advisory_max_consecutive` (3) caps an
+  unbroken run; the next refusal latches with its E-stop. Any accepted chunk
+  resets the run, so the cap counts shoving, not progress
+  (`…AnUnbrokenAdvisoryRunLatchesAtItsCap`).
+* **severity outranks depth.** Because the gate threshold differs per pair, the
+  deepest tripping pair is not the most serious one: a −5 mm hard trip on an
+  undeclared payload and a −43 mm advisory reading in the declared receptacle
+  can occur in one sweep, and ranking by depth would report the advisory and
+  lose the latch the first pair earned. `fold_pair` ranks severity first
+  (`…AShallowHardTripOutranksADeeperAdvisoryOne`).
+
+It is **not** permission to penetrate: an advisory hit still has `hit == true`
+and the action is still dropped. What changes is that recovering from a place
+that arrived does not need an operator. `place_advisory_max_consecutive: 0`
+disables the band entirely and restores the pre-#176 behaviour exactly.
+
+**The allowance's effect on a live verdict is pinned end-to-end, not only in
+gtest.** Through nine validation rounds the allowance armed correctly in every
+declared run yet `place_allowance_active=1` was observed exactly once — XR-1's
+stochastic trajectories almost never put the payload in the band between the
+reduced and the unreduced margin, so outside the gtests the allowance's effect on
+an accept rested on counterfactual arithmetic.
+`tests/integration/test_safety_kernel_place_allowance_band.py` removes the policy
+and drives the band directly against this node: a 1-DoF prismatic carriage
+carrying a 20 mm sphere at a single occupied 25 mm cell, so the commanded joint
+value *is* the payload's distance. One chunk at `d = 20 mm` is refused
+undeclared and **accepted** with a live declaration (the verdict flip that had
+never been observed); a second at `d = 5 mm` is refused either way and emits the
+disclosure verbatim:
+
+```
+safety.collision kind=world a=attached:sim:cup b=voxel_368 step=0 min_distance_m=0.005
+sweep_min_distance_m=0.005 mode=0 rskill_id=openral/place-approach-band
+place_allowance_active=1 place_target=sim:cabinet
+```
+
+`d = 20 mm` is deliberately below the 25 mm the pre-Second-Amendment cap would
+have left, so reverting either `kPlaceApproachAllowanceVoxels` or
+`kMaxPlaceApproachAllowanceM` turns that accept back into a refusal (verified by
+actually reverting both, together and separately). It runs on the `docker-build`
+live-ROS lane via `scripts/ros_live_tests.sh`; no GPU, no simulator.
+
+### What the region's log lines say
+
+Three events, and the reason is always the real one:
+
+| Line | Severity | When |
+| --- | --- | --- |
+| `safety.place_region_armed` | INFO | a validated region goes live (on the transition); `geometry=<n>` says how many declared-target primitives armed with it, `0` being the pre-ADR-0098 box-only case. Re-emitted when that count changes, because a region that gains or loses the declared body is adjudicating against something materially different |
+| `safety.place_region_dropped reason=…` | INFO | an armed region is disarmed — `no_declaration`, `retracted`, `no_region`, `detached`, `grid_frame_changed` |
+| `safety.place_region_not_armed reason=no_object` | INFO | a live declaration names a payload the kernel is not carrying |
+| `safety.place_region_rejected reason=…` | WARN | a malformed region reached the kernel — `frame_mismatch`, `bad_pose`, `bad_extents`, `degenerate`, `oversize`, `oversize_volume`, `bad_geometry`, `geometry_overflow` |
+
+Two rules keep them honest. **The reason is the branch that fired**
+(`place_region_status_reason`), not a category: `reason=bounds` used to label
+every refusal, including the empty-object-mask one that fires on every heartbeat
+before the grasp. And **a refusal is announced on its (reason, target)
+transition**, not per message — the attachment set is heartbeated at 30 Hz and a
+refusal is normally a standing state, which round-8 recorded as 672–811 identical
+warnings per run. The standing state is instead readable on the 1 Hz
+`/diagnostics` `place_region` key (`live:<target>:geom=<n>`,
+`expired:<target>:geom=<n>`, `<reason>:<target>`, or `-`; `geom` is the count of
+declared-target primitives armed with the region, `0` for the box-only case). A pre-grasp declaration is *not* a fault — the
+margins in force are exactly the undeclared ones — so it is INFO, and it is still
+logged once, because an allowance that never armed has to be reconstructible from
+the trace (HZ-0097-2 mitigation 1).
+
+The honest cost, accepted and recorded as HZ-0097-4: an object already sitting
+inside the declared region when the declaration goes live — a jar on the shelf —
+receives the same allowance for the declared window, whether or not the payload
+ever reaches it. It is bounded by the cap, the region and the declaration's
+lifetime; `…AnObjectAlreadyInTheRegionIsForgivenOnlyToTheCap` pins the bound on a
+50 mm lattice at exactly the 40 mm ceiling. The Second Amendment re-accepted that
+cost unchanged in shape and at the same severity, at the raised cap. `…TheRound6ApproachReachesTheDeclaredShelf` and
+`…TheSameApproachUndeclaredStopsExactlyAsRound6Did` are the field case in both
+directions.
+
+**2. Embedded attach-time residue.** The payload's own occupancy left in the
+map at attach — a cell already at least half a voxel inside the payload when
+the baseline was snapshotted. This is stale self-occupancy, a different
+phenomenon from support contact, and the witness deliberately does not cover
+it; the attach-time baseline snapshot is retained solely for this.
+
+**Removed:** the non-deepening index-keyed baseline (per-cell attach-time
+distance, capping penetration at what it allowed) — it decorrelated as the
+base drove and the lattice re-phased, since indices shift while physical
+contact persists. Also removed: `attached_contact_allow_new_shallow`, which
+exempted unattested new cells up to a tolerance raised to the voxel size.
+Both removals move cases from no-stop to stop.
+
+`attached_contact_tolerance_m` survives with its name's meaning restored:
+physical slack for FK and pose noise, defaulting to 1 mm. It is no longer
+overridden to the octomap resolution in `deploy_e2e.launch.py` (hazard
+**HZ-0095-2**), because the quantisation it was standing in for is now handled
+geometrically by the witness predicate.
+
+With a live witness the predicted Cartesian steps are checked too — the old
+path skipped them whenever attach-time contact was active, because it had no
+pose-dependent way to tell the support contact apart. The skip remains only for
+the unattested legacy case.
+
+## The contact-force gate (ADR-0100, survey Path C)
+
+Every check above discriminates on **position**. At the instant of a place the
+true clearance *is* zero, so none of them separates "set the object down in the
+cabinet" from "crush it against the cabinet" — both are the same distance
+(survey §9 point 4). `check_contact_force_gate` reads the axis that does.
+
+**It only ever adds a refusal, and that is the whole safety argument.** The node
+evaluates it *last*, after every geometric check in `check_config` has already
+passed, so the only configurations it can reach are ones the kernel was about to
+accept. There is no branch by which it widens a margin, creates an exemption, or
+lets a measured force license contact the geometry refused — and
+`ContactForceGateResult` has no field with which to express one. Geometry keeps
+priority in the evidence: a force stop appears only where there would otherwise
+have been no stop at all.
+
+It arms only when **all four** hold, and each one fails toward the shipped
+geometry-only behaviour:
+
+* **a live declaration with a bound.** `AttachedModel::force_gate.valid`, which
+  the node sets from `PlaceDeclaration.contact_force_threshold_n`. Dispatch's
+  default is `0.0` — no gate. Unlike the approach allowance, this does **not**
+  need a producer-measured region, because the bound travels with the
+  declaration rather than with the geometry; it is therefore resolved above the
+  `region_valid` check, and armed for the region-less declaration dispatch
+  actually publishes.
+* **the declared payload.** The object's bit must be in `force_gate.object_mask`.
+  A second object the robot happens to be carrying is outside the declaration
+  and outside this (`…WithNoLiveDeclarationTheGateIsInert`).
+* **a witness on the declared target.** `contact_force_target_matches`, resolved
+  at ingest against *this* message's declaration — the same scoping rule
+  `SupportContactWitness::support_id` is under
+  (`…AContactOnAnythingButTheDeclaredTargetAttestsNothing`).
+* **a calibrated magnitude.** Without `contact_force_calibrated` the value is a
+  producer quantity and **not newtons**, so it is not read at all rather than
+  read optimistically (`…AnUncalibratedMagnitudeIsNeverReadAsNewtons`). No
+  published work validates MuJoCo contact-force magnitudes against real
+  force-torque measurements (survey §21.7), MuJoCo documents its contact model
+  as an approximation resting on `solref`/`solimp`, and FORGE
+  ([arXiv:2408.04587](https://arxiv.org/abs/2408.04587)) re-tunes its threshold
+  on hardware across >1000 real trials. A sim magnitude is a calibration knob,
+  never an equivalence claim.
+
+`kMaxContactForceThresholdN = 140.0` mirrors
+`openral_core.PlaceDeclaration.MAX_CONTACT_FORCE_THRESHOLD_N` — ISO/TS 15066
+Table A.2's quasi-static limit for hands and fingers, the most permissive body
+region in the table — so a schema-valid declaration can never overflow the
+kernel, and a threshold past it arms nothing rather than being clamped to a
+bound nobody chose (`…AnOutOfRangeOrNonFiniteBoundArmsNothing`).
+
+The comparison is **inclusive**: a declaration stating "up to 30 N" permits
+30 N. The **deepest** overrun is the one reported, so the evidence names the
+binding pair rather than the first object scanned
+(`…TheDeepestOverrunIsTheOneReported`) — the single-pair-coherence rule
+`CollisionHit` is under. A gate stop logs `safety.contact_force_gate` with the
+object, the target, the measured magnitude and the threshold it was judged
+against, and `min_distance` is left at infinity rather than carrying an invented
+geometric distance no check measured.
+
+**Absence of a witness is not evidence of absent contact.** The sim producer
+reads MuJoCo's solver contact list, which `contype`/`conaffinity` exclusions can
+leave empty under a payload demonstrably in contact. That blind spot is
+survivable precisely because this check can only add refusals: failing to arm
+lands on today's behaviour, never on something more permissive than it.
+
+## Frame convention (ADR-0095)
+
+The kernel applies **no transforms**. It FKs each link from the manifest's
+per-joint `origin_xyz` / `origin_rpy` starting at the robot's `base_frame`, and
+rasterizes the resulting capsules straight against `/openral/world_voxels`,
+whose `header.frame_id` and `origin` are taken at face value. Everything the
+kernel touches therefore lives in one frame, `base_frame`, and that frame is
+whatever `/tf` says it is:
+
+```
+odom -> base_link        ← MobileBaseBridge (from the HAL's base_pose_6dof)
+  ├─ base_link -> <cam>_optical_frame   ← the depth extrinsic feeding octomap
+  │     …octomap_server → openral_octomap_bridge → /openral/world_voxels
+  └─ manifest origin_xyz chain          ← this kernel's collision FK
+```
+
+The two branches must be measured against the **same body**. On robosuite /
+RoboCasa mobile manipulators `base_link` is the arm mount at the top of the
+0.70 m pedestal (`mobilebase0_support`), not the ground-level chassis root, so
+`robots/panda_mobile*/robot.yaml` carries the plain Franka `panda_joint1`
+origin `[0, 0, 0.333]`. PR #103 briefly set it to `1.033` to cancel a
+producer-side frame bug *inside* the kernel; ADR-0095 fixes the producer at
+source and reverts the root **in the same commit**, because either half alone
+leaves the kernel a full pedestal away from the obstacles it is checked against
+(hazard **HZ-0095-1**).
+
+That pairing is envelope-neutral by construction — the grid's content and the
+FK root move by the same −0.700 m, and a capsule-vs-voxel distance depends only
+on their difference. `VoxelCollision.BaseFrameAlignmentPreservesTheProtective`
+`Envelope` asserts the hit flag, the evidence cell index and `min_distance` are
+identical across the pair; `VoxelCollision.HalfAppliedFrameAlignmentMovesThe`
+`KernelByThePedestal` asserts a half-applied change blinds the kernel.
+
+## What this kernel does NOT check: base motion (ADR-0040)
+
+The kernel checks the **arm's link capsules and the attached payload** against
+`/openral/world_voxels`. It does **not** check where the base drives. Nav2's
+2-D costmap does, on its own, against its own world model — that is ADR-0040's
+recorded decision, and the two models are deliberately separate:
+
+| | this kernel | Nav2 |
+|---|---|---|
+| geometry | 3-D link + payload capsules | one 2-D footprint polygon |
+| world | `/openral/world_voxels` (octomap-derived) | costmap from `/openral/nav2/scan` or `/map` |
+| authority | veto `/openral/candidate_action`, or E-stop | refuse a path, then `/cmd_vel` |
+
+**`/cmd_vel` never reaches `/openral/candidate_action`.**
+`openral_hal.mobile_base_bridge.MobileBaseBridge` turns Nav2's `Twist` into a
+`BODY_TWIST` action and applies it through the HAL directly, so this kernel
+neither bounds nor vetoes base velocity; Nav2's `velocity_smoother` caps it.
+The single authority this kernel retains over base motion is the **E-stop
+latch** — the bridge drops every `/cmd_vel` while the HAL node is latched, so
+an E-stop raised here does stop the base. There is no per-command bound.
+
+A consequence worth stating plainly: a payload this kernel is faithfully
+protecting in 3-D is invisible to Nav2 unless Nav2's footprint says it is
+there. `packages/openral_nav2_bringup` publishes exactly that footprint from
+the same `/openral/world_state_fast` attachment set this kernel ingests, so the
+two sides can never act on different attachments. Its README carries the full
+boundary table.
+
+## Link geometry for the world-voxel check (staged 26-DOP → convex hull)
+
+The arm-link↔world-voxel narrow phase is **staged** for any link whose manifest
+declares `tight_geometry`, instead of running `box_box_distance` on the link's
+oriented box:
+
+1. **Stage 1**, on every occupied cell — a 16-axis separating-axis lower bound
+   against the link's **26-DOP** (13 tangent slabs in the box's own frame, plus
+   the three world axes). Measured 8.5–10× cheaper per query than the box SAT.
+2. **Stage 2**, only on the cells stage 1 cannot clear — **GJK on the link's
+   exact convex hull**, returning the true surface distance.
+3. `box_box_distance` is folded back in — the maximum of the two bounds — for any
+   cell the staged path is about to stop on.
+
+Step 3 is not belt-and-braces. A 26-DOP is a strictly smaller solid than the box
+that contains it, but its axis set is **not** a superset of the box SAT's 15
+axes, so the tighter solid can still produce the looser bound at some cells.
+Taking the maximum of two lower bounds is still a lower bound, and it buys the
+property the change is justified by: **the staged path can never stop where the
+shipped path would not have.** It removes false stops the box was causing; it
+cannot add one.
+
+**The broad-phase window does not move.** It is still sized from `half_extents`
+alone. That stays correct because `hull ⊆ 26-DOP ⊆ shipped OBB` is asserted at
+`on_configure` by `validate_tight_geometry`, fail-closed — a model that cannot
+prove containment does not configure. Both containment links are *definitional*
+(the hull is `conv(vertices)`; the slabs are tangent halfspaces), so no fitted
+parameter or optimiser tolerance appears in the argument.
+
+Three bounds keep it real-time, and every one of them fails **conservative** —
+the fallback is always a lower bound on the true distance, i.e. today's answer or
+better:
+
+| constant | value | when it binds |
+|---|---:|---|
+| `kGjkMaxIterations` | 24 | returns the best supporting-hyperplane bound so far |
+| `kMaxStage2PerCheck` | 32 | falls back to stage 1 + `box_box_distance` |
+| `kMaxTightHullVertices` | 320 | that link runs stage 1 only |
+
+The vertex ceiling is why `panda_link1` ships stage 1 only: its exact hull is
+1588 vertices and measured **0.77×** the shipped routine's speed at 400 occupied
+cells. Its 26-DOP still cuts the link's support excess from 53.27 mm to 25.69 mm.
+`panda_link2` ships both stages (152-vertex hull, 46.83 mm → 0.00 mm), as do
+`panda_link5` (152-vertex, 45.20 mm) and `panda_link7` (102-vertex, 28.25 mm) —
+added for the self-collision path below.
+
+Everything else keeps the primitive path unchanged: world-capsule obstacles,
+capsule-lowered robots, and every link that declares no tight geometry. Hazard-log
+Entry 012's lockstep is **not engaged** — `check_attached_self_collision` still
+reads the same link boxes it always did. Carried payloads got their own staged
+path in #266, below.
+
+## The same stages for a carried payload (issue #266)
+
+`check_attached_voxel_collision` runs the identical staged path for a payload
+primitive that arrives with a proved-contained refinement. The box stays the
+broad phase and the fallback; a primitive that ships none — every pre-#266
+publisher, and every sphere/box/capsule sim geom, which lower **exactly** — is
+bit-for-bit unchanged.
+
+It is there because a carried **mesh** geom had no lowering but its local AABB.
+Across the 2026-09-10 resolution A/B (424 samples, 4 scenes, identical in every
+scene) those corners stood a median **50.78 mm** (max 88.22 mm) proud of the
+mesh — against a world-voxel half-diagonal of 21.65 mm at 25 mm cells and
+12.99 mm at 15 mm, so the payload box was **2.3–3.9× the entire quantisation
+term**. Payload-vs-world was 27/34 (79 %) of stops at 25 mm and 36/37 (97 %) at
+15 mm, and roughly half of those fired with the payload >10 mm clear of
+anything. The 25 → 15 mm A/B returned a null for exactly this reason: it was
+shrinking the small term.
+
+The check itself stays. The ≤2 mm bucket holds real interpenetration (−7.7,
+−1.7, −1.5, −1.3 mm) — a carried object already in contact. The fix is
+fidelity, not removal.
+
+Two things differ from a robot link's hulls, both because a payload's geometry
+is not known until something is carried:
+
+* **The producer runs online.** `_sim_attachment_evidence._tight_geometry_from_points`
+  builds the DOP and the exact hull at attach, and stops there — the offline
+  tool's `refine_dop_to_budget` is a loop of halfspace intersections, affordable
+  once per robot release and not once per grasp. Over `kMaxTightHullVertices`
+  the payload runs stage 1 only.
+* **Ingest fails DOWN, not closed.** The refinement arrives on every world-state
+  message from a live producer. One that cannot be proved contained
+  (`validate_tight_hull` — the same predicate `validate_tight_geometry` uses,
+  extracted so a payload hull is never held to a weaker standard) is **dropped**,
+  and the primitive is checked as the plain box. Refusing the whole attachment
+  would drop the payload's geometry, which is the unsafe direction. An
+  over-budget hull is refused whole, never truncated — a truncated hull no
+  longer contains its mesh.
+
+Untouched on purpose: **ADR-0098's place-target adjudication**, whose
+`target_distance ≤ d + allowance` bound keeps reading the shipped box distance
+(that bound is calibrated against the box model the declaration is adjudicated
+on); `check_attached_self_collision` and `check_attached_world_collision`, which
+are 3 % of measured stops and whose adjudication budget
+(`attached_payload_mesh_slop`) is stated against exactly that box; and the
+support-witness liveness probe, where a tighter payload would *shorten* an
+exemption.
+
+`attached_payload_mesh_slop` now publishes `n_stage2_primitives` per object, so
+an offline adjudicator can tell a refined payload from a boxed one instead of
+inferring it from the round's date — the `has_stage2_hull` lesson of #260, on
+the payload side. Full measurements and the safety case:
+[`docs/reference/collision-hull-narrow-phase.md`](../../docs/reference/collision-hull-narrow-phase.md) §10.
+
+## The same hulls for self-collision (issue #191)
+
+`check_self_collision`'s box↔box pass re-asks the exact hulls
+(`hull_hull_distance`) for any pair the OBBs cannot clear when **both** links
+ship a stage-2 hull. The OBB stays the broad phase and the fallback: a pair the
+boxes already separate never reaches the GJK, and a manifest declaring no tight
+geometry is bit-for-bit unchanged.
+
+It is there because the OBB cannot answer for links that interleave.
+`panda_link5`↔`panda_link7` was **ACM-exempted** — the check switched off — for
+that reason. Over the pair's whole relative-DoF subspace (`panda_joint6` ×
+`panda_joint7`, 121 × 121 = 14 641 poses, at `self_collision_margin_m = 0`):
+
+| representation | fires | real | false |
+|---|---:|---:|---:|
+| shipped OBB | 12 647 (86.38 %) | 967 | **11 680 (79.78 %)** |
+| exact hull | 967 (6.60 %) | 967 | **0** |
+
+No margin separated the OBB's two populations — the deepest real collision sits
+at a box gap of −8.37 mm and the shallowest false one at −36.64 mm — and the box
+check fires at the arm's own reset pose (−11.68 mm, where the hull is +21.81 mm
+clear). The exemption is gone; the pair is checked. Cost: `check_self_collision`
+goes 0.758 → 2.303 µs/call on `panda_mobile`, 24.7 µs over a 16-step horizon.
+
+Two consequences to know about. **The all-zero Panda arm self-collides for real**
+(5.65 mm at its own meshes), which two kernel tests were flying before this
+became visible. And the self-collision check no longer contributes to #188's
+graded velocity band: `panda_link5`↔`panda_link7` never opens past 22.72 mm at
+*any* pose, so folding it in pinned the scale at a constant 0.21 and left the
+world term — the one a chunk can act on — mattering only below 22 mm. The
+self-collision **latch** is untouched.
+
+Geometry is generated by `tools/generate_tight_geometry.py` from the robot's real
+collision meshes and verified against them in CI. Full measurements, the safety
+case, and the standing real-HAL caveat:
+[`docs/reference/collision-hull-narrow-phase.md`](../../docs/reference/collision-hull-narrow-phase.md)
+(§9 for the self-collision half).
+
+## The hull check reports when it did not measure the depth
+
+`hull_hull_distance` runs GJK on the Minkowski difference. GJK **proves** an
+overlap — the simplex contains the origin — but it does not size one; that needs
+an expanding-polytope step this kernel does not run. On that branch the OBB's
+`box_box_distance` stands as the reported number.
+
+That is **sound**: the hull is contained in its box, so the box can only ever
+report *more* penetration than the truth, never less. It can also be very loose.
+On the `panda_link5` ↔ `panda_link7` pair at the 2026-09-04 battery's tripping
+configuration it reads **−31.97 mm for a ~1.5 mm hull interpenetration**, a 20×
+overstatement — published under the identity of a check that exists *because*
+#191/#202 established the box cannot be trusted for that pair.
+
+`CollisionHit::depth_is_box_bound` closes that. It is set only for a
+self-collision pair whose two links both ship a stage-2 hull and whose hulls the
+GJK found overlapping, and it means exactly one thing: **the reported
+`min_distance` is the box's bound, not a measurement of the geometry the
+evidence names.**
+
+* **Disclosure, never a gate.** The trip decision is unaffected — both numbers
+  are ≤ 0 and the pair trips either way — exactly like `place_allowance_active`
+  and `place_target_adjudicated`. Nothing branches on it.
+* **It does not mean "this pair has hulls."** A pair whose hulls genuinely clear
+  reports the measurement and leaves the flag unset
+  (`…TheReportedHitCarriesTheDisclosure`), and a pair with a stage-1-only link
+  never reached the GJK at all (`…TheFlagIsClearedWhenNoHullRefinementHappened`).
+* **Who needs it.** An adjudicator differencing this number against a mesh-level
+  probe. `tools/validation_matrix.py` scores a link-vs-link self stop
+  `unadjudicated` today; when it gains a real self-pair budget, this flag is what
+  tells it the kernel's depth is a bound rather than a measurement.
+
+The honest fix for the *number* is an expanding-polytope step. That is a new
+numerical routine on an allocation-free real-time path and is deliberately not
+bundled here — see hazard-log Entry 025's open item.
+
+## Real-time guarantees
+
+- Validator (`validate()` in `src/validator.cpp`) is allocation-free.
+  Pinned in CI by `test_no_alloc.cpp` via a counting global
+  `operator new`.
+- C++17 / no exceptions across the kernel boundary — `Result<void,
+  Violation>` propagation (CLAUDE.md §5.2).
+- `SCHED_FIFO` + CPU pinning are opt-in via the `request_sched_fifo` /
+  `cpu_affinity` parameters; the node warns when the privileges are
+  unavailable rather than silently downgrading.
+
+## Testing & verification
+
+**The lifecycle tests isolate their own DDS process** (#222). `LifecycleKernelTest::SetUp`
+sets `ROS_AUTOMATIC_DISCOVERY_RANGE=OFF` before `rclcpp::init`, so no participant
+outside the test process — another test run, a second worktree, a live
+`openral deploy sim` — can reach the nodes under test. This is not hygiene: the
+kernel subscribes to `/openral/estop`, a global topic, and a concurrent sim on
+the default domain asserted an E-stop that latched the node under test and failed
+`StateUnavailableDropAndRecoveryPublishSafetyStatus` with a
+`DROP_EXTERNAL_ESTOP` the test never sent (19/20 on the shared domain with that
+sim live; 20/20 with discovery off). The fixture overwrites a caller's value on
+purpose. Debugging a test with external tools needs the opposite setting; do it
+locally, never by weakening the fixture.
+
+Three tiers, all driving the **real** `safety_kernel_node` (no mocks):
+
+- **C++ unit** (`just safety-kernel-test`) — `test_validator.cpp`,
+  `test_collision.cpp`, `test_lifecycle_kernel.cpp`, and the
+  allocation pin `test_no_alloc.cpp` (10,000× runs, zero allocs). The
+  `NoAlloc` case in `test_collision.cpp` drives the staged tight narrow
+  phase — GJK simplex included — under the same counter, because a
+  stack-only fixed-size simplex is a design constraint there, not an
+  accident.
+- **Sim** (`tests/sim/safety/`) — the kernel subprocess gated against a
+  MuJoCo oracle: envelope (`test_kernel_with_*_twin.py`) and geometric
+  collision (`test_kernel_*_collision*.py`, `test_kernel_h1_self_collision.py`,
+  `test_kernel_mjcf_lowered_self_collision.py`). These prove
+  self/world/voxel `KIND_COLLISION` rejection + estop end-to-end.
+
+> Geometric collision arms automatically in `openral deploy sim` /
+> `deploy run`: the launch lowers the robot's collision model
+> (`openral_safety.mjcf_lowering` preferred, manifest fallback) and the
+> kernel logs `self-collision check enabled: N links`. The lowering
+> assigns `dof_index` by **movable-joint order** — matching by joint
+> *name* previously froze the FK at the rest pose for robots whose MJCF
+> joint names differ from the manifest (issue #77).
+
+## Related
+
+- `cpp/opentelemetry_cpp_vendor` — ROS 2 vendor package this one
+  depends on for `opentelemetry-cpp` at colcon-build time.
+- `packages/openral_nav2_bringup/README.md` — the other half of the world:
+  Nav2's base footprint vs its 2-D costmap, the `/cmd_vel` boundary above, and
+  the payload footprint publisher that keeps a carried object visible to both
+  surfaces.
+- `packages/openral_safety/openral_safety/envelope_loader.py` — Python
+  bridge that writes the envelope YAML the kernel reads.
+- `packages/openral_safety/openral_safety/supervisor_node.py` — Day-1
+  Python pass-through; the kernel is the process swap behind the same
+  topic contract.
+- `python/observability/src/openral_observability/dashboard/store.py`
+  — Dashboard's TelemetryStore; consumes the `safety.check` spans
+  this kernel emits.

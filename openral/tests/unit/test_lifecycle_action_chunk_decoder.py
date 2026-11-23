@@ -1,0 +1,251 @@
+"""Regression test for the ``/openral/safe_action`` decoder.
+
+The HAL lifecycle node's ``_on_safe_action`` used to hardcode every incoming
+chunk as ``ControlMode.JOINT_POSITION``, dropping the wire
+``control_mode`` field. Per-mode chunks (CARTESIAN_DELTA, GRIPPER_POSITION,
+BODY_TWIST) from the C++ safety kernel were silently misrouted into
+``Action.joint_targets``, rejected by the HAL packer with a single WARN —
+visible only as "arm never moves in `openral deploy sim`".
+
+Pins ``openral_hal.lifecycle.decode_action_chunk`` against every
+control_mode the F1/F5 publisher emits. Real ``ActionChunk``-shaped inputs,
+real Pydantic ``Action`` outputs, no mocks (CLAUDE.md §1.11) — the
+decoder is duck-typed so any object exposing the wire field names works.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import pytest
+from openral_core.schemas import CONTROL_MODE_TO_UINT8, Action, ControlMode
+from openral_hal.lifecycle import decode_action_chunk
+
+
+@dataclass
+class FakeChunk:
+    """Duck-typed stand-in for the rosidl-generated ``ActionChunk``.
+
+    ``decode_action_chunk`` reads its fields via ``getattr`` only, so a
+    plain dataclass is a real (not mocked) substitute — the rosidl
+    class itself is just a struct with no behaviour.
+    """
+
+    flat: list[float] = field(default_factory=list)
+    n_dof: int = 0
+    horizon: int = 1
+    control_mode: int = 0
+    ee_name: str = ""
+    frame_id: str = ""
+    confidence: float = 1.0
+    tick_index: int = 0
+    tick_group_size: int = 1
+    cartesian_delta_scale: list[float] = field(default_factory=list)
+    joint_names: list[str] = field(default_factory=list)
+
+
+class TestDecodeActionChunk:
+    def test_joint_position_round_trip(self) -> None:
+        chunk = FakeChunk(
+            flat=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            n_dof=7,
+            horizon=1,
+            control_mode=CONTROL_MODE_TO_UINT8[ControlMode.JOINT_POSITION],
+        )
+        action = decode_action_chunk(chunk)
+        assert isinstance(action, Action)
+        assert action.control_mode is ControlMode.JOINT_POSITION
+        assert action.joint_targets == [[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]]
+
+    def test_cartesian_delta_populates_typed_field_not_joint_targets(self) -> None:
+        """The regression. CARTESIAN_DELTA must land in
+        ``Action.cartesian_delta``, not ``Action.joint_targets``.
+        """
+        chunk = FakeChunk(
+            flat=[-0.97, -0.28, -0.27, 0.0, -0.34, -0.10],
+            n_dof=6,
+            horizon=1,
+            control_mode=CONTROL_MODE_TO_UINT8[ControlMode.CARTESIAN_DELTA],
+            cartesian_delta_scale=[0.05, 0.05, 0.05, 0.5, 0.5, 0.5],
+        )
+        action = decode_action_chunk(chunk)
+        assert isinstance(action, Action)
+        assert action.control_mode is ControlMode.CARTESIAN_DELTA
+        assert action.cartesian_delta == [(-0.97, -0.28, -0.27, 0.0, -0.34, -0.10)]
+        assert action.cartesian_delta_scale == (0.05, 0.05, 0.05, 0.5, 0.5, 0.5)
+        assert not action.joint_targets
+
+    def test_gripper_position_uses_flat_list_not_nested_rows(self) -> None:
+        chunk = FakeChunk(
+            flat=[0.04, 0.04, 0.0],
+            n_dof=1,
+            horizon=3,
+            control_mode=CONTROL_MODE_TO_UINT8[ControlMode.GRIPPER_POSITION],
+        )
+        action = decode_action_chunk(chunk)
+        assert isinstance(action, Action)
+        assert action.control_mode is ControlMode.GRIPPER_POSITION
+        assert action.gripper == [0.04, 0.04, 0.0]
+
+    def test_body_twist_populates_typed_field(self) -> None:
+        chunk = FakeChunk(
+            flat=[0.2, 0.0, 0.0, 0.0, 0.0, 0.3],
+            n_dof=6,
+            horizon=1,
+            control_mode=CONTROL_MODE_TO_UINT8[ControlMode.BODY_TWIST],
+        )
+        action = decode_action_chunk(chunk)
+        assert isinstance(action, Action)
+        assert action.control_mode is ControlMode.BODY_TWIST
+        assert action.body_twist == [(0.2, 0.0, 0.0, 0.0, 0.0, 0.3)]
+
+    def test_slot_metadata_survives_safety_wire(self) -> None:
+        chunk = FakeChunk(
+            flat=[0.25],
+            n_dof=1,
+            control_mode=CONTROL_MODE_TO_UINT8[ControlMode.GRIPPER_POSITION],
+            ee_name="left_gripper",
+            frame_id="base_link",
+            confidence=0.75,
+            tick_index=42,
+            tick_group_size=3,
+        )
+        action = decode_action_chunk(chunk)
+        assert isinstance(action, Action)
+        assert action.ee_name == "left_gripper"
+        assert action.frame_id == "base_link"
+        assert action.confidence == pytest.approx(0.75)
+        assert action.tick_index == 42
+        assert action.tick_group_size == 3
+
+    def test_zero_confidence_round_trips(self) -> None:
+        """confidence=0.0 (policy disowns the action) must not decode as 1.0.
+
+        The old ``or 1.0`` falsy guard rewrote an explicit zero to full
+        confidence, so downstream consumers (dataset recording, diagnostics)
+        recorded the opposite of what the policy declared.
+        """
+        chunk = FakeChunk(
+            flat=[0.25],
+            n_dof=1,
+            control_mode=CONTROL_MODE_TO_UINT8[ControlMode.GRIPPER_POSITION],
+            ee_name="left_gripper",
+            confidence=0.0,
+        )
+        action = decode_action_chunk(chunk)
+        assert isinstance(action, Action)
+        assert action.confidence == 0.0
+
+    def test_cartesian_twist_populates_typed_field(self) -> None:
+        chunk = FakeChunk(
+            flat=[0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+            n_dof=6,
+            horizon=1,
+            control_mode=CONTROL_MODE_TO_UINT8[ControlMode.CARTESIAN_TWIST],
+        )
+        action = decode_action_chunk(chunk)
+        assert isinstance(action, Action)
+        assert action.control_mode is ControlMode.CARTESIAN_TWIST
+        assert action.cartesian_twist == [(0.1, 0.0, 0.0, 0.0, 0.0, 0.0)]
+
+    def test_joint_velocity_and_joint_torque_route_to_typed_fields(self) -> None:
+        for mode, field_name in (
+            (ControlMode.JOINT_VELOCITY, "joint_velocities"),
+            (ControlMode.JOINT_TORQUE, "joint_torques"),
+        ):
+            chunk = FakeChunk(
+                flat=[0.1, -0.2, 0.3],
+                n_dof=3,
+                horizon=1,
+                control_mode=CONTROL_MODE_TO_UINT8[mode],
+            )
+            action = decode_action_chunk(chunk)
+            assert isinstance(action, Action)
+            assert action.control_mode is mode
+            assert getattr(action, field_name) == [[0.1, -0.2, 0.3]]
+            assert not action.joint_targets, (
+                f"{mode!r} must not bleed into joint_targets — that was the bug."
+            )
+
+    def test_multi_step_horizon_splits_rows(self) -> None:
+        chunk = FakeChunk(
+            flat=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5],
+            n_dof=6,
+            horizon=2,
+            control_mode=CONTROL_MODE_TO_UINT8[ControlMode.CARTESIAN_DELTA],
+        )
+        action = decode_action_chunk(chunk)
+        assert isinstance(action, Action)
+        assert action.horizon == 2
+        assert action.cartesian_delta == [
+            (0.0, 0.1, 0.2, 0.3, 0.4, 0.5),
+            (1.0, 1.1, 1.2, 1.3, 1.4, 1.5),
+        ]
+
+    def test_empty_flat_returns_none(self) -> None:
+        assert decode_action_chunk(FakeChunk(flat=[], n_dof=0)) is None
+        assert decode_action_chunk(FakeChunk(flat=[1.0], n_dof=0)) is None
+
+    @pytest.mark.parametrize(
+        "unwired_mode",
+        [ControlMode.CARTESIAN_POSE, ControlMode.FOOT_PLACEMENT],
+    )
+    def test_modes_not_on_wire_drop_to_none(self, unwired_mode: ControlMode) -> None:
+        """Modes the publisher refuses to encode must drop on the
+        receive side too — otherwise the prior code's "fabricate a
+        JOINT_POSITION lie" lives on by another name.
+        """
+        chunk = FakeChunk(
+            flat=[0.0, 0.0, 0.0],
+            n_dof=3,
+            horizon=1,
+            control_mode=CONTROL_MODE_TO_UINT8[unwired_mode],
+        )
+        assert decode_action_chunk(chunk) is None
+
+
+class TestSlotJointNames:
+    """ADR-0102 — a sub-slot chunk must arrive knowing which joints it owns.
+
+    Without this the decoder produced an `Action` indistinguishable from a
+    whole-vector one, and a consumer reassembling a tick had only slot arrival
+    order to go on.
+    """
+
+    def test_joint_names_survive_the_wire(self) -> None:
+        chunk = FakeChunk(
+            flat=[0.0, 1.0, 2.0, 0.0],
+            n_dof=4,
+            horizon=1,
+            control_mode=CONTROL_MODE_TO_UINT8[ControlMode.JOINT_POSITION],
+            joint_names=["left_joint1", "left_joint2", "left_joint3"],
+        )
+        action = decode_action_chunk(chunk)
+        assert isinstance(action, Action)
+        assert action.joint_names == ["left_joint1", "left_joint2", "left_joint3"]
+
+    def test_an_empty_list_decodes_to_none(self) -> None:
+        """Empty = whole-vector action, the pre-ADR-0102 meaning."""
+        chunk = FakeChunk(
+            flat=[0.0, 0.1],
+            n_dof=2,
+            horizon=1,
+            control_mode=CONTROL_MODE_TO_UINT8[ControlMode.JOINT_POSITION],
+        )
+        action = decode_action_chunk(chunk)
+        assert isinstance(action, Action)
+        assert action.joint_names is None
+
+    def test_a_pre_adr_chunk_without_the_field_decodes_to_none(self) -> None:
+        """A producer built before the IDL field must still decode."""
+
+        @dataclass
+        class PreAdrChunk:
+            flat: list[float] = field(default_factory=lambda: [0.0, 0.1])
+            n_dof: int = 2
+            horizon: int = 1
+            control_mode: int = CONTROL_MODE_TO_UINT8[ControlMode.JOINT_POSITION]
+
+        action = decode_action_chunk(PreAdrChunk())
+        assert isinstance(action, Action)
+        assert action.joint_names is None

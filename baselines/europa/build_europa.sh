@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Reproducible native build of NASA EUROPA on Ubuntu 22.04 without sudo, plus the
+# upstream Light/Rover examples and this baseline's planner and PLEXIL link adapter.
+set -euo pipefail
+EUROPA_COMMIT=ac5c332d01bc429e4fb543475891b1905f61475c
+SRC=$HOME/Programs/europa                 # nasa/europa checkout; build in $SRC/build, install in $SRC/dist/europa
+DEPS=$HOME/Programs/europa-deps           # swig 4.0, libantlr3c 3.4, cppunit 1.15 unpacked from the jammy .debs
+HERE=$(cd "$(dirname "$0")" && pwd)
+D=$DEPS/root/usr
+export SWIG_LIB=$D/share/swig4.0
+
+[ -d $SRC ] || git clone https://github.com/nasa/europa.git $SRC
+git -C $SRC checkout -q -f $EUROPA_COMMIT
+git -C $SRC apply $HERE/patches/*.patch   # upstream fixes, one file each
+
+# the three build dependencies apt would install, extracted into a prefix (no root needed)
+if [ ! -x $D/bin/swig4.0 ]; then
+  mkdir -p $DEPS/debs && cd $DEPS/debs
+  apt-get download swig4.0 libantlr3c-dev libantlr3c-3.4-0 libcppunit-dev libcppunit-1.15-0
+  for f in *.deb; do dpkg -x $f $DEPS/root; done
+fi
+
+mkdir -p $SRC/build && cd $SRC/build
+cmake .. -DOPTIMIZE=ON -DCMAKE_PREFIX_PATH=$D -DSWIG_EXECUTABLE=$D/bin/swig4.0
+make -j"$(nproc)" && make install
+export EUROPA_HOME=$SRC/dist/europa
+
+# upstream examples: the interpreted-NDDL planner executables (not the SWIG/Java UI targets)
+for ex in Light Rover; do
+  mkdir -p $HOME/Programs/europa-examples-build/$ex && cd $HOME/Programs/europa-examples-build/$ex
+  cmake $SRC/examples/$ex -DOPTIMIZE=ON -DSWIG_EXECUTABLE=$D/bin/swig4.0 -DCMAKE_PREFIX_PATH=$D
+  make -j"$(nproc)" $ex-planner_o_rt
+done
+
+# this baseline: the EUROPA planner the host calls, and the PLEXIL adapter that links the host to the exec
+mkdir -p $HERE/planner/build && cd $HERE/planner/build && cmake .. && make
+mkdir -p $HERE/plexil/build && cd $HERE/plexil/build && cmake .. && make
+# the re-authored L2-B task model's planner (baselines/revised/europa-l2b, BASELINE_REVISION=reauth/europa-l2b): its own
+# horizon start; the other revised EUROPA models use the planner above
+R=$HERE/../revised/europa-l2b/europa/planner
+mkdir -p $R/build && cd $R/build && cmake .. && make

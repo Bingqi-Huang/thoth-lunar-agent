@@ -1,0 +1,1378 @@
+# RobotDescription -- Franka Emika Panda on a holonomic mobile base.
+#
+# RoboCasa's default robot composition (see
+# robocasa/models/robots/manipulators/panda_mobile_robot.py): a Franka
+# Panda 7-DoF arm mounted on a 3-DoF holonomic base + a 1-DoF gripper.
+# The action surface exposed by robosuite is 11-D (3 base + 7 arm + 1
+# gripper). The exact actuator limits and link kinematics are sourced
+# from robosuite's MJCF; this manifest captures the *contract* the
+# eval layer needs (embodiment tags, sensors, capabilities) -- not the
+# physics, which lives in robosuite.
+#
+# Sim-only today; the matching sim adapter is
+# python/sim/src/openral_sim/adapters/robocasa.py (the RoboCasa sim-backend adapter).
+# There is no `openral_hal.panda_mobile` adapter yet (real
+# Panda-on-mobile-base hardware is an integration target, not a near
+# product) -- `sdk_kind: open` and `hal.real` is null because the only
+# consumer right now is `openral sim run --scene robocasa/...`.
+
+name: "panda_mobile_vslam"
+embodiment_kind: "mobile_manipulator"
+base_frame: "base_link"
+# Per the Nav2 generic mobile-base properties convention — mobile-base properties consumed generically by the
+# Nav2 bringup (instead of a hand-vendored per-robot param file):
+# `footprint_radius` -> Nav2 `robot_radius` (chassis collision
+# envelope); `base_kinematics: omni` -> MPPI `motion_model: Omni` +
+# symmetric lateral velocity bound (the HAL exposes base_x/base_y/yaw).
+footprint_radius: 0.35
+# Real OmronMobileBase collision box (robosuite omron_mobile_base.xml
+# `pedestal_feet_col`, half-extents 0.35 x 0.25 m) -> 0.70 x 0.50 m
+# rectangle, centered on base_link. Drawn on the dashboard occupancy grid.
+footprint_polygon: [[0.35, 0.25], [-0.35, 0.25], [-0.35, -0.25], [0.35, -0.25]]
+base_kinematics: "omni"
+
+# robot_state_publisher wiring: deploy_e2e.launch.py reads `assets.urdf.ref`
+# (`rd:panda_description`, resolved via `robot_descriptions` so we don't ship
+# the URDF into the repo), starts robot_state_publisher with it, then a
+# static_transform_publisher bridging base_link -> panda_link0. Once active,
+# per-link arm TF (panda_link0 -> ... -> panda_hand) is on /tf for
+# openral_state_adapter's human300_16d assembler. Self-collision ACM source:
+# vendored Franka MoveIt SRDF; regenerate via
+# `openral collision lower --robot robots/panda_mobile_vslam/robot.yaml --acm-only`.
+#
+# `base_to_root_xyz_rpy` is IDENTITY (translation and rotation): post-6DoF-
+# base-publish fix in `openral_hal.SimAttachedHAL.base_pose_6dof`, the HAL
+# publishes `odom -> base_link` with the FULL RoboCasa `robot0_base_pos`
+# (z ~= 0.70 m), so `base_link` IS the arm-mount frame — no extra z offset
+# belongs here. The old 0.40 m offset assumed base_link was at ground level
+# (planar-base joint output) and double-counted on top of the 6DoF base z,
+# pushing `base_to_eef.z` to ~1.10 m vs sim_run's ~0.61 m (policy reaching
+# 49 cm above the actual target).
+assets:
+  urdf:
+    ref: "rd:panda_description"
+    root_frame: "panda_link0"
+    base_to_root_xyz_rpy: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  srdf: "file:panda_mobile_vslam.srdf"
+
+# Per the Nav2 generic mobile-base properties convention — declare which joints constitute the planar mobile base.
+# The generic ray-cast helper in
+# `openral_sim.backends.robocasa.synthesize_laser_scan_2d` reads these
+# names + each joint's `sim_joint_name` override to resolve MJCF
+# joints without hardcoding the robosuite/robocasa namespace.
+# Order is `[forward_axis, side_axis, yaw_axis]` per the schema.
+base_joints:
+  - "base_x"
+  - "base_y"
+  - "base_yaw"
+
+# Joints: 3-DoF holonomic base (x, y, yaw) + 7-DoF Panda arm. We list
+# them here so RobotDescription.action_spec sizes the eval-layer
+# bookkeeping correctly. Limits mirror robosuite's PandaMobile MJCF:
+# https://github.com/robocasa/robocasa/blob/main/robocasa/models/robots/manipulators/panda_mobile_robot.py
+joints:
+  # `sim_joint_name` overrides carry the exact MJCF joint names robosuite's
+  # OmronMobileBase + Panda compositions emit under `robocasa/<task>` kitchen
+  # scenes (auto-prefixed `mobilebase0_`/`robot0_`); HAL + openral_sim ray-cast
+  # helpers read these from the loaded description rather than hardcoding
+  # names — see `synthesize_laser_scan_2d` / `read_panda_mobile_base_velocity`
+  # in python/sim/src/openral_sim/backends/robocasa.py, and
+  # `_PandaMobileLifecycleNode._compute_scan_ranges` in
+  # packages/openral_hal_panda_mobile/.
+  #
+  # base velocity_limit: a JOINT_VELOCITY rSkill (rldx-rc365, pi05-human300)
+  # emits NORMALIZED [-1,+1] on these joints; robosuite's `HybridMobileBase`
+  # does physical scaling internally. Safety kernel checks
+  # `|v| <= envelope.joint_velocity_max[i]` against those normalized values,
+  # where envelope = `velocity_limit * safety.max_joint_speed_factor`
+  # (openral_safety/envelope_loader.py:_extract_joint_limits). factor=0.5
+  # below => velocity_limit: 2.0 gives effective cap 1.0 (full normalized
+  # range). Real-HW deployment needs either (a) scale chunks to physical m/s
+  # and restore physical limits here, or (b) keep the normalized contract and
+  # scale at the ros2_control hardware interface.
+  - name: "base_x"
+    joint_type: "prismatic"
+    parent_link: "world"
+    child_link: "base_x_link"
+    position_limits: [-10.0, 10.0]
+    velocity_limit: 2.0
+    effort_limit: 200.0
+    actuator_kind: "dc"
+    role: "base"
+    sim_joint_name: "mobilebase0_joint_mobile_forward"
+  - name: "base_y"
+    joint_type: "prismatic"
+    parent_link: "base_x_link"
+    child_link: "base_y_link"
+    position_limits: [-10.0, 10.0]
+    velocity_limit: 2.0
+    effort_limit: 200.0
+    actuator_kind: "dc"
+    role: "base"
+    sim_joint_name: "mobilebase0_joint_mobile_side"
+  - name: "base_yaw"
+    joint_type: "revolute"
+    parent_link: "base_y_link"
+    child_link: "base_link"
+    position_limits: [-3.14159, 3.14159]
+    velocity_limit: 2.0
+    effort_limit: 200.0
+    actuator_kind: "dc"
+    role: "base"
+    sim_joint_name: "mobilebase0_joint_mobile_yaw"
+  - name: "panda_joint1"
+    joint_type: "revolute"
+    parent_link: "base_link"
+    child_link: "panda_link1"
+    # ADR-0095: base_link IS the arm mount (RoboCasa's mobilebase0_support), so
+    # this is the plain Franka URDF joint-1 transform — the 0.7 m pedestal is
+    # already carried by odom->base_link and must not be added twice. Lets the
+    # kernel FK place the collision capsules.
+    origin_xyz: [0.0, 0.0, 0.333]
+    origin_rpy: [0.0, 0.0, 0.0]
+    position_limits: [-2.8973, 2.8973]
+    velocity_limit: 2.175
+    effort_limit: 87.0
+    actuator_kind: "bldc"
+    role: "arm"
+    sim_joint_name: "robot0_joint1"
+  - name: "panda_joint2"
+    joint_type: "revolute"
+    parent_link: "panda_link1"
+    child_link: "panda_link2"
+    # Fixed parent->joint transform (from Franka URDF; joint1 absorbs the 0.7 m arm-base mount). Lets the kernel FK place the collision capsules.
+    origin_xyz: [0.0, 0.0, 0.0]
+    origin_rpy: [-1.5708, 0.0, 0.0]
+    position_limits: [-1.7628, 1.7628]
+    velocity_limit: 2.175
+    effort_limit: 87.0
+    actuator_kind: "bldc"
+    role: "arm"
+    sim_joint_name: "robot0_joint2"
+  - name: "panda_joint3"
+    joint_type: "revolute"
+    parent_link: "panda_link2"
+    child_link: "panda_link3"
+    # Fixed parent->joint transform (from Franka URDF; joint1 absorbs the 0.7 m arm-base mount). Lets the kernel FK place the collision capsules.
+    origin_xyz: [0.0, -0.316, 0.0]
+    origin_rpy: [1.5708, 0.0, 0.0]
+    position_limits: [-2.8973, 2.8973]
+    velocity_limit: 2.175
+    effort_limit: 87.0
+    actuator_kind: "bldc"
+    role: "arm"
+    sim_joint_name: "robot0_joint3"
+  - name: "panda_joint4"
+    joint_type: "revolute"
+    parent_link: "panda_link3"
+    child_link: "panda_link4"
+    # Fixed parent->joint transform (from Franka URDF; joint1 absorbs the 0.7 m arm-base mount). Lets the kernel FK place the collision capsules.
+    origin_xyz: [0.0825, 0.0, 0.0]
+    origin_rpy: [1.5708, 0.0, 0.0]
+    position_limits: [-3.0718, -0.0698]
+    velocity_limit: 2.175
+    effort_limit: 87.0
+    actuator_kind: "bldc"
+    role: "arm"
+    sim_joint_name: "robot0_joint4"
+  - name: "panda_joint5"
+    joint_type: "revolute"
+    parent_link: "panda_link4"
+    child_link: "panda_link5"
+    # Fixed parent->joint transform (from Franka URDF; joint1 absorbs the 0.7 m arm-base mount). Lets the kernel FK place the collision capsules.
+    origin_xyz: [-0.0825, 0.384, 0.0]
+    origin_rpy: [-1.5708, 0.0, 0.0]
+    position_limits: [-2.8973, 2.8973]
+    velocity_limit: 2.610
+    effort_limit: 12.0
+    actuator_kind: "bldc"
+    role: "arm"
+    sim_joint_name: "robot0_joint5"
+  - name: "panda_joint6"
+    joint_type: "revolute"
+    parent_link: "panda_link5"
+    child_link: "panda_link6"
+    # Fixed parent->joint transform (from Franka URDF; joint1 absorbs the 0.7 m arm-base mount). Lets the kernel FK place the collision capsules.
+    origin_xyz: [0.0, 0.0, 0.0]
+    origin_rpy: [1.5708, 0.0, 0.0]
+    position_limits: [-0.0175, 3.7525]
+    velocity_limit: 2.610
+    effort_limit: 12.0
+    actuator_kind: "bldc"
+    role: "arm"
+    sim_joint_name: "robot0_joint6"
+  - name: "panda_joint7"
+    joint_type: "revolute"
+    parent_link: "panda_link6"
+    child_link: "panda_link7"
+    # Fixed parent->joint transform (from Franka URDF; joint1 absorbs the 0.7 m arm-base mount). Lets the kernel FK place the collision capsules.
+    origin_xyz: [0.088, 0.0, 0.0]
+    origin_rpy: [1.5708, 0.0, 0.0]
+    position_limits: [-2.8973, 2.8973]
+    velocity_limit: 2.610
+    effort_limit: 12.0
+    actuator_kind: "bldc"
+    role: "arm"
+    sim_joint_name: "robot0_joint7"
+  # Per the single-DoF gripper abstraction convention — single 1-DoF abstraction over the franka two-finger
+  # MJCF mimic. The MJCF expands this into ``gripper0_finger_joint{1,2}``
+  # at the simulator layer; the safety kernel + rskill action contract
+  # see one width DoF. Matches ``robots/franka_panda/robot.yaml`` so the
+  # arm declaration is identical on both bases.
+  - name: "panda_gripper"
+    joint_type: "prismatic"
+    parent_link: "panda_link7"
+    child_link: "panda_finger_pair"
+    # Fixed parent->joint transform (from Franka URDF; joint1 absorbs the 0.7 m arm-base mount). Lets the kernel FK place the collision capsules.
+    origin_xyz: [0.0, 0.0, 0.107]
+    origin_rpy: [0.0, 0.0, 0.0]
+    position_limits: [0.0, 1.0]
+    velocity_limit: 0.1
+    effort_limit: 70.0
+    has_torque_sensor: false
+    actuator_kind: "servo"
+    role: "gripper"
+    # PandaOmron mounts the gripper on its `right` arm in robosuite's
+    # composable robot framework, which prefixes the finger joints
+    # with `right_`. The HAL's read_state() looks up the sim_joint_name
+    # in MJCF; without the prefix the lookup fails and silently emits
+    # qpos=0.0 (the wrong "fully closed" reading), starving the
+    # human300_16d assembler of the real gripper width.
+    sim_joint_name: "gripper0_right_finger_joint1"
+
+end_effectors:
+  - name: "panda_gripper"
+    kind: "parallel_gripper"
+    parent_link: "panda_link7"
+    actuated: true
+    grasp_force_n: 80.0
+
+capabilities:
+  # RoboCasa's holonomic base reads as `wheeled` in the closed-set
+  # locomotion enum (the schema's options are bipedal / quadruped /
+  # wheeled / tracked / none -- there is no holonomic-specific entry).
+  locomotion:
+    - "wheeled"
+  can_lift_kg: 3.0
+  has_dexterous_hands: false
+  has_tactile: false
+  has_force_control: true
+  has_vision: true
+  # This variant is the LIDAR-LESS twin of ``panda_mobile``: it localises and
+  # maps from its two base-mounted RGB cameras (shoulder_left/right → RoboCasa
+  # agentview_left/right, a 0.70 m base-mounted rig) via cuVSLAM, NOT a 2-D
+  # LaserScan. ``has_lidar: false`` so ``_resolve_slam_backend`` routes to the
+  # visual backend; ``has_vision_slam: true`` gates it. The ``base_scan``
+  # lidar_2d sensor is intentionally dropped (see sensors below).
+  has_lidar: false
+  has_vision_slam: true
+  has_humanoid_balance: false
+  # Per the Nav2 generic mobile-base properties convention — body_twist for the holonomic base (cmd_vel from Nav2),
+  # joint_position for the seven-DoF Franka arm. The dual declaration
+  # is how mobile-manipulator embodiments advertise both surfaces in
+  # one robot.yaml; the HAL routes by Action.control_mode.
+  # Per the hybrid mobile-base composite convention — joint_velocity exposes the HybridMobileBase composite's
+  # 'base' part (3-D forward/side/yaw velocity) for rldx/pi05 mobile-
+  # manipulation skills that emit JOINT_VELOCITY chunks on slot 7-9 of
+  # their 12-D action vector.
+  supported_control_modes:
+    - "body_twist"
+    - "joint_position"
+    - "joint_velocity"
+    # Per the hybrid mobile-base composite convention — sim-only HybridMobileBase composite mux flag.
+    - "composite_mode"
+    # Per the gripper/task-space joint-role convention — the panda_gripper EE accepts position commands (the rc365
+    # skills already drive a gripper_position slot on it).
+    - "gripper_position"
+  embodiment_tags:
+    - "panda_mobile"
+    - "robocasa"
+    - "franka"
+    - "panda"
+    # `mobile_base` is the canonical class tag for any robot with a
+    # planar base + body_twist actuator (EmbodimentTag in
+    # openral_core.schemas). Lets generic base-only rSkills (Nav2,
+    # waypoint, …) target the class without naming the specific robot.
+    - "mobile_base"
+
+safety:
+  max_ee_speed_m_s: 1.0
+  max_joint_speed_factor: 0.5
+  max_force_n: 100.0
+  max_torque_nm: 87.0
+  deadman_required: true
+  # Per the per-control-mode safety-bounds convention — per-control-mode bounds the safety supervisor enforces
+  # on RoboCasa pi0.5 / rldx1 chunks (cartesian_delta arm + body_twist
+  # base + gripper width). All bounds derive from RoboCasa's training
+  # config: 5 cm / 0.2 rad max OSC step (the policy emits per-step
+  # deltas at 20 Hz; 5 cm * 20 = 1 m/s envelope matches max_ee_speed
+  # above), 1 m/s + 1.5 rad/s base velocity (robosuite's holonomic
+  # mobile base default). Cartesian-twist angular bound is paired with
+  # the existing max_ee_speed_m_s linear bound for the eventual
+  # cartesian-twist VLA family.
+  max_cartesian_step_m: 0.05
+  max_cartesian_step_rad: 0.2
+  max_ee_angular_speed_rad_s: 1.0
+  max_base_linear_speed_m_s: 1.0
+  max_base_angular_speed_rad_s: 1.5
+
+# Three-camera convention: robosuite's left/right agent-view cameras + in-hand
+# wrist camera. RoboCasa renders via `robot0_agentview_left_image` /
+# `_right_image` / `robot0_eye_in_hand_image`; openral_sim.adapters.robocasa
+# surfaces them as `shoulder_left`/`shoulder_right`/`wrist` (HAL-facing
+# convention). `vla_feature_key` stays camera1/2/3 (checkpoint-frozen). RC365
+# (rldx1-ft-rc365-nf4) consumes all three; single-camera rSkills (pi05,
+# smolvla) bind `shoulder_left`. These are robosuite robot-mounted cameras
+# (parent_body=mobilebase0_support), DELIBERATELY angled forward-and-down for
+# manipulation — on the navigate-kitchen scene they show wheel + counter edge,
+# not third-person, by design (pi05/rldx1 trained on this exact perspective;
+# swapping cameras breaks their observation-key contracts). For third-person
+# view, enable the MuJoCo passive viewer via `viewer_enabled` (auto-on for
+# `openral deploy sim` on panda_mobile).
+sensors:
+  - name: "shoulder_left"
+    modality: "rgb"
+    # Per the cross-frame object-lift convention — a dedicated optical frame (NOT the
+    # world origin) so the SimSensorBridge broadcasts base_link -> this frame
+    # from the live MuJoCo camera pose, letting the world-state lifter project
+    # the world voxel map into this camera. metadata.mjcf_camera names the
+    # robosuite camera the optical-TF helper looks up.
+    frame_id: "shoulder_left_optical_frame"
+    rate_hz: 20.0
+    intrinsics:
+      width: 256
+      height: 256
+      fx: 256.0
+      fy: 256.0
+      cx: 128.0
+      cy: 128.0
+    encoding: "rgb8"
+    vla_feature_key: "observation.images.camera1"
+    vendor: "sim"
+    model: "robocasa_agentview_left"
+    metadata:
+      mjcf_camera: "robot0_agentview_left"
+  - name: "shoulder_right"
+    modality: "rgb"
+    frame_id: "shoulder_right_optical_frame"
+    rate_hz: 20.0
+    intrinsics:
+      width: 256
+      height: 256
+      fx: 256.0
+      fy: 256.0
+      cx: 128.0
+      cy: 128.0
+    encoding: "rgb8"
+    vla_feature_key: "observation.images.camera2"
+    vendor: "sim"
+    model: "robocasa_agentview_right"
+    metadata:
+      mjcf_camera: "robot0_agentview_right"
+  - name: "wrist"
+    modality: "rgb"
+    frame_id: "panda_hand"
+    rate_hz: 20.0
+    intrinsics:
+      width: 256
+      height: 256
+      fx: 256.0
+      fy: 256.0
+      cx: 128.0
+      cy: 128.0
+    encoding: "rgb8"
+    vla_feature_key: "observation.images.camera3"
+    vendor: "sim"
+    model: "robocasa_eye_in_hand"
+  # NOTE: unlike ``panda_mobile``, this variant declares NO ``base_scan``
+  # lidar_2d sensor — it is the lidar-less visual-SLAM twin (``has_lidar:
+  # false``). ``shoulder_left`` + ``shoulder_right`` above are the cuVSLAM
+  # stereo rig (a scene's ``slam_stereo_cameras`` names them); the HAL
+  # broadcasts each camera's ``base_link -> <optical_frame>`` TF, which the
+  # PyCuVSLAM node reads as the per-camera rig extrinsic (multi-camera mode).
+  # Depth camera the panda_mobile HAL ray-casts from MuJoCo
+  # (`synthesize_depth_image`, once/frame), publishes PointCloud2 on
+  # `/openral/cameras/front_depth/points` for octomap_server -> the C++ safety
+  # kernel's world-collision voxel check. `metadata.mjcf_camera` names the
+  # robosuite <camera>; `frame_id` is the REP-103 optical frame the HAL
+  # broadcasts base_link-> TF for; `range_max_m` bounds the octree volume;
+  # reuses the forward agentview-left viewpoint (arm reach + obstacles ahead).
+  # `range_min_m` is NOT the self-filter: self-exclusion runs first by
+  # IDENTITY (every body in `robot_self_body_ids` is ray-cast-transparent, a
+  # robot-only hit emits a max-range CLEARING endpoint). `range_min_m` is then
+  # a blanket cutoff on the transparent cast's result — any return closer than
+  # it (self or world) collapses to "no measurement", clearing only if it
+  # struck the robot. Accepted consequence: an obstacle <0.3 m is neither
+  # marked nor cleared while that close. Deliberately retained at 0.3 — tested,
+  # intended (hazard log Entry 012, 2026-08-22); only the old description was wrong.
+  - name: "front_depth"
+    modality: "depth"
+    frame_id: "front_depth_optical_frame"
+    parent_frame: "base_link"
+    rate_hz: 5.0
+    intrinsics:
+      width: 256
+      height: 256
+      fx: 256.0
+      fy: 256.0
+      cx: 128.0
+      cy: 128.0
+    encoding: "32FC1"
+    range_min_m: 0.3
+    range_max_m: 5.0
+    vendor: "sim"
+    model: "robocasa_depth_mj_ray"
+    metadata:
+      mjcf_camera: "robot0_agentview_left"
+
+# Geometric safety. Conservative OBB bounds per link so
+# the C++ safety kernel can forward-kinematic the arm from the manifest's
+# ``joints`` (origin_xyz/rpy + axis_xyz) and check it for self-collision AND
+# against the OctoMap world voxels (/openral/world_voxels). Each box encloses
+# the matching RoboCasa ``robot0_linkN_collision`` mesh. ``joints`` stays
+# normative for kinematics; this is geometry only. Validated: manifest FK
+# matches the live robosuite model to <1 mm at q=0.
+collision_geometry:
+  # Scope: the ARM LINKS (1–7) — the parts that must never strike the
+  # environment. Deliberately EXCLUDED, so the world-voxel check is usable for
+  # real picks in a cluttered kitchen:
+  #   * base_link — the mobile base parks ~1 cm from cabinets; base-vs-world is
+  #     Nav2's 2-D costmap job, so a base capsule here only
+  #     false-positives on furniture beside the parked base.
+  #   * panda_finger_pair — the gripper is the intended-contact part (it grasps
+  #     the target); checking it against the world would veto every grasp.
+  # The arm links staying checked still protects the body (wrist/forearm into a
+  # cabinet flags), while the exempt gripper reaches the object.
+  - link_name: "panda_link1"
+    shape: { shape: "box", half_extents_m: [0.0552, 0.0724, 0.1410] }
+    origin_xyz_rpy: [0.0, -0.0267, -0.0731, 0.3834, 0.0001, -0.0004]
+    # GENERATED by tools/generate_tight_geometry.py from robosuite's
+    # link1_collision mesh (6260 vertices, hull 1588).
+    # DOP inward margin inside the box above: 0.0831 mm.
+    # Stage 2 is OFF: the exact hull is 1588 vertices, over the
+    # kernel's 320-vertex cost budget -- measured 0.77x the shipped routine's
+    # speed at 400 occupied cells. The 26-DOP still cuts this link's support
+    # excess from 53.27 mm to 25.69 mm.
+    tight_geometry:
+      dop_lo_m: [-0.05502134419046353, -0.07224518140471763, -0.14082987685126935, -0.11711047489386382, -0.11540894963827596, -0.11012989554980393, -0.1154433118227032, -0.06860961055688732, -0.07804751818779684, -0.12656989534730556, -0.11398132392419272, -0.12049854502882983, -0.12788258044376566]
+      dop_hi_m: [0.055003115686142794, 0.07221304721515846, 0.1409169158859604, 0.11537882207055665, 0.11016639495826967, 0.11543191892827934, 0.11707534820255158, 0.07801075972929553, 0.06864027684344456, 0.11400731331074267, 0.12652316121368015, 0.12812835105624665, 0.12170808814947336]
+      hull_vertices_m: []
+  - link_name: "panda_link2"
+    shape: { shape: "box", half_extents_m: [0.0552, 0.0719, 0.1407] }
+    origin_xyz_rpy: [-0.0001, -0.0751, 0.0298, 1.9168, 0.0, -0.0002]
+    # GENERATED by tools/generate_tight_geometry.py from robosuite's
+    # link2_collision mesh (152 vertices, hull 152).
+    # DOP inward margin inside the box above: 0.0546 mm.
+    tight_geometry:
+      dop_lo_m: [-0.05502965786630984, -0.07176706692285992, -0.14054323693834514, -0.11740424259026946, -0.11465582672319323, -0.1151961911177313, -0.11460429395072828, -0.07856062568432486, -0.06826609563700926, -0.11341039031676425, -0.12725599177596028, -0.13040748052235973, -0.12741132384450726]
+      dop_hi_m: [0.05506955270550785, 0.0717374613467578, 0.14064540123822378, 0.11470258848088068, 0.11552342687096487, 0.11491838302980212, 0.11716322095558551, 0.06833096768599378, 0.07826665459415537, 0.1274972106388361, 0.1136315850946798, 0.11828316107324598, 0.12794643287623]
+      hull_vertices_m:
+        - [0.05486314368208755, -0.05582262072653748, -0.06902544133409326]
+        - [0.05506955270550785, 0.0024000882322973466, -0.08261835482745013]
+        - [0.055059618813378085, 0.007583318717797258, 0.12364796462269897]
+        - [0.05421823654296751, 0.002388384233403369, -0.0907430922326652]
+        - [0.031161235456313094, -0.053550760503578744, 0.07349216566135741]
+        - [0.047680421257008776, -0.06255316661340755, -0.08708981375300222]
+        - [0.050324091161485895, -0.001705973007197535, -0.1033293715120814]
+        - [0.021315588923644643, -0.05837214122510214, 0.07577066229854959]
+        - [0.04005593567190865, -0.04696363237991169, 0.06942811328070848]
+        - [0.048523020717130015, -0.03666335803670875, 0.06440236928485847]
+        - [-0.051759413604209555, -0.005011047033465882, 0.1282077358585925]
+        - [-0.04990482041361527, -0.0341101808455411, 0.06183999607831858]
+        - [-0.04654651910289364, -0.015388569963706439, 0.1319478036830273]
+        - [-0.04388454664413349, -0.06433161262203631, -0.09202286357331274]
+        - [-0.03607433999729425, -0.006966244877057258, -0.12158344973922645]
+        - [-0.032023437234954, -0.06828444183866281, -0.10304223411687177]
+        - [-0.01514873046579794, 0.0699992039610748, -0.08678735492559847]
+        - [-0.023636388495944786, 0.059057553503574625, 0.10510488146693632]
+        - [-0.010454267345133172, 0.06323051688123085, 0.10359769467434575]
+        - [-0.025378160155493757, 0.06623332539913764, -0.08648532435627607]
+        - [0.030790076553155382, 0.06342405946579885, -0.08559799210615736]
+        - [0.021960522328823236, 0.059971313583215204, 0.10476580216960951]
+        - [0.037077212162980405, 0.05093943656577598, 0.10801861829491677]
+        - [0.016168453175933586, -0.011056294652845147, -0.1319358293834039]
+        - [0.02867473193136105, -0.06906787783006435, -0.10519004171206728]
+        - [0.013638268917297525, -0.07116157267258387, -0.11099070458797734]
+        - [0.028795709089402998, -0.008518045836388244, -0.12675146428916015]
+        - [0.003622022291796497, -0.06254374700824612, 0.07620679227855054]
+        - [0.011562422647380126, -0.061327716905551756, 0.0763498828070204]
+        - [-0.013760815393620621, -0.06080917997248926, 0.07647103022673267]
+        - [0.03915343120962566, -0.06619286149513288, -0.09720831222977615]
+        - [-0.04384871920288337, 0.0526941190972339, -0.08627856453319785]
+        - [-0.04614206969447424, 0.04898729724600559, -0.09359891808446805]
+        - [-0.0486183361025825, 0.03671968990248688, 0.11316243388315053]
+        - [-0.05474517287874087, -0.05512120194105535, -0.06677586707146048]
+        - [-0.05333802284878505, -0.02582905957848743, 0.055044308319980896]
+        - [-0.05502965786630984, 0.017095951807352697, 0.12024913835116231]
+        - [-0.05439662945581651, 0.004592215136579417, 0.12474640091523462]
+        - [-0.03571903871065184, -0.05019331959217487, 0.0719723162464637]
+        - [-0.05109894068943093, -0.06000256162185738, -0.08004144097087303]
+        - [-0.0033199562706071584, -0.06247716351611457, 0.07637414215037602]
+        - [-0.017837272683696285, -0.07070522611387953, -0.10974507352504406]
+        - [-0.02134234140507214, -0.010028348917003323, -0.1303239241240732]
+        - [-0.007695351681952396, -0.011307293900927044, -0.1336916664165548]
+        - [-0.0023862527580484974, -0.07176706692285992, -0.11265696066676642]
+        - [-0.051146340636488104, -0.0013772118022674698, -0.1009786369966288]
+        - [0.05351276214246149, -0.025967822087816804, 0.05571041461238786]
+        - [0.0008380466687126524, 0.07043711146086949, -0.09734002437428337]
+        - [-0.003395980977314925, 0.0717374613467578, -0.08790701764092881]
+        - [0.006353152586973704, 0.07157514825528448, -0.08624599915165147]
+        - [0.0057220734545676425, 0.0639386730461078, 0.10333897754403798]
+        - [0.03800432077703301, 0.058374897046023465, -0.08521987558573123]
+        - [0.04636751691995453, 0.04862384682241018, -0.09418059115015603]
+        - [0.047904265389632494, 0.038133814497217804, 0.11263263112169966]
+        - [0.053555133620365236, 0.02509361338914706, 0.11733307694789312]
+        - [0.04469460826126954, 0.05193997297034056, -0.0860927110472371]
+        - [-0.009959950961402632, 0.06796315035468022, -0.10315285125086082]
+        - [-0.006802616851324598, 0.06485283133928177, -0.11144024809172126]
+        - [-0.014955829335798258, 0.06170701587744406, -0.11419136706955475]
+        - [-0.03656921603743349, 0.059485688487754936, -0.0851001680492114]
+        - [0.04467597032839841, -0.004245096299466907, -0.112588090904144]
+        - [0.05187034718780421, 0.022678249472344536, -0.08975064091968171]
+        - [0.04952962006635121, 0.014938324217956461, -0.10368703762750207]
+        - [0.028417336480375463, -0.032161758077407336, 0.1379786741650037]
+        - [0.04594153458114848, -0.01648799144253794, 0.13232479189651197]
+        - [0.037448493117469846, -0.02588255630178091, 0.13571342871202755]
+        - [-0.051696628575842514, 0.022614600835494325, -0.09032351341977922]
+        - [-0.05483193725034393, 0.002369966930280913, -0.08559799888767743]
+        - [-0.03730632338892075, 0.05054833234081494, 0.10817542563706152]
+        - [-0.02756930538145964, -0.055540261646543264, 0.07436084267616559]
+        - [-0.04513411841065278, -0.004470024667844338, -0.11164052622660676]
+        - [-0.03951617456384055, 0.013405146500736749, -0.12010276749926066]
+        - [-0.008475930831357954, 0.008816425820792366, -0.13711705646474326]
+        - [-0.01971220937341318, 0.010466337549532976, -0.13405824856944515]
+        - [-0.012946928948452301, 0.032020301142707826, -0.1390001658905944]
+        - [-0.025141976352103468, 0.011004864835343544, -0.13148510291728435]
+        - [-0.03124187978070224, 0.011615293483283991, -0.12754444272724472]
+        - [0.0034531874016681635, -0.01153825037706484, -0.1341455898932375]
+        - [0.05188318668598038, -0.0056739134099392675, 0.12842509776420086]
+        - [0.019138950334137456, 0.06885377127508129, -0.0863432740134647]
+        - [-0.014038127572077244, 0.06937768880630564, -0.09465520211976934]
+        - [0.02990846725078994, 0.06319482580221494, -0.09341012010612225]
+        - [0.024160996435340275, 0.06500224861984069, -0.0989261558295964]
+        - [0.004058330968296836, 0.06813574488809637, -0.10494649495612458]
+        - [-0.02080044446520452, 0.06501771413035717, -0.10277456201854057]
+        - [-0.012851951455655288, -0.03812191758815411, 0.14013608921772372]
+        - [8.10376298407781e-05, -0.039541420942588876, 0.14064540123822378]
+        - [0.03656432478094759, -0.005819543627632322, -0.12146711861631525]
+        - [-0.0429505172005714, -0.04379483058629049, 0.0675928862019086]
+        - [0.009099226459650644, 0.062195217328402934, -0.1157378062223715]
+        - [0.0026949849651175767, 0.06482914793180972, -0.11231238297121014]
+        - [0.011945753615022989, 0.06953279974865276, -0.09606652203081273]
+        - [0.013847437084357567, 0.056565763199333485, -0.12196763045541462]
+        - [0.01770121061091913, 0.0643457757737981, -0.1075502928285971]
+        - [0.02611393528068456, 0.058669712972138244, -0.11130021279387463]
+        - [0.046019069037029445, 0.04550479265062468, -0.1034086771422625]
+        - [0.039384323454365454, 0.05631765146027339, -0.09383970887371156]
+        - [0.03646815628477455, 0.05570021805390146, -0.1034037961188221]
+        - [-0.025473258368924098, 0.05976141469392173, -0.10982094186832382]
+        - [-0.02361002626885907, 0.05246725372135378, -0.12162275594385039]
+        - [-0.03222155080351651, 0.05176820331863627, -0.11529196025541877]
+        - [-0.004266716253186424, 0.060058866800691835, -0.11966578920176403]
+        - [-0.014341094328734419, 0.05667327733329216, -0.12144531976663485]
+        - [0.048692797613805815, 0.03084101181518621, -0.10175130040698327]
+        - [-0.04616847038602635, 0.044554083834721765, -0.10331604766027658]
+        - [-0.04267992577345546, 0.049403144522237576, -0.10336611558395696]
+        - [-0.026624789608330618, -0.03313645452170312, 0.13834240114224747]
+        - [0.016142742166662612, -0.03745795739396607, 0.13989083189160803]
+        - [-0.05134275428559605, 0.012325035127075423, -0.09837273476476302]
+        - [-0.04645086650013399, 0.016016314358037628, -0.11009526442180721]
+        - [-0.03739627505228545, 0.038127690348180726, -0.12284897313005377]
+        - [-0.04245090827661122, 0.04159385943492932, -0.11424222587003008]
+        - [-0.026594951742251745, 0.04117524791407932, -0.12919998503367933]
+        - [-0.03108359696185853, 0.03582276655784307, -0.1293029151381358]
+        - [0.0020443651745629876, 0.010685292187600046, -0.13811098108194697]
+        - [-0.04398288099085973, 0.04204286591426247, -0.11139434057374661]
+        - [0.00039019753546409917, 0.055943425469014645, -0.12500015516180865]
+        - [0.03319136082466619, 0.05255707806294057, -0.11337045000742173]
+        - [-0.030195338115600923, 0.05982980548666374, -0.10379142341936273]
+        - [-0.036120402112208655, 0.053882267152225445, -0.10702266725482909]
+        - [-0.03126604125868778, 0.0624252629541077, -0.09280297689688055]
+        - [-0.03799671084180992, -0.025133499424540674, 0.13545950700203346]
+        - [0.043930877815028684, 0.024773019734289466, -0.11424024989354607]
+        - [0.04003487166590576, 0.01450645792566458, -0.11969141085953237]
+        - [-0.017800510696056013, 0.03362353680114717, -0.13724087793967496]
+        - [-0.005745619461737938, 0.03629493966866992, -0.13868577595185103]
+        - [-0.009449577752062345, 0.04222270843213431, -0.13504410735684297]
+        - [-0.017077553579371654, 0.04569352719188449, -0.13069987065453606]
+        - [-0.024378155324380268, 0.03420390492475327, -0.1341439159083109]
+        - [-0.038679057951310825, 0.0464563978925971, -0.11424262398517851]
+        - [-0.03199913745041854, 0.04437090175031871, -0.12315561665358796]
+        - [0.017071612434057266, 0.04918048213343015, -0.12811711059981432]
+        - [0.003204349888623058, 0.04830924811502201, -0.1318682710462691]
+        - [-0.0026881579101178076, 0.031831951163570925, -0.14054323693834514]
+        - [0.011523637337597332, 0.010088383928858125, -0.13668751143567393]
+        - [0.04254903136930964, 0.04141100318348311, -0.11470507155528321]
+        - [0.03666049721542716, 0.0379682517757488, -0.12382303334744627]
+        - [0.03423210112142521, 0.045668448935622837, -0.12019189474793077]
+        - [-0.03736605322818586, 0.05702334824585537, -0.09704978308700668]
+        - [0.003020147265831927, 0.039829744228687215, -0.13723849413442046]
+        - [-0.011712555414339841, 0.05055534782336193, -0.128559934404852]
+        - [0.012107043973167706, 0.039560202693228456, -0.1360339559887544]
+        - [0.020514008285157394, 0.03917642655516335, -0.1335192832254575]
+        - [0.008817816007195682, 0.03195508281290601, -0.13990601991804108]
+        - [0.02783345544011347, 0.047333971309422906, -0.12378389746204985]
+        - [0.024327910722275057, 0.05382585429515675, -0.11956223128508295]
+        - [0.03947742325635557, 0.0465321561681815, -0.11324404885215074]
+        - [0.02007601925250598, 0.013526034142975766, -0.13440079805103614]
+        - [0.026118230438429934, 0.033977909167147144, -0.13321972057149098]
+        - [0.019738620483487155, 0.033153650455258706, -0.13653951046788423]
+        - [0.024984927225019573, 0.04345369930892387, -0.12884675261225736]
+        - [0.031806329379337986, 0.035732140479081353, -0.1288929993755106]
+      hull_overhang_m: 0.000217
+  - link_name: "panda_link3"
+    shape: { shape: "box", half_extents_m: [0.0655, 0.0673, 0.1264] }
+    origin_xyz_rpy: [0.0401, 0.0213, -0.0444, 0.6264, -0.6489, 2.7888]
+    # GENERATED by tools/generate_tight_geometry.py from robosuite's
+    # link3_collision mesh (152 vertices, hull 152).
+    # DOP inward margin inside the box above: 0.0884 mm.
+    # Added 2026-09-07 alongside robots/panda_mobile: the arm geometry of
+    # the two manifests is contract-tested to be identical.
+    tight_geometry:
+      dop_lo_m: [-0.0653884325040986, -0.06710157788849982, -0.1262803775216629, -0.07974186888870681, -0.10027608087286607, -0.09959058227441747, -0.10720458109922053, -0.06490493623798917, -0.06829867319044881, -0.10097844495602842, -0.09935001354139872, -0.10677689684589559, -0.11143051788083617]
+      dop_hi_m: [0.06540453098720111, 0.06718253830740441, 0.12631157493175046, 0.1005877276160773, 0.0887682428870553, 0.10434957823501141, 0.09972265101038119, 0.07139546200368897, 0.06650047009817898, 0.11030914508748976, 0.09883041914894687, 0.115357509639385, 0.10082937727680073]
+      hull_vertices_m:
+        - [-0.0651000482524975, 0.009992886606695658, -0.06495333026245849]
+        - [-0.0653884325040986, -0.009283149247344332, -0.05073315938906605]
+        - [-0.06332909245168879, 0.029701888612271625, 0.0607058021230066]
+        - [-0.029241237484032748, -0.04589579456737784, 0.09854623480427914]
+        - [-0.018357362054978805, -0.054634239497386765, 0.09590033040907245]
+        - [-0.022096841811139144, -0.04011457634452763, 0.11127728619656872]
+        - [0.004819156767971647, -0.06652718555227552, -0.07504401074925204]
+        - [-0.001829775039662519, -0.06484817391566333, 0.060362201865010345]
+        - [-0.014146567866697421, -0.06710157788849982, -0.0568688226505389]
+        - [-0.014952034741593779, -0.06202959439645429, 0.07647838346929765]
+        - [-0.039003741820239704, -0.020594453172228668, 0.09813115197475777]
+        - [-0.027464130933834978, -0.03612971516237392, 0.10785243867286312]
+        - [-0.032762375020027344, -0.014149152058460268, 0.10773976155216937]
+        - [-0.004424534776259905, 0.06460175481931674, 0.09853839983428657]
+        - [0.005595406411773015, 0.0663567163520509, 0.09526796620594984]
+        - [0.01161699928165909, 0.059436101022427246, -0.04449461918501354]
+        - [0.02256840502198176, 0.05915970610514526, -0.04893566775248568]
+        - [0.022986338800335675, 0.06701108912006981, 0.08422562692853945]
+        - [0.015330537854357158, 0.06718253830740441, 0.0902692455356944]
+        - [-0.029826841796593947, -0.05347268010060958, 0.0820504175423663]
+        - [0.04039225896068662, 0.06057617169682331, 0.057570827471809596]
+        - [0.057364962729477637, 0.035671471785506295, -0.051250237762550964]
+        - [0.051045796736078744, 0.043831731348815885, -0.052000632421618925]
+        - [0.04586133008026601, 0.04794952002838622, -0.05558837766266758]
+        - [0.04058659751460648, 0.05219892377182585, -0.05303039883096887]
+        - [0.02171936254786156, -0.043459166577306405, -0.10754616909027208]
+        - [0.03939307272411068, -0.02192937037263594, -0.0915852165945733]
+        - [0.03259639362807469, -0.03540579424953278, -0.09350322043975717]
+        - [0.026437460089161882, -0.04808855177131586, -0.08690054491238759]
+        - [0.016839751792680744, -0.057249696064631095, -0.09303730265310224]
+        - [-0.054880887869889185, 0.041708022048131226, 0.08193174210472269]
+        - [-0.06027171146744459, 0.03592411753558183, 0.07240203902286502]
+        - [0.027075909494136872, 0.00757780833070245, 0.11613453809676526]
+        - [0.0177493831707102, 0.007009911198521693, 0.1197255196538378]
+        - [0.02301196370711195, -0.013173752902469766, 0.12385774751811263]
+        - [0.007099421687186047, 0.00374956169367522, 0.12231847362513236]
+        - [-0.03658783294587439, -0.05520160814685084, -0.044469839092782196]
+        - [0.01680759669839316, -0.06145640951619792, 0.07619130307975269]
+        - [0.006743441305116711, -0.06273287916948946, 0.07622247291807013]
+        - [-0.052918850044420616, -0.0374593697526168, -0.04202152928408584]
+        - [-0.02707419940819417, 0.03808444671428042, -0.0912541940564486]
+        - [-0.03188736278479003, 0.028796512598173764, -0.10964696836485262]
+        - [-0.04157733776708796, 0.02969086209049902, -0.10122774859707248]
+        - [-0.042031575878396524, -0.024055866374566394, 0.09026648651417567]
+        - [-0.014819542635179818, 0.06199232264292121, 0.09986085365925779]
+        - [-0.024608597228000007, 0.058733992330836086, 0.09928291025337327]
+        - [-0.03345643147268635, 0.054980842240468834, 0.0972465075548329]
+        - [-0.006861903757593964, -0.00011688436007755638, 0.12179839344784886]
+        - [-0.021755772910352557, -0.007281273443825051, 0.11670701800993599]
+        - [-0.04507881902472734, 0.04891224323264843, 0.09141612245354076]
+        - [0.010552665607135076, -0.024339504947084742, 0.12631157493175046]
+        - [-0.002009232372141395, -0.02886524825990185, 0.12474116607278775]
+        - [0.015715897446529348, -0.03307014930654726, 0.12123943905468226]
+        - [-0.04314644316595915, -0.028866586331187667, 0.0811418684883543]
+        - [-0.060377085841628576, -0.024142360755949804, -0.044674665758593815]
+        - [-0.034234615752376664, -0.045143777409321136, 0.08728417363099082]
+        - [-0.017119806578637053, 0.047673265327213894, -0.06684742593386613]
+        - [0.058556221178523986, -0.028691332795946187, 0.07019332260702846]
+        - [0.06399427556371262, -0.00045845473729018085, -0.048317111256510684]
+        - [0.06540453098720111, 0.01050175281439094, -0.0458488020054923]
+        - [0.04978668332278925, -0.044259183394241924, 0.07034431330466753]
+        - [0.06156060097393664, -0.007389169671722012, -0.04607725163582245]
+        - [0.03651549452652311, -0.017946244577563764, 0.11839602199294344]
+        - [0.022574728808221128, -0.020903213737454213, 0.12474491932743577]
+        - [0.008922372106796046, -0.01627718808867922, 0.1261060181992032]
+        - [-0.019431029780215006, -0.029907570970031445, 0.11681718106866029]
+        - [0.0018872113420754526, -0.06066193418365403, 0.08622790519131387]
+        - [-0.0590304581087581, 0.021815048706928825, -0.07919064060408447]
+        - [-0.05051965730763627, 0.027615054145194558, -0.09136436449798437]
+        - [-0.01737064929165211, 0.03825330660234671, -0.09577585626242344]
+        - [-0.014390724642034435, 0.03154813421932044, -0.10773382438555036]
+        - [-0.01645094375651136, 0.022816648369385448, -0.11977762446109971]
+        - [0.0038776880649687815, 0.05301743994518999, -0.06626981061945661]
+        - [0.0007909290551696609, 0.05559171006292433, -0.053096523853281945]
+        - [-0.010103725883218664, 0.04541838670684181, -0.08184874850830126]
+        - [-0.014529368862162863, 0.04695623917744967, -0.07375627881121537]
+        - [0.058600818671565934, -0.022398459070236344, 0.08632447390140319]
+        - [0.05257300240798212, -0.03835466188752156, 0.0821118023575887]
+        - [0.025133191862102673, -0.05945693794357223, 0.06883917717283564]
+        - [0.04325001768561363, -0.05036573988080301, 0.06092069101752975]
+        - [0.0541356547055403, -0.0031616686981038346, -0.07229788528851504]
+        - [0.04690866572088239, 0.0007786685604694127, -0.08550114283224096]
+        - [0.061066895139703724, 0.013079556929641892, -0.06236164948458577]
+        - [-0.010268785365816779, -0.045185961610530095, 0.11177481687454552]
+        - [0.0033249166902067293, -0.055956762132189884, 0.09727860710416497]
+        - [0.008667795332478497, -0.0491963134617438, 0.10657901754128259]
+        - [0.00034651607990113736, -0.03887427478688961, 0.11871227486244657]
+        - [-0.0033625210575245748, -0.021114651722351985, 0.12498931657282923]
+        - [-0.010604138838370797, -0.031806898621056866, 0.12153862948510336]
+        - [0.018579059817983527, -0.057109634658256206, 0.09024465859003328]
+        - [0.009182647330908927, -0.060605395103817, 0.08550949961633886]
+        - [0.020496934834931847, -0.048451220601416, 0.10418068692083321]
+        - [0.012509065114750733, -0.05466933482611724, 0.09800837026716859]
+        - [0.030088431153299924, -0.05137324658335481, 0.09244254510836686]
+        - [0.047196716874470926, -0.018838108566125184, 0.10880397216203855]
+        - [0.04753584468325073, -0.03169870657981543, 0.10150421998835707]
+        - [0.037028794343149714, 0.00825752368245553, 0.10965298318904546]
+        - [0.045665745172332003, -0.011613230292046766, 0.10941421566451631]
+        - [0.030406451417467204, 0.06599779727332122, 0.07651709931754844]
+        - [0.03352254280049406, 0.05601004822542883, -0.05110967497739002]
+        - [0.03707667052729288, 0.06341697975188691, 0.06581648455323674]
+        - [0.023368506116029784, 0.0016986307458046657, -0.11288155664365786]
+        - [0.011074437559648065, -0.004675925830960582, -0.12565559826402942]
+        - [0.004677954841195118, 0.004553591776196155, -0.1262803775216629]
+        - [-9.320363772751482e-05, 0.045192072220887315, -0.08415009933292682]
+        - [0.05849164701783254, 0.02480214293693186, -0.06357044988302214]
+        - [0.053217133099280875, 0.01725412147430199, -0.07394412323061185]
+        - [0.046326734870626156, 0.025270336957802703, -0.07884934497552445]
+        - [0.05379403290601006, 0.0348717563603835, -0.06386659232080637]
+        - [0.01657788358823452, 0.0584605694477319, -0.05263223919459589]
+        - [0.0006499939118890219, 0.03068429061801075, -0.10597314959001627]
+        - [0.0023056314023145856, 0.03990066325931355, -0.09309235680234079]
+        - [0.014526047744239389, 0.040150185744983496, -0.08894673309713189]
+        - [0.01424174425748106, 0.050768176297022266, -0.07198442120093133]
+        - [0.054357056726611015, -0.019006027110822908, 0.09851089864439347]
+        - [0.03346452799802061, -0.054444166556991885, 0.077942523280222]
+        - [0.04882065815072724, -0.01998373086981583, -0.07179036099723737]
+        - [0.038416912344395135, -0.03614625819249702, -0.07529568040058095]
+        - [0.04790981218942558, 0.007052354975406214, 0.09786005058436859]
+        - [0.056638845507830014, 0.000395694527500701, 0.08056049725270167]
+        - [0.06399417786164094, 0.020659590247920512, -0.047132453547178654]
+        - [0.0398526612103177, -0.01344162172574448, -0.09422114547226652]
+        - [0.021134231002439496, -0.02980813154141049, -0.11684343567897396]
+        - [0.03196648838506888, -0.013750704046419895, -0.1055910126380303]
+        - [0.033268528205424926, -0.03006426531377098, 0.11537249524230356]
+        - [-0.03506754735472302, 0.037468462775369006, -0.08226516031485663]
+        - [0.02072016339740151, 0.018025216643555657, -0.10679005476130664]
+        - [0.032396607187363466, 0.016426216914686414, -0.0978984220957288]
+        - [-0.004925951486352645, 0.014564014530552546, -0.12450195259592509]
+        - [0.015364740779177424, 0.029152436597249205, -0.10109067013212972]
+        - [0.016594339492250827, -0.015239146832612299, -0.12317297964320746]
+        - [0.030793584265857734, -0.006516063712046636, -0.10693049522858047]
+        - [0.04010106183394061, 0.0322722261253783, -0.08033921909256239]
+        - [0.06380984115993042, 0.006115132645805524, -0.05439423480009862]
+        - [0.06338051491349606, 0.018202662333505763, -0.05580482901069295]
+        - [0.02754271854424358, 0.05338126318887122, -0.06319913280852044]
+        - [0.02618203491158594, 0.057132343550699176, -0.05540783566323824]
+        - [0.055158506739171435, -0.008272027030296489, -0.06698592777562201]
+        - [0.05000630635762238, -0.023558696278468343, -0.059305738918087006]
+        - [0.06219440767856816, 0.025956593099369086, -0.05178290292788859]
+        - [0.037279747882371414, 0.051509825741018075, -0.060689549372689715]
+        - [0.02711967282227035, -0.05620402623806165, 0.08415520954123766]
+        - [0.027416644713259136, -0.04601028965498831, 0.102960922591585]
+        - [0.03431860695044962, -0.045927827356994334, 0.09709274253835068]
+        - [0.05331639020408663, 0.004163894162230712, 0.08896401822774806]
+        - [0.039556925917187194, 0.009248205027674235, -0.09362802484081924]
+        - [0.028623830746425688, 0.032218819627887786, -0.08959921725106593]
+        - [0.027301519003940948, 0.04401183269241047, -0.07767669821227913]
+        - [0.04362250659523759, 0.044367543893412305, -0.06576105629034447]
+        - [0.03771241858706298, -0.04899804569292995, 0.08656718085790853]
+        - [0.05183634454697444, 0.04053749112220845, -0.059658090668314276]
+        - [0.05911966290405858, 0.031063338800212004, -0.056131957452496335]
+      hull_overhang_m: 0.00048499999999999997
+  - link_name: "panda_link4"
+    shape: { shape: "box", half_extents_m: [0.0658, 0.0684, 0.1272] }
+    origin_xyz_rpy: [-0.0423, 0.0457, 0.0210, 1.1575, 0.3623, 0.6286]
+    # GENERATED by tools/generate_tight_geometry.py from robosuite's
+    # link4_collision mesh (152 vertices, hull 152).
+    # DOP inward margin inside the box above: 0.0834 mm.
+    # Added 2026-09-07 alongside robots/panda_mobile: the arm geometry of
+    # the two manifests is contract-tested to be identical.
+    tight_geometry:
+      dop_lo_m: [-0.0656553359541144, -0.06823707145611806, -0.12706109152157663, -0.08959376357472752, -0.09857833293804362, -0.1017219465802201, -0.10430717049581036, -0.06974698056612431, -0.06667357266141506, -0.10122271424976036, -0.11224066794812439, -0.10021279047173702, -0.11543120119153333]
+      dop_hi_m: [0.06571664400026027, 0.06829944675589156, 0.12703938984058638, 0.09987966400332554, 0.07900173086243283, 0.10853520022586181, 0.09909575871134846, 0.06575989609195078, 0.06660811317854488, 0.10052071887461483, 0.10351122574969736, 0.11253183776268873, 0.10639421190057528]
+      hull_vertices_m:
+        - [-0.02357832443143596, 0.019992472946817556, 0.1257185433871204]
+        - [-0.008503062900022803, 0.025732067236181794, 0.12703938984058638]
+        - [-0.013806630439919566, 0.03420223071383326, 0.12184661130024532]
+        - [0.006185096282227047, 0.03390722172957662, 0.12252778531528113]
+        - [0.05936837027486507, 0.02802501828903846, -0.047491127061085915]
+        - [0.008417704683438379, 0.06829944675589156, -0.058515756169880376]
+        - [0.027411332470540957, 0.06133852221118607, -0.04808515705788882]
+        - [0.06551889603677293, -0.021955709995454396, 0.05895790473530361]
+        - [0.06571664400026027, -0.004725433977130634, -0.06788178942328882]
+        - [0.06490950557075574, 0.0137616571949862, -0.05404885631724068]
+        - [0.03688348269162851, -0.026052055812193612, -0.10870335039881956]
+        - [0.045682101754703774, -0.025186636577672422, -0.10070487755838137]
+        - [0.01150764344276118, 0.06201140130934809, 0.08228885408172609]
+        - [0.05800980650315124, -0.018999110431869776, -0.08555191747177442]
+        - [-0.00015574092588212983, -0.002362989517194715, 0.12310235187298953]
+        - [-0.01537425662314474, 0.012678311654589781, 0.1264004488076353]
+        - [-0.01413205757059043, -0.0070387329836699136, 0.12178071634887924]
+        - [0.015905719565725902, -0.061564586747761406, 0.10091066063565951]
+        - [-0.002776619979605954, 0.017516299975308593, 0.12645660616677026]
+        - [-0.017359213129306158, 0.06215410795392541, -0.08491673386385011]
+        - [-0.006525379607110603, 0.06757405442324065, -0.07159201085124582]
+        - [-0.0007921795111745979, 0.04131705150204556, 0.11782699966071765]
+        - [-0.015753678872652936, 0.048857096617849115, 0.10631306238558623]
+        - [0.005305665703004425, 0.02481901055410481, 0.1242746484788749]
+        - [0.0034686541858060323, -0.06536216424108911, 0.09788220600499468]
+        - [-0.005660723336391443, -0.06068940782779436, -0.04343092982737363]
+        - [0.02887632712976979, -0.05613494073896968, 0.10072149214851887]
+        - [0.000845044861445466, 0.0653537405908041, 0.064234289132814]
+        - [0.04838174724142046, 0.04461678967206181, -0.04366017982166969]
+        - [0.03986855389489688, 0.03411553934103545, 0.08044979558863187]
+        - [0.06089179925474328, -0.03310306591606625, 0.07874002605064434]
+        - [0.03913064883564023, 0.027619590640743694, 0.09288352532856176]
+        - [0.03230095757401343, 0.01750875098548715, 0.10752815472164265]
+        - [-0.0268066218840694, 0.011608831759284274, 0.12375682199014744]
+        - [0.010809885548165754, 0.003009858497762362, 0.12161062654410305]
+        - [0.014871457864642956, -0.04983762890792391, -0.0628651694692403]
+        - [0.029155767820116377, -0.04095736993133823, -0.07288689703595756]
+        - [0.039642735919671566, -0.050356448395255736, 0.09798929688592643]
+        - [-0.03866043702375461, 0.03720255852551788, -0.07899426823804259]
+        - [-0.054499590488981876, 0.03881900997006251, 0.07276297342024199]
+        - [-0.04792973850791961, 0.04636093220172159, 0.061656583437051334]
+        - [-0.03066590569804135, 0.05691569188665809, 0.07470128997550567]
+        - [-0.036514218931368594, 0.05410025827967552, 0.054946563872216816]
+        - [-0.02287974697162196, 0.05485812487577063, -0.09520959592209405]
+        - [-0.025723442293957878, 0.04560926097602846, -0.10485487645176206]
+        - [0.018398239680409566, 0.04270283294627898, 0.11151611577944491]
+        - [0.008267403139025027, 0.048839813997781575, 0.10932942334316342]
+        - [0.02148379607763458, 0.03737353110717014, 0.1118564880393418]
+        - [-0.008614007236944974, 0.053390660890509915, 0.10186540383342906]
+        - [-0.022422881823067876, 0.04443783440012434, 0.10867352756853328]
+        - [-0.025967500024845838, 0.05086158831947639, 0.09851810809256872]
+        - [-0.016814276268083808, 0.055737889678806746, 0.09546316784830412]
+        - [-0.030205846309502488, 0.02868174425938189, 0.11905610099090995]
+        - [-0.06214634037452632, 0.003401460384411238, -0.04605470505726498]
+        - [-0.06065530073825137, 0.024467590514817235, 0.06987396599808988]
+        - [-0.05587325137906868, 0.03336002935087019, 0.08404622105802836]
+        - [-0.039828869721074675, 0.04743280155989683, 0.08850580682200089]
+        - [-0.018349631494367278, 0.061378228704122524, 0.07465027557022884]
+        - [-0.02273852887176658, 0.022657017792850644, -0.12041200644046086]
+        - [-0.03437783680924913, 0.016724891333424804, -0.1052479565093638]
+        - [-0.025811058475626963, 0.03551015886489564, -0.11286892232269181]
+        - [0.04366780655626737, -0.030561458965479203, -0.08215171217582702]
+        - [0.03674146989815163, -0.033929418120550586, -0.08730344301329787]
+        - [0.022250216490847158, -0.022946787437767673, -0.1185518635453348]
+        - [0.012799464195189202, -0.018650416976454077, -0.12307187043192969]
+        - [0.0487962533707456, -0.04435802575071504, 0.09271114284004414]
+        - [0.05426046617975913, -0.03993763084142111, 0.08789729775221432]
+        - [0.06482566156673575, -0.026688648308527897, 0.06763015079650096]
+        - [0.010715829416052055, -0.046585758374139793, -0.07920907951597088]
+        - [0.022180918410066502, -0.040850249154934695, -0.08536948974467673]
+        - [-0.030607054580257385, -0.01099107696093411, 0.11457747580166919]
+        - [-0.05261692157709439, -0.04449442720515426, -0.053495703739985905]
+        - [-0.04789089349319133, -0.049344303283332766, -0.05280938681213481]
+        - [-0.03480519388184762, -0.06383193196933806, 0.05911059651191135]
+        - [-0.03577889394900709, 0.05327501351841608, 0.07945717178725756]
+        - [0.02379880668587455, 0.049081950150018094, 0.10011589586077548]
+        - [0.02814504462164469, 0.043439180105657865, 0.09930990169228318]
+        - [0.020878956412596482, 0.01025140282973971, 0.11751046634845942]
+        - [0.014412937424789555, 0.0296672353302092, 0.11947045576201014]
+        - [-0.008766657062337585, 0.061317387796908034, 0.08418853100639091]
+        - [-0.02670902874236796, 0.0560771087950726, 0.08670826370381551]
+        - [-0.0070297225482456515, 0.057922530016499406, 0.09389336087675156]
+        - [-0.061030078956224025, 0.018285288630880428, 0.08444948191297785]
+        - [-0.06488695824024199, -0.005243442498511955, -0.04594615905026082]
+        - [-0.05222550014418346, -0.00893660696612165, 0.0913176382186773]
+        - [-0.031175716598378714, -0.0662975136967091, 0.06747705668942816]
+        - [-0.023819384394827284, -0.068234451492148, 0.07868884528715679]
+        - [-0.03838364898690361, 0.008643572842494654, 0.11752421979248581]
+        - [-0.008926552498535445, -0.0005404895523097201, -0.12706109152157663]
+        - [-0.016665164599921314, 0.010136273672056648, -0.125157068489542]
+        - [-1.9772817822145393e-05, -0.009482632213189152, -0.12662882589166982]
+        - [-0.0038026038453119844, -0.06695870496525617, 0.0946882612687382]
+        - [-0.013155172705523662, -0.06823707145611806, 0.08892130902749854]
+        - [-0.014197973712832499, -0.06170871961308331, -0.04794779562197439]
+        - [0.024466252940846915, 0.056370723476593804, 0.08274048239110611]
+        - [-0.03921427727037952, -0.05540042571524685, -0.0527095620589192]
+        - [-0.026491619139334517, -0.061042607251241755, -0.04762945988391534]
+        - [-0.05643585696682029, -0.005491790586283141, 0.08129426899972395]
+        - [-0.06340110300512579, -0.027229259910123323, -0.04544462262655003]
+        - [-0.045515100196423436, 0.015079252159104065, -0.08647724264263282]
+        - [-0.059380023703741125, -0.0036050304840701355, -0.06274902048624917]
+        - [-0.0545349126544595, 0.010259228622013858, -0.0672282264518715]
+        - [-0.04044053492029209, 0.028899152157731634, -0.08759043089108673]
+        - [-0.0489553654800316, 0.023666787123459834, -0.06625570822396634]
+        - [-0.04852947401503347, -0.04005804967492455, -0.06659342686278381]
+        - [-0.05786741825039942, -0.032880336815513674, -0.060068719162589455]
+        - [-0.04621289023898601, -0.023695972777035473, -0.08083190540025731]
+        - [-0.052793550384893057, -0.040387563722535345, -0.060840996051654696]
+        - [-0.058222134823559195, -0.03752036840246295, -0.05073533762927648]
+        - [0.029316897077136292, 0.04926433536207231, 0.08744089624412489]
+        - [-0.015787503450708045, 0.060066807754788204, 0.08478695076745628]
+        - [0.012549532097941239, 0.05572835919089455, 0.09769611104558189]
+        - [-0.03698694209602112, 0.044019617768679714, 0.09839032083093481]
+        - [-0.05199259000557939, 0.028412309745949674, 0.09898306716671076]
+        - [-0.04267394876565102, 0.02698248958328578, 0.1110088805435561]
+        - [-0.048542918390934664, 0.013907814413916439, 0.110189356471118]
+        - [-0.04363349465913817, -0.010178927317991648, 0.10438082273495748]
+        - [0.02048456686137755, -0.0338517935641371, -0.10182274360602447]
+        - [-0.033424030596332706, 0.0038442861437767767, -0.10606252069630293]
+        - [-0.05900309310377715, -0.02707310145485242, -0.06171194379810298]
+        - [-0.05540090818212017, -0.018230139902379407, -0.07058122260781406]
+        - [0.0015794914817998233, -0.05547939820005043, -0.05885006723447657]
+        - [-0.03890093676206591, -0.05154683697972825, -0.062332637833857]
+        - [-0.032287778549495376, -0.05729410029089708, -0.05640336603956196]
+        - [0.005409132488398195, -0.04277507373662914, -0.08922837668762477]
+        - [-0.008227375356959471, -0.04542264814666607, -0.08457722574083684]
+        - [0.008715803095095152, -0.032943186607594786, -0.10474465871508348]
+        - [-0.0218129315269242, -0.06021436478107456, -0.05435222073689169]
+        - [-0.06462424613350294, -0.011454167882311345, -0.05141677860121686]
+        - [-0.0656553359541144, -0.015273760669097587, -0.044934686159857476]
+        - [-0.043874277495631754, 0.004733284805436553, -0.09166322010212359]
+        - [-0.05341292028564944, -0.005224156022857716, -0.0757573993687245]
+        - [-0.03777665750150168, -0.030852452739375733, -0.08481978203535857]
+        - [-0.038137237046359664, 0.016107937022682976, 0.11910172977385657]
+        - [-0.0312897442067304, 0.0422762419936993, 0.10549385189745908]
+        - [-0.05515677444965679, 0.014448861278760864, 0.10094640904496222]
+        - [-0.05902777764001641, 0.016289322254220622, 0.09232168243052542]
+        - [-0.030026008025352324, -0.01682732315284326, -0.10133118639156402]
+        - [-0.015624208100223247, -0.01277352362103278, -0.11521665430435477]
+        - [-0.027929484575539884, -0.05583836626328517, -0.06206698887710024]
+        - [-0.06309807277044464, -0.018921818624769705, -0.056319371911002135]
+        - [-0.06355334199415397, -0.024371859465486582, -0.051461492249315684]
+        - [-0.04510116204692504, -0.047846825524851894, -0.06171309830521113]
+        - [-0.030543775836148528, -0.0038745334731579784, -0.10714461509252415]
+        - [-0.04485546655404474, -0.009312702310371488, -0.08843515900088043]
+        - [-0.03523607303510385, -0.042724397557932135, -0.07570551313403424]
+        - [-0.022899642744545534, -0.029068804705169385, -0.09793548683025408]
+        - [-0.008281758000853899, -0.023348084274708195, -0.11133940637951213]
+        - [-0.00874869036916649, -0.03500982011079253, -0.09881276774150946]
+        - [-0.02404740579820429, -0.04610015349865982, -0.07846969158025129]
+        - [-0.0207693178236589, -0.0047909561130805075, -0.11577555717719355]
+        - [-0.010648295567895363, -0.05600345815892242, -0.06408727453780437]
+      hull_overhang_m: 0.000217
+  - link_name: "panda_link5"
+    shape: { shape: "box", half_extents_m: [0.0552, 0.0672, 0.1705] }
+    origin_xyz_rpy: [0.0003, 0.0416, -0.1090, -0.2720, 0.0021, 0.0011]
+    # GENERATED by tools/generate_tight_geometry.py from robosuite's
+    # link5_collision mesh (152 vertices, hull 152).
+    # DOP inward margin inside the box above: 0.0833 mm.
+    # Stage 2 is what retires the panda_link5<->panda_link7 ACM exemption
+    # (issue #191): the boxes cannot separate that pair at any margin, the
+    # hulls separate it exactly. See docs/reference/collision-hull-narrow-phase.md.
+    tight_geometry:
+      dop_lo_m: [-0.05505200854706414, -0.06701685317540496, -0.17041674138122168, -0.14013889354056225, -0.1321425931670658, -0.12885374517689094, -0.12445749314513553, -0.07367956381513253, -0.0636815517418538, -0.15041227863194614, -0.1363230210278837, -0.15790285523216033, -0.14940700460618486]
+      dop_hi_m: [0.055049974633927856, 0.0670068554025121, 0.17033341683205458, 0.12394892645840458, 0.12866229747578206, 0.13164616771725124, 0.14023984137977943, 0.0634490651521704, 0.07295175728548582, 0.13582906981112497, 0.15029365788108864, 0.14104091630145, 0.13705950241351048]
+      hull_vertices_m:
+        - [-0.04312233380640455, 0.03362341296508615, -0.14643548662041755]
+        - [-0.04993394093846177, 0.0336535055795888, 0.11416029365488398]
+        - [-0.027713765012979882, 0.062345549133313756, -0.049183148080560214]
+        - [-0.02987401124880909, -0.06431977825554586, 0.13468389570490696]
+        - [-0.03961568408649679, -0.06164327067687398, 0.12518744988779146]
+        - [-0.008037391910856976, -0.06078870226723221, -0.12822847086895592]
+        - [0.0115154228982106, 0.05245099569472473, -0.1410670108973303]
+        - [-0.007941035079130247, 0.05281692582557231, -0.14101448133972214]
+        - [-0.0007701782714991046, 0.06630077760159035, -0.07476885778004294]
+        - [0.04462639853199427, -0.05854296602009002, 0.11372612621558073]
+        - [0.044730744654970137, 0.021321575859269918, 0.14453462834771924]
+        - [0.03953473161914411, -0.06126542476171124, 0.1234749426572426]
+        - [0.05256829544309784, 0.016924565072339866, -0.1508903663840663]
+        - [0.050058526811185916, 0.029284261046704792, 0.12459968244326232]
+        - [0.055049974633927856, -0.002094914910543144, -0.15619548009167486]
+        - [0.047098274100132356, -0.05569121225103632, 0.1036747258143043]
+        - [0.030653851486301082, -0.06400857909420585, 0.13335542052750593]
+        - [0.029961513108810144, 0.014612864072726156, 0.16096014714254234]
+        - [0.019595417337064682, 0.01230268268078386, 0.16666598918163442]
+        - [-0.04950180379811565, 0.024910864834760755, 0.13526405094797353]
+        - [-0.050866327160800584, 0.03077582114868871, 0.1219057274531033]
+        - [-0.04823149967610073, -0.05555219054588364, 0.10356565546759935]
+        - [-0.04592706603370479, 0.02160130765338278, 0.14387997365029728]
+        - [-0.04088542599929199, 0.018540029353576574, 0.1517289346988477]
+        - [-0.03916758230756663, 0.02842823866595367, 0.1466482282568833]
+        - [-0.050304340755478544, 0.02186518728432563, -0.14973868624573505]
+        - [-0.02361526689272784, -0.05605824101594751, -0.1323584086536669]
+        - [-0.045843129628739696, -0.058355508788354674, 0.11339726980507281]
+        - [0.0368688422300633, 0.01710745845187251, 0.15522247046135157]
+        - [-0.018283515305234352, -0.06613272033072358, 0.14117074170407562]
+        - [-0.005225641220137338, 0.010844554706994216, 0.17033341683205458]
+        - [-0.020392870611291778, 0.012619595834106273, 0.16675320959501133]
+        - [-0.0033126447425759855, -0.06701685317540496, 0.14427655905220113]
+        - [0.0146611757260612, 0.03344175994680684, 0.1593922873788451]
+        - [0.009828575741708425, 0.044309459219967456, 0.15382123309138884]
+        - [0.006921830738149042, 0.0338400335439636, 0.16130034941682703]
+        - [0.04907088679161545, 0.0333232555205849, 0.1142198322498308]
+        - [0.04348019960183037, 0.03292296128143387, -0.1464464753633312]
+        - [-0.011455070115358389, 0.0655165752805248, -0.07590450212001644]
+        - [-0.022303440093811876, 0.06394041539441037, -0.07118570759996332]
+        - [-0.02599284273678749, 0.04744649188555779, -0.14254494497150308]
+        - [-0.016223833249041246, 0.051290881415507236, 0.13854521664361746]
+        - [-0.01692396963442047, 0.04459910830244501, 0.15156961667798396]
+        - [-0.004678715127370942, 0.050452138849339294, 0.14438579078997052]
+        - [-0.003475645861539368, 0.0440023437632195, 0.15545963291981962]
+        - [-0.034688508532812426, 0.01587114691803542, 0.15810135666849334]
+        - [-0.02595870624739197, 0.013413727855504202, 0.16402998528014257]
+        - [-0.027667465608389216, 0.021562092111280073, 0.15999956872115698]
+        - [0.04412775783593858, 0.03324299222534108, 0.13262343696807097]
+        - [0.048085109218112855, 0.024369324219108247, 0.1365432123930989]
+        - [0.0052538183106673846, 0.053530946664150515, 0.1362651997429371]
+        - [-0.007262785699832636, 0.052371035034536495, 0.13950818801124984]
+        - [0.007773920864167296, 0.05083141195465865, 0.14262360252217737]
+        - [0.019753681782575066, 0.03478841992556047, 0.15638188704352537]
+        - [0.02112623036030512, 0.044881057353572736, 0.14803055660090716]
+        - [0.02703967424014981, 0.0626908542179437, -0.05135596362835254]
+        - [0.016908513793949503, 0.06439552666898095, -0.07735778324841813]
+        - [0.030994115012486285, 0.04425174558019353, -0.14331677127119102]
+        - [0.01078507425779071, 0.06583302473928869, -0.073919262803077]
+        - [0.009749045058961398, 0.05546204419524307, 0.1279018490733657]
+        - [0.017862252662576756, 0.05471905516353599, 0.12300648666596768]
+        - [0.008232314962739089, 0.05686209849330822, 0.11923362542200631]
+        - [0.05206277706856981, -0.020986193391815886, -0.1448664340517814]
+        - [0.054275378881978455, -0.009605416121838463, -0.1582719504321191]
+        - [0.002043178208960932, 0.019191934049986474, 0.16829474326055913]
+        - [0.012616300725077896, 0.020464798762608327, 0.16612345000348724]
+        - [-0.028668435769872633, 0.0462724999910843, 0.14017079240367467]
+        - [-0.03334333477184838, 0.048311745847539375, 0.12679732497771004]
+        - [-0.04188327223180783, 0.03800069326761566, 0.13155227851489873]
+        - [-0.015016300215206602, 0.05448362104837245, 0.12895529627644398]
+        - [-0.004483740702535434, 0.05509344995914115, 0.13117410851148462]
+        - [-0.01696107581024285, 0.05543752658097169, 0.12038869302272617]
+        - [-0.006758088091898743, 0.05684099738404482, 0.1219684022698478]
+        - [-0.03524348444149111, 0.038329468279445944, 0.14162364076875303]
+        - [-0.04396218254443268, 0.030695330422824758, 0.1380807173460556]
+        - [-0.02892921959548982, 0.03838444692314256, 0.1482530349913976]
+        - [-0.05398984066718204, 0.011440997599293802, -0.15265931840757718]
+        - [0.007882009567440338, 0.011032716743311513, 0.16980342092930586]
+        - [0.014137184900237725, -0.06652497155458333, 0.14232605837853757]
+        - [-0.014981552816807448, -0.05917076972644706, -0.1313260188252259]
+        - [-0.005265314662864942, -0.05599302721474827, -0.1572876056128288]
+        - [-0.011291908986150567, -0.057635307925064015, -0.14576895350838576]
+        - [-0.011701379736931488, -0.05439609470789516, -0.1600524521723708]
+        - [0.03263439149322964, 0.04855620290801628, 0.12371962511498599]
+        - [0.024079362597235313, 0.05226452311294404, 0.12565995623458218]
+        - [0.030972212655963238, 0.04712723162200947, 0.13354479622783205]
+        - [0.03973522423030612, 0.040566956914271715, 0.1286616176379711]
+        - [0.042085961132388446, 0.04110271588608943, 0.11822156500255737]
+        - [-0.008556904812106325, 0.02056252470267639, 0.1671542523508682]
+        - [-0.0006264205712197363, 0.033670181519001544, 0.1621597756896709]
+        - [0.017764459997627338, 0.05162502867982872, 0.1361000675969483]
+        - [0.023086039954859503, 0.06377929205904181, -0.06738304206820059]
+        - [0.04688316389581719, 0.03438748059860874, 0.12283806091378956]
+        - [0.014574692612277229, 0.06597812016821647, -0.05867325466064767]
+        - [-0.020403577202005703, 0.06488787825446495, -0.052697645798269514]
+        - [0.0030432100616033905, -0.05289161802553486, -0.17041674138122168]
+        - [-0.001641675594340876, -0.05834375411247303, -0.14697215402936192]
+        - [0.03685834380495719, -0.046507800751757825, -0.14024445655576653]
+        - [0.026443874044707372, 0.02332352276735299, 0.15923148269088966]
+        - [0.020248259403280403, 0.02015367565086107, 0.1636841478344275]
+        - [-0.02138883314475588, 0.05192753229380447, 0.13246142222259108]
+        - [-0.010963052958724162, 0.06644502753573343, -0.06143378525063477]
+        - [0.0002805727968376158, 0.0670068554025121, -0.06076780409895672]
+        - [-0.02388998056772435, 0.05295773252609986, 0.12436348055206857]
+        - [-0.022385596486341783, 0.03546086517462986, 0.1550573490425019]
+        - [-0.03141474646477009, 0.028829629363016345, 0.15342909587277492]
+        - [-0.05505200854706414, -0.003912379282472404, -0.1569224123673671]
+        - [-0.05328695088326292, -0.016704794844215175, -0.1465102590271553]
+        - [0.04064037066324061, 0.03487613758244897, 0.13703891565707058]
+        - [0.03202403973422402, 0.03849082570279768, 0.1441709727325533]
+        - [0.03816383813032851, 0.027814944348765566, 0.14722200095884705]
+        - [0.026049669389916763, 0.04590227553680468, 0.14242147472186312]
+        - [-0.0065220357769686325, 0.03177314264758299, 0.1625394474505944]
+        - [-0.01641513917495007, 0.02723084740130246, 0.16245036052768225]
+        - [-0.01372776521268999, 0.036138593265001066, 0.15840030786776982]
+        - [0.009779631824249981, -0.060649903260596626, -0.12628485629975536]
+        - [0.01723679556335537, -0.05834890737294398, -0.13249567501501386]
+        - [-0.04150114495662223, 0.04227643334401479, 0.12067238276620527]
+        - [-0.011853221271602519, -0.05166660160662042, -0.17016260699676877]
+        - [0.003253307868287812, -0.06141699477909808, -0.12644264884356252]
+        - [0.02911591047419526, 0.03142259575149631, 0.15273538635116352]
+        - [0.04877321489423885, -0.029484823704598772, -0.14396792750648207]
+        - [0.04069538314017736, -0.04228492373792427, -0.14160296357928553]
+        - [0.04285725630142866, -0.033048210351340666, -0.1648493740035161]
+        - [0.04502935734998244, -0.03656338655331693, -0.14157535755039657]
+        - [0.03393362807646463, -0.04169005553528573, -0.16727884690342784]
+        - [0.011121291781082175, -0.05178099909969383, -0.17014960028072645]
+        - [0.012682700147961284, -0.05529749949847642, -0.15555421822521792]
+        - [0.02662668051970537, -0.05198889363206983, -0.1478229648752846]
+        - [0.019878603039256884, -0.05445449640808112, -0.1503551179507345]
+        - [0.02244195176352941, -0.04823706459287326, -0.16912768281786358]
+        - [0.03143368793050206, -0.0499164692613191, -0.144278583644919]
+        - [-0.04618227841212539, -0.0348882590053243, -0.14209410153362653]
+        - [-0.04655510944994565, -0.02830018039150721, -0.16377128803345917]
+        - [-0.04247286808743773, -0.040407539883477006, -0.1412491974077474]
+        - [-0.049964473498365046, -0.027058571310684124, -0.14518159453135285]
+        - [-0.05208758403065569, -0.01711034306211165, -0.16062750035808343]
+        - [-0.032289492558983654, -0.048669161867369484, -0.14713100493238937]
+        - [-0.03696155047946388, -0.03905400540561009, -0.16671212784366574]
+        - [-0.025597106593914558, -0.04684095828980953, -0.16886384280011266]
+        - [-0.025603325809225405, -0.05278493052446628, -0.14707838777286844]
+        - [-0.03148440802113495, -0.051290274924987764, -0.13713726579744492]
+        - [0.04868910181316046, -0.024619434001323263, -0.16248772825052307]
+        - [0.008035034498407163, -0.058367202216811985, -0.14459864322804186]
+        - [0.023946226648587116, -0.05563555116877283, -0.13481859815431663]
+        - [0.030935284473659907, -0.05187132861483706, -0.13324666024227944]
+        - [-0.01789910445535386, 0.06532791519428502, -0.06485858241173637]
+        - [-0.049742807505684085, -0.0014266610384737497, -0.16199825070960444]
+        - [-0.049716910039585914, 0.005143332212328582, -0.1601546074571162]
+        - [-0.03816787972613194, -0.045326842436608526, -0.14062411252516485]
+        - [-0.019817098745690383, -0.053682733331422, -0.1534622025639628]
+        - [-0.018577923859476004, -0.05623922160703932, -0.1439749791579433]
+      hull_overhang_m: 0.000259
+  - link_name: "panda_link6"
+    shape: { shape: "box", half_extents_m: [0.0467, 0.0706, 0.0921] }
+    origin_xyz_rpy: [0.0424, 0.0082, 0.0083, -3.0616, -1.4278, 0.0485]
+    # GENERATED by tools/generate_tight_geometry.py from robosuite's
+    # link6_collision mesh (102 vertices, hull 102).
+    # DOP inward margin inside the box above: 0.1320 mm.
+    # Added 2026-09-07 alongside robots/panda_mobile: the arm geometry of
+    # the two manifests is contract-tested to be identical.
+    tight_geometry:
+      dop_lo_m: [-0.046462885694982144, -0.07043252707674909, -0.09196801809987938, -0.07989682762871572, -0.09013535205206889, -0.08295867020636262, -0.0983585645133207, -0.06919418386017039, -0.0786703784208751, -0.08674562909643779, -0.07836494934160342, -0.07705911798026177, -0.0946730638808065]
+      dop_hi_m: [0.046542002084413246, 0.07042601881647266, 0.09194018187767727, 0.09662761624981252, 0.07345952574668618, 0.08720467754793508, 0.06983925176838976, 0.07586841687541344, 0.06548497443055755, 0.07600770673581125, 0.07438959477920028, 0.10747030092753136, 0.08060108116585603]
+      hull_vertices_m:
+        - [0.007315564240449874, 0.013113839761317973, -0.09141695248216794]
+        - [-0.035759070956767974, 2.2428686796623847e-05, -0.08691777418800051]
+        - [-0.03528986186127929, 0.017001184096985852, -0.08502585546519585]
+        - [-0.046462885694982144, 0.06479383042484309, 0.03912992489374171]
+        - [-0.030322232984808066, 0.048321391725121454, -0.05618720149892035]
+        - [-0.03274234629032443, 0.04071817621197767, -0.06918488988669876]
+        - [0.006816267528807648, -0.011272378418881613, -0.09030590471823814]
+        - [-0.03559660919978567, -0.013622030059475237, -0.08408005029039181]
+        - [-0.04526470731335235, -0.006291160999342653, 0.049082037546727623]
+        - [0.014956876322847446, 0.04317131269519375, -0.06574915620260083]
+        - [0.024288667628454153, 0.05996219447091988, -0.0006767065507859761]
+        - [0.0408831926183681, 0.06382191845778606, 0.02819800836313164]
+        - [0.008361196049521165, -0.0020904318386880316, -0.09196801809987938]
+        - [-0.03419634090651804, 0.031405045630830596, -0.07808724518842189]
+        - [0.046542002084413246, -0.011332118131140947, -0.007269770325482087]
+        - [0.03909674957880372, -0.033128295534484556, 0.05689798016446742]
+        - [0.03477484962527986, -0.05704847909560956, 0.05093472994865309]
+        - [0.041906579297661166, 0.0653875648033243, 0.04026000939191563]
+        - [0.04631067927861299, 0.025405364202974616, -0.008945445931808469]
+        - [0.04347581685996046, 0.028005285108948536, -0.03727787423654638]
+        - [0.03706322495473365, -0.002277562240317845, 0.06778334188602944]
+        - [0.04119277660774723, 0.003031932601486737, 0.05626341059722937]
+        - [0.03812140005044246, 0.06746870814084824, 0.05682177785095121]
+        - [0.0035246467460745444, 0.042779027321885536, -0.06975769462030229]
+        - [0.009926630382760454, 0.03434228413205886, -0.07964485799462936]
+        - [0.007281177450564028, -0.022994357330670106, -0.08508560737091445]
+        - [-0.03447309289848555, -0.02825775635028666, -0.07565451556773624]
+        - [-0.043249354673879366, 0.0014541212048109341, 0.06137848995698598]
+        - [-0.04353838601103099, 0.0664670193702434, 0.05344793939330076]
+        - [0.005521304628291513, 0.047618901896617875, -0.05951242529150718]
+        - [0.008335620194908668, 0.025805035817963572, -0.08607493498518205]
+        - [0.02818678963532374, 0.06910375968006484, 0.07007339144355475]
+        - [0.031477459044679836, -0.0003300527944059021, 0.07601367066598128]
+        - [-0.00962105255223376, -0.056679573957677976, 0.0762744993545815]
+        - [0.021419718841055573, -0.06634122269715767, 0.04202224754604021]
+        - [0.024325935174312256, -0.059345503503920864, 0.06286358569674559]
+        - [0.011720544331281064, -0.050088405160604754, 0.08183885046355291]
+        - [0.003827011206855335, -0.03903168742469858, 0.08994589893806407]
+        - [-0.003541941785615423, -0.047535955522409586, 0.08598392301245035]
+        - [-0.02061380292595007, -0.06892589058517765, 0.029742289790259346]
+        - [-0.005173574442728098, -0.07043252707674909, 0.02553378033752917]
+        - [-0.01154827269246794, -0.06954643234265882, 0.03591826014661975]
+        - [-0.026021024930484308, -0.06601475505026383, 0.04790472246743439]
+        - [0.019219723604809856, 0.06989497535484195, 0.07671311922146172]
+        - [0.016843608816894298, -0.030380032674268552, -0.07374149093428277]
+        - [0.035794333323131276, -0.01961422195799241, -0.061251202510703505]
+        - [0.023495670241873292, -0.03435976764580398, -0.06055447140802254]
+        - [0.023055163687896917, 0.0010036865298467645, 0.0830484601402289]
+        - [0.03899182588432512, -0.022309405247384777, -0.051179307185641384]
+        - [0.03807068250089818, 0.02479968117249791, -0.05947106769649809]
+        - [-0.037773438993600174, 0.0607734931339113, 0.009001847205811047]
+        - [-0.04220490362875416, -0.03483866823425205, 0.05511987750926086]
+        - [-0.03791947079589712, -0.058346588020617415, 0.05378782739410466]
+        - [-0.03266696695603568, -0.03931255662577083, -0.06282740295835261]
+        - [-0.03757378833157521, 0.0679481245738231, 0.06464492197243978]
+        - [-0.03004912489870779, -0.0023611168563858064, 0.0807756492748683]
+        - [-0.024827629613561556, 0.0695035943190822, 0.07603080716396887]
+        - [0.01749502717468627, -0.05486882847968062, 0.07487155853192289]
+        - [0.008798748489769895, -0.06962998995746858, 0.031446648151685325]
+        - [-0.01347139992002327, -0.05234807721907484, 0.0815398537125761]
+        - [-0.025108550040482125, -0.05039220874364809, 0.07902421534180289]
+        - [-0.023196643979233277, -0.058764757432841964, 0.06976794025111713]
+        - [-0.03555218007673043, -0.05438049141054454, 0.066186337825016]
+        - [0.04363387914686821, -0.01978259681698139, -0.03162307592100843]
+        - [0.03419697165774243, -0.05204316254860898, 0.06295476249836264]
+        - [0.030360290184201083, -0.062249448787148734, 0.03618833862434304]
+        - [-0.010350255087383986, 0.07030725805113994, 0.08149497207770867]
+        - [0.005493995378370458, 0.07042601881647266, 0.08155993830756]
+        - [0.01893581900835551, -0.06668430719818061, 0.026216324389979177]
+        - [0.01698759419750278, 0.007941912848690934, -0.08716699878586023]
+        - [0.022313345027455647, -0.007840138256415717, -0.08195488156737607]
+        - [0.015144746166144871, -0.017522677705990034, -0.0842428046289676]
+        - [0.02529699359041246, -0.022422180235461373, -0.07208866583765336]
+        - [0.03296070965408654, 0.0111818814273279, -0.07224206418209728]
+        - [0.019347947392694503, 0.023506124972611692, -0.081428278310958]
+        - [0.004208696725511366, -0.040573810309274407, -0.06418719510950804]
+        - [-0.01826120002756889, -0.000902700072172667, 0.08779083554795697]
+        - [-0.03780674803167481, -0.025324391340198846, 0.07093337927523567]
+        - [0.023071189353753522, -0.024554699365891955, 0.08374740069338088]
+        - [0.018456421014861623, -0.044470776811131575, 0.0835532719424298]
+        - [0.02927952562872373, -0.0342764383524869, 0.07809101693616727]
+        - [-0.030171645327204927, -0.061908768414102935, 0.057669285893737876]
+        - [0.006272040627177375, -0.06902726300262907, 0.021534164560244463]
+        - [0.013604218315686917, -0.039587837526876925, -0.06369352676796093]
+        - [0.02651918845777359, -0.062347039896757474, 0.05123182386450543]
+        - [0.010735799286167384, -0.002182879543803508, 0.0894167591465481]
+        - [0.02327715358016519, 0.03534993079234488, -0.06860854652066446]
+        - [0.009149560517682492, -0.03311651266869302, -0.07586153708350159]
+        - [-0.023991619573645862, -0.023841786765832783, 0.08573847203052065]
+        - [-0.032641809637417744, -0.04861870491454313, 0.07337189494012805]
+        - [0.03250547515162109, -0.008277447924839141, -0.07097854145673707]
+        - [-0.003461929936600809, 0.010324261359889305, 0.08977867311964186]
+        - [-0.0021848666499748055, -0.025584828462122344, 0.09194018187767727]
+        - [-0.014276989437889525, -0.029456076896115645, 0.08939622341984418]
+        - [0.028574605685083326, -0.05060335900308618, 0.07186496748251497]
+        - [0.009936183453875777, -0.030472101802840098, 0.08993588751341275]
+        - [-0.011585208932444224, -0.044314838353053554, 0.08778379908978744]
+        - [-0.03443814277645843, -0.06341721047593205, 0.041415646629110535]
+        - [-0.03667787173926192, 0.006617522498755427, 0.07280905008096997]
+        - [0.03636018986100483, -0.02925570253985036, 0.06719398060998258]
+        - [-0.030753362824629985, -0.02758975015344844, 0.07990046767112026]
+        - [-0.021799745862735302, -0.04049189524928616, 0.08504951693460379]
+      hull_overhang_m: 0.000234
+  - link_name: "panda_link7"
+    shape: { shape: "box", half_extents_m: [0.0295, 0.0440, 0.0711] }
+    origin_xyz_rpy: [0.0123, 0.0123, 0.0800, 3.1380, -1.5171, -2.3520]
+    # GENERATED by tools/generate_tight_geometry.py from robosuite's
+    # link7_collision mesh (102 vertices, hull 102).
+    # DOP inward margin inside the box above: 0.0977 mm.
+    # Stage 2 is what retires the panda_link5<->panda_link7 ACM exemption
+    # (issue #191): the boxes cannot separate that pair at any margin, the
+    # hulls separate it exactly. See docs/reference/collision-hull-narrow-phase.md.
+    tight_geometry:
+      dop_lo_m: [-0.02940231982523405, -0.04385414580963837, -0.07088478391810914, -0.058522296459796445, -0.061385269242049754, -0.0585686472647957, -0.061389546535387945, -0.050145142905473936, -0.05020597681065646, -0.05253955860695317, -0.06179819984067162, -0.06917363637890223, -0.05733481341743535]
+      dop_hi_m: [0.029337828148606658, 0.04390213988271437, 0.07092990492339842, 0.05638469010385434, 0.06150609400541406, 0.05645371816738561, 0.06162211837095515, 0.04353306494163081, 0.04350001352460314, 0.0593645598413147, 0.05615231922793263, 0.05734864668989711, 0.06906781030918817]
+      hull_vertices_m:
+        - [0.026538383574084515, 0.02214505177142248, -0.005502027961982781]
+        - [0.02657621189760374, -0.023037107586686072, -0.004948068534273627]
+        - [0.02602745280981792, 0.00021732796009342505, -0.015429115369104737]
+        - [-0.025238734432457256, -0.030389194287256956, 0.05069447644381101]
+        - [0.019353646281344457, -0.02913043453671187, 0.04929662732402971]
+        - [0.008427661611438852, -0.0037933716928853847, 0.07082086465106362]
+        - [0.02724159920211942, 0.029430245150944466, 0.007214215197338056]
+        - [0.027757555457892803, 0.030592776096840364, 0.01720017367508836]
+        - [0.006883001313862752, -0.030848944428747225, -0.06662087453734442]
+        - [0.011079784640051821, -0.031143592876083096, -0.06398808956913452]
+        - [0.017418397488679693, -0.04385414580963837, 0.013159227857528648]
+        - [-0.001196521301552693, -0.031240380191996132, -0.06567721916761243]
+        - [-0.027173886579766125, -0.0437420546042921, 0.013661871851531907]
+        - [-0.02671624686171937, -0.04385344167391163, 0.023511260784870376]
+        - [-0.028547577487825965, -0.033412978325549125, -0.009563363347180921]
+        - [-0.02909120191602148, -0.02155692995696378, -0.01967406454146168]
+        - [-0.0068232688737697895, -0.02995513837490581, -0.06458518359530006]
+        - [0.010717007049514274, -0.009062172471932214, -0.06869436436133157]
+        - [0.009032165633596335, 0.008715963590424826, -0.0698501335576993]
+        - [0.0112717565847607, 0.013944372441939747, -0.06792136122252612]
+        - [0.02900419365630207, 0.019133570324651343, 0.04027597918815816]
+        - [0.028338378696470143, 0.028265625892851694, 0.02796901499003969]
+        - [0.012606750978774986, -0.029682507115985263, -0.06350314267377957]
+        - [0.02751603975696459, -0.030431130466496637, 0.011799557128469085]
+        - [0.028087037907904133, -0.029735805867541584, 0.02311068819663536]
+        - [0.01797020237084751, -0.04354810671905931, 0.021769409316045703]
+        - [0.011171973595897342, -0.02877642848101391, -0.06619900080694016]
+        - [0.01059294176085363, -0.03025712637933268, -0.0658825717483315]
+        - [0.012250681587978448, -0.004580278010768901, -0.0669208363097439]
+        - [0.012680496410090208, 0.02985677610724826, -0.06314614987432415]
+        - [-0.028584563907999534, 0.03305615544522489, -0.010008187676081658]
+        - [-0.006815812554508299, 0.029964807402770875, -0.0646069705503536]
+        - [-0.029142715579969752, 0.01999496031249102, -0.02048490750412715]
+        - [0.008532112058466516, 0.003726269247765296, 0.07092990492339842]
+        - [-0.024627411825834167, -0.001537712030891697, 0.06276844051908648]
+        - [0.012881308443794297, -0.0021290845683723317, 0.07049544846906608]
+        - [0.013525692453814511, -2.2484719852626685e-05, 0.07042847319808193]
+        - [0.019921850096601044, -0.02195586024702778, 0.0542440654464275]
+        - [-0.02490998887051619, -0.021627907567975065, 0.057145665059376495]
+        - [0.019307831544637877, -0.03238256463647078, 0.046011789057374325]
+        - [-0.025594070958653133, -0.03659366299206704, 0.04342220035175417]
+        - [-0.026086057490436833, -0.04127253266261064, 0.0343303208626092]
+        - [0.01875528102433882, -0.03971760431238307, 0.03502600589966823]
+        - [0.029053824847042237, -0.01769220061227007, 0.04108636434481018]
+        - [0.028574906270256117, -0.025993960349800314, 0.032200608605706775]
+        - [0.01824350096389201, -0.04226682615282982, 0.02832246273638315]
+        - [0.008902867761963059, -0.02922551123646196, -0.06762149009613208]
+        - [0.0047974126475813375, -0.016097337872164042, -0.07021924421442076]
+        - [0.009461340888625233, -0.01696878993914897, -0.06897303508353206]
+        - [0.0021600258606740775, -0.029443622492951505, -0.06838267223275693]
+        - [-0.02786300437628246, -0.040892711378850845, 0.0024070218272627835]
+        - [-0.028115459719551046, 0.03898731969117229, -0.0013469833082125065]
+        - [-0.027491197034088474, 0.042897661208319636, 0.008769857550624148]
+        - [0.017399724605968732, 0.04363867241854296, 0.01170671289568422]
+        - [-0.027099833435105098, 0.04390213988271437, 0.015614152039062931]
+        - [0.010385860246806523, 0.031268128982647664, -0.06432842066077155]
+        - [0.009227148670221313, 0.02987088859272253, -0.06711827214353525]
+        - [0.005684887918233192, 0.030663387788946343, -0.06682249447760973]
+        - [-0.02940231982523405, 2.3627492846853947e-05, -0.025162381046312188]
+        - [-0.006307368030036385, -0.018366500166113787, -0.06722888433538465]
+        - [0.019008497562381717, 0.036798573711817564, 0.040394965628075895]
+        - [0.012634712795169697, 0.0024436552951436876, 0.07051482380765159]
+        - [-0.0246461028158708, 0.009314381791829446, 0.06186266239417158]
+        - [-0.02494993764570973, 0.022854875744688884, 0.0563967251251783]
+        - [-0.024748342673610993, -0.011925178442206285, 0.06113055593452753]
+        - [0.029337828148606658, 0.0032443594649791225, 0.04646671865265756]
+        - [0.029289431033373985, -0.007421491886253231, 0.0455604240002593]
+        - [0.020664853148351234, 0.014372544411043756, 0.057187190443561915]
+        - [0.020307159536352214, -0.013247117352305238, 0.0579120355587241]
+        - [-0.0015337656845623628, -0.022584336351040735, -0.06909610740275403]
+        - [-0.0036341552422288507, -0.029573747593417896, -0.06732891703178377]
+        - [-0.004030546358824061, -0.018661743430102608, -0.06879259832393145]
+        - [-0.005400538511420508, -0.004560441641796119, -0.06890161783162874]
+        - [0.006879513493577323, 0.02029668458077005, -0.06945989437224186]
+        - [0.010097524615500146, 0.0287201277647858, -0.06713412527699472]
+        - [-0.005211180066156429, 0.029899060001034827, -0.06633363272601484]
+        - [-0.002029787905181677, 0.029255149621871833, -0.06799017073374691]
+        - [-0.0052532359262409565, 0.020731449596999147, -0.06791907975276619]
+        - [-0.006956050173915837, 0.014186775154961681, -0.06681570284699097]
+        - [-0.007157694856914196, -0.0056992016984239394, -0.06690190053494115]
+        - [0.011534736404993997, 0.029694911155289997, -0.0653020322322007]
+        - [0.017671545840862005, 0.04389350501126099, 0.01764512129788662]
+        - [-0.02561873114545051, 0.03664248546843331, 0.04337557709930535]
+        - [0.019125861629266043, 0.032783351660660674, 0.04575193473897506]
+        - [-0.02522657972031046, 0.030016492822387972, 0.05108674111020742]
+        - [0.018845724272372594, -0.03639901455152664, 0.04106036695593285]
+        - [-0.005325370129800051, -0.030947612394769765, -0.06465040834510341]
+        - [-0.004625244467323984, 0.009261913898150578, -0.06921521863524369]
+        - [-0.002194461021310719, -0.004309449899132232, -0.070442015319808]
+        - [-0.0013679186917012914, 0.010196779234277534, -0.07037369825314915]
+        - [0.007768559955502118, -0.0076798874418262655, -0.07029507032673443]
+        - [0.004549430282392181, 0.00490043407687408, -0.07088478391810914]
+        - [0.005714441917260322, 0.02947622051293942, -0.06820041354972675]
+        - [-0.004057590547864461, 0.031429918382494974, -0.06395623110997635]
+        - [-0.02666448686586868, 0.04385198952249572, 0.023741545609922057]
+        - [0.01791768124896505, 0.043177558093953974, 0.025002172976964332]
+        - [-0.026122465326392796, 0.04139086012253267, 0.03406629468225507]
+        - [0.019623116512238144, 0.02599897904553359, 0.05175353368125742]
+        - [0.00208744915640361, 0.029093524455154864, -0.06851595270965823]
+        - [0.018651613186810898, 0.04091022168251727, 0.03221757716051909]
+        - [-0.0010247022962089956, 0.030565431446065605, -0.06679564570204008]
+        - [-0.005795797414512747, -0.029179318680825364, -0.066137871470701]
+      hull_overhang_m: 8.9e-05
+
+# GENERATED by `openral collision lower` (source: srdf) — do not hand-edit.
+allowed_collision_pairs:
+  - [panda_link1, panda_link2]
+  - [panda_link1, panda_link3]
+  - [panda_link1, panda_link4]
+  - [panda_link2, panda_link3]
+  - [panda_link2, panda_link4]
+  - [panda_link2, panda_link6]
+  - [panda_link3, panda_link4]
+  - [panda_link3, panda_link5]
+  - [panda_link3, panda_link6]
+  - [panda_link3, panda_link7]
+  - [panda_link4, panda_link5]
+  - [panda_link4, panda_link6]
+  - [panda_link4, panda_link7]
+  - [panda_link5, panda_link6]
+  - [panda_link6, panda_link7]
+
+# No real-HW HAL adapter (yet) -- robosuite owns the physics.
+sdk_kind: "open"
+# Explicit sim/real HAL entrypoints (resolved by openral_hal.build_hal).
+# No `sim:` block (the in-process PandaMobileHAL twin owns its own MuJoCo model),
+# so sim is named explicitly rather than derived. Real path: Stage 3 of the
+# Nav2 generic mobile-base properties rollout.
+hal:
+  sim: "openral_hal.panda_mobile:PandaMobileHAL"
+  real: null
+schema_version: '0.1'

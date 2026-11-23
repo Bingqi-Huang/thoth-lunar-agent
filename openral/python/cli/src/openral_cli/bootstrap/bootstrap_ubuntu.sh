@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Ubuntu 22.04 (Humble) or 24.04 (Jazzy) bootstrap.
+# Usage: `openral install ros` (works from a curl-bash install — no clone),
+#        or `just bootstrap` from a workspace checkout.
+#
+# This lives inside the openral-cli package rather than scripts/ so it ships
+# in the wheel: the Tier-0 installer never clones the repo.
+
+if [[ ! -f /etc/os-release ]] || ! grep -qiE 'ubuntu' /etc/os-release; then
+  echo "This script is for Ubuntu only." >&2
+  exit 1
+fi
+
+VERSION_ID=$(. /etc/os-release && echo "${VERSION_ID}")
+case "${VERSION_ID}" in
+  22.04) ROS_DISTRO="humble" ;;
+  24.04) ROS_DISTRO="jazzy"  ;;
+  *) echo "Unsupported Ubuntu ${VERSION_ID}"; exit 1 ;;
+esac
+echo "==> ROS 2 distro: ${ROS_DISTRO}"
+
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake ninja-build git curl jq \
+  python3-dev python3-pip python3-venv \
+  clang clang-format clang-tidy cppcheck \
+  libusb-1.0-0-dev libudev-dev udev usbutils \
+  software-properties-common locales
+
+# python3.12-dev — required by the workspace Python pin (pyproject.toml
+# requires-python = ">=3.12,<3.13") for any sdist that needs pyconfig.h.
+# Triggered most often by `uv sync --group maniskill3`, which pulls
+# mplib → toppra, both of which compile against the Python headers.
+# Ships in 24.04 (jazzy) main; on 22.04 (humble) it comes from the
+# deadsnakes PPA. We make this best-effort so older hosts that
+# already have a 3.12 from another source don't fail bootstrap.
+sudo apt-get install -y python3.12-dev || \
+  echo "(python3.12-dev not in apt — add the deadsnakes PPA: " \
+       "sudo add-apt-repository ppa:deadsnakes/ppa && " \
+       "sudo apt-get install python3.12-dev)"
+
+sudo locale-gen en_US.UTF-8 || true
+
+# ROS 2 apt repository
+sudo add-apt-repository -y universe
+sudo apt-get install -y curl gnupg lsb-release
+
+# Only add our own source entry when the host has none.
+#
+# Recent Ubuntu/ROS images ship the official `ros2-apt-source` .deb, which
+# installs /etc/apt/sources.list.d/ros2.sources — deb822 format, carrying the
+# signing key INLINE under `Signed-By:`. Writing our legacy one-line ros2.list
+# on top of that leaves apt with two entries for the same repo+suite whose
+# Signed-By values disagree, and apt then refuses to read ANY source list:
+#
+#   E: Conflicting values set for option Signed-By regarding source
+#      http://packages.ros.org/ros2/ubuntu/ noble:
+#      /usr/share/keyrings/ros-archive-keyring.gpg != -----BEGIN PGP ...
+#   E: The list of sources could not be read.
+#
+# That is not a soft failure — every subsequent apt command on the machine
+# breaks, including the rest of this script, and the user is left with an
+# unusable package manager until they delete one of the two entries by hand.
+# So detect first and leave a working configuration alone.
+#
+# `grep -R` (not `-r`): ros2.sources is typically a SYMLINK into
+# /usr/share/ros-apt-source/, and `-r` does not follow symlinks found during
+# directory recursion — it would miss the very file we are checking for.
+if grep -Rqs 'packages\.ros\.org/ros2' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+  echo "==> ROS 2 apt source already configured — leaving it as-is."
+  echo "    (a second entry with a different signed-by= would break every apt"
+  echo "     command with 'Conflicting values set for option Signed-By')"
+else
+  sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+    -o /usr/share/keyrings/ros-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
+    | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
+fi
+sudo apt-get update
+sudo apt-get install -y "ros-${ROS_DISTRO}-ros-base" python3-colcon-common-extensions \
+  "ros-${ROS_DISTRO}-rmw-cyclonedds-cpp" || true
+sudo apt-get install -y "ros-${ROS_DISTRO}-rmw-zenoh-cpp" || \
+  echo "(rmw_zenoh may not be in the apt repo for this distro yet — install from source if needed)"
+
+# wrapped-ROS rSkills + the reasoner-managed mobile-base demo
+# need these upstream packages. Mirror the Dockerfile.dev / Dockerfile.x86
+# install lists (commit d814f4a) so a fresh-machine `just quickstart`
+# produces the same graph as the container images:
+#
+#   * moveit                              — openral/rskill-moveit-multi-joints-none
+#   * moveit-msgs                         — IDL for the MoveGroup action
+#   * moveit-resources-panda-moveit-config — tests/integration/test_moveit_*
+#   * nav2-bringup + nav2-msgs            — openral/rskill-nav2-mobile_base-navigate_to_pose-none
+#   * slam-toolbox                        — reasoner-managed lifecycle peer
+#   * control-msgs                        — control_msgs/GripperCommand (ALOHA HIL gripper transport)
+#   * nav-msgs                            — Odometry/OccupancyGrid (panda_mobile HAL + slam bridge)
+#   * octomap + octomap-msgs + octomap-server + tf2-geometry-msgs
+#                                         — openral_octomap_bridge (octree →
+#                                           OccupancyVoxels feeding the C++
+#                                           safety kernel's voxel check)
+#   * foxglove-bridge + image-transport + compressed-image-transport +
+#     joint-state-publisher               — exec_depends of
+#                                           openral_foxglove_bringup (the
+#                                           dashboard); the package builds
+#                                           without them and then dies at
+#                                           launch on a missing executable
+#
+# `|| true` because some of these may not be in the apt repo for every
+# combination of (Ubuntu, ROS distro); the missing ones surface as
+# rSkill resolution errors at runtime rather than a hard bootstrap
+# failure on hosts that don't need them.
+sudo apt-get install -y \
+  "ros-${ROS_DISTRO}-moveit" \
+  "ros-${ROS_DISTRO}-moveit-msgs" \
+  "ros-${ROS_DISTRO}-moveit-resources-panda-moveit-config" \
+  "ros-${ROS_DISTRO}-nav2-bringup" \
+  "ros-${ROS_DISTRO}-nav2-msgs" \
+  "ros-${ROS_DISTRO}-slam-toolbox" \
+  "ros-${ROS_DISTRO}-control-msgs" \
+  "ros-${ROS_DISTRO}-nav-msgs" \
+  "ros-${ROS_DISTRO}-octomap" \
+  "ros-${ROS_DISTRO}-octomap-msgs" \
+  "ros-${ROS_DISTRO}-octomap-server" \
+  "ros-${ROS_DISTRO}-tf2-geometry-msgs" \
+  "ros-${ROS_DISTRO}-foxglove-bridge" \
+  "ros-${ROS_DISTRO}-image-transport" \
+  "ros-${ROS_DISTRO}-compressed-image-transport" \
+  "ros-${ROS_DISTRO}-joint-state-publisher" || \
+  echo "(one or more wrapped-ROS rSkill apt deps unavailable on this distro — " \
+       "rSkills that need them will surface a typed runtime error)"
+
+# NVIDIA Isaac ROS cuMotion: a CUDA-accelerated MoveIt planning
+# pipeline. Selected per-request via MotionPlanRequest.pipeline_id only when the
+# host clears the GPU floor (RobotCapabilities.supports_cumotion: Ampere+, CUDA
+# >= 13, ~8 GB); on CPU/low-VRAM hosts MoveIt keeps OMPL. So we install it only
+# when a discrete NVIDIA GPU is present AND the distro is jazzy (cuMotion targets
+# Ubuntu 24.04). The apt packages live in NVIDIA's Isaac ROS apt repo — if that
+# repo isn't configured the install is skipped with a pointer, never a hard fail.
+# Isaac ROS 4.4+ cuMotion is a self-contained C++/CUDA package (ships a native
+# libcumotion.so.1 + uses the CUDA 13 runtime); there is NO Python cuRobo to
+# install and no uv/pip group — the apt packages are the whole planner. Verified
+# 2026-06-22 on an RTX 4070 (Ada): the planner node loads + solves a joint plan.
+if command -v nvidia-smi >/dev/null 2>&1 && [[ "${ROS_DISTRO}" == "jazzy" ]]; then
+  echo "==> NVIDIA GPU detected — installing Isaac ROS cuMotion ."
+  sudo apt-get install -y \
+    "ros-${ROS_DISTRO}-isaac-ros-cumotion-moveit" \
+    "ros-${ROS_DISTRO}-isaac-ros-cumotion-robot-description" || \
+    echo "(cuMotion apt packages unavailable — add the NVIDIA Isaac ROS apt repo: " \
+         "https://nvidia-isaac-ros.github.io/getting_started/isaac_apt_repository.html ; " \
+         "MoveIt falls back to OMPL until cuMotion is installed)"
+else
+  echo "(no NVIDIA GPU or non-jazzy distro — skipping Isaac ROS cuMotion; MoveIt uses OMPL)"
+fi
+
+# uv
+if ! command -v uv >/dev/null 2>&1; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+fi
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> "${HOME}/.bashrc"
+
+# just
+if ! command -v just >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh \
+    | sudo bash -s -- --to /usr/local/bin
+fi
+
+echo ""
+echo "==> System bootstrap complete."
+echo "==> Source ROS 2 with: source /opt/ros/${ROS_DISTRO}/setup.bash"

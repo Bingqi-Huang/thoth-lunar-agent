@@ -1,0 +1,228 @@
+# Connecting Ridge Outpost layout.
+# Frame: metres, +x east, +y north, rover dock at the origin. Heights come from the terrain.
+
+dem:
+  file: raw/terrain/lola_site01_connecting_ridge/Site01_final_adj_5mpp_surf.tif
+  pixel_m: 5.0
+  center_px: [1950, 1970]  # [row, col] on the ridge crest, core slope ~2.5 deg (chosen from the slope map)
+
+terrain:
+  near_size_m: 200.0       # collision + lidar terrain, centred on the dock (≥26 m beyond the landing pad)
+  near_res_m: 0.4
+  mid_size_m: 600.0        # visual ring with the same noise + craters, so no detail seam at the near border
+  mid_res_m: 2.0
+  mid_fade_m: 150.0        # noise + small craters thin out toward the mid border
+  far_size_m: 6000.0       # visual horizon only
+  far_res_m: 20.0
+  seed: 7
+  noise:                   # [wavelength_m, amplitude_m]
+    - [12.0, 0.18]
+    - [4.0, 0.07]
+    - [1.2, 0.025]
+  craters:
+    density_per_m2: 0.0102 # same areal density as the original 260 craters on the 160 m site
+    radius_m: [0.4, 20.0]  # power-law distributed, over the mid field
+    large_radius_max_m: 120.0  # the same law continued above 20 m, over the whole far field
+    depth_ratio: 0.16
+    keep_out_m: 4.0        # no craters this close to pads/roads
+  pad_blend_m: 4.0
+  cut_blend_m: 8.0         # berm of the landing-pad / access-road cut into the rising ground
+  platform_blend_m: 10.0   # berm between the graded core platform and natural terrain
+  platform_noise:          # graded regolith between pads: centimetre-scale only
+    - [3.0, 0.012]
+  rocks: {near: 340, mid: 900}  # OmniLRS rocks, visual only
+  road_width_m: 3.5
+  road_blend_m: 2.0
+
+albedo:  # near + mid albedo bakes (scene/bake_albedo.py); normal/roughness stay on the plain tile
+  tile_m: 4.0
+  tile_px: 163             # 8150 px over 200 m → 2.45 cm/px
+  mid_px: 8192             # 600 m mid ring → 7.3 cm/px
+  overlay_tile_m: 13.0
+  overlay_rotation_deg: 31.0
+  overlay_strength: 0.45
+  macro_tone: [0.035, 0.018]
+  road_factor: 0.8
+  track_half_width_m: 0.427  # LunarBot wheel y offset
+  track_factor: 0.86
+  pad_factor: 0.88          # graded work pads
+  sintered_factor: 0.66     # sintered dock and landing pads
+  marking_factor: 1.55
+
+sun:  # fixed for review renders and the SRB scenery; low polar sun from the SSW
+  elevation_deg: 12.0
+  azimuth_deg: 200.0       # compass bearing the light comes from (0 = +y north, 90 = +x east)
+
+pads:  # work sites, exactly flat; all but the landing pad share the core platform level
+  dock:     {center: [0, 0],     size: [10, 10], sintered: true}
+  habitat:  {center: [0, 25],    size: [36, 14]}
+  power:    {center: [24, 5],    size: [32, 30]}
+  comm:     {center: [-24, 21],  size: [18, 18]}
+  depot:    {center: [9, -15],   size: [16, 12]}   # between the dock and the power field: Mission B source
+  isru:     {center: [-25, -8],  size: [22, 22]}
+  ship:     {center: [-46, 56], radius: 18, sintered: true}  # NW: the 50 m ship's shadow falls away; cut to platform level
+
+# Static scene variants (build_scene.py --variant <name>): extra structures, baked into the lidar mesh.
+variants:
+  # A parked crew rover across the west leg of the depot loop (dock -> depot): Nav2 has to route around it
+  # or take the east leg round the charging station (route-block check).
+  route_block:
+    assets:
+      route_blocker_rover: {usd: vehicles/mmsev_crew_rover, pos: [5.0, -2.25], yaw_deg: -75, zone: Z4}  # long side across the road
+
+roads:  # drivable network (checked against asset footprints by build_scene.py); graded + compacted
+  main_east: [[-4, 1.5], [30, 1.5]]          # dock -> power-field aisle between the PDUs and the PV racks
+  main_west: [[-4, 1.5], [-22, 1.5]]         # dock -> ISRU yard
+  north: [[-4, 1.5], [-4, 20.5]]             # dock -> habitat front
+  habitat_front: [[-12, 20.5], [12, 20.5]]
+  comm: [[-4, 12], [-20, 12]]                # -> comm station
+  depot_loop: [[4, 1.5], [6, -6], [10, -11.8], [2, -11], [-4, -6], [-4, 1.5]]  # two ways round the charging station
+  ship_access: [[-12, 20.5], [-19, 22], [-40, 41]]
+  east_spur: [[30, 1.5], [33.5, 1.5], [33.5, 13]]  # -> battery storage unit
+  isru_road: [[-22, 1.5], [-21.5, -6.5], [-33, -6.5]]  # round to the ISRU plant's service side (south)
+
+assets:  # name: {usd: <category>/<name>, pos: [x, y], yaw_deg, zone}
+  rover_charging_station: {usd: dock/rover_charging_station, pos: [0, -3.5], yaw_deg: 0, zone: Z0}
+
+  habitat_row:            {usd: habitat/mars_one_habitat_row, pos: [0, 26], yaw_deg: 0, zone: Z1}
+  habitat_light_tower:    {usd: isru/light_tower, pos: [18, 17], yaw_deg: -30, zone: Z1}
+  exomars_parked:         {usd: vehicles/exomars_rover, pos: [7, 16], yaw_deg: 20, zone: Z1}
+
+  pdu_1:                  {usd: power/electrical_distribution_cabinet, pos: [12, 5], yaw_deg: -90, zone: Z2}
+  pdu_2:                  {usd: power/electrical_distribution_cabinet, pos: [18.5, 5], yaw_deg: -90, zone: Z2}
+  pdu_3:                  {usd: power/electrical_distribution_cabinet, pos: [25, 5], yaw_deg: -90, zone: Z2}
+  pv_tracker_1:           {usd: power/pv_tracker_tall, pos: [14, 14], yaw_deg: 0, zone: Z2}
+  pv_tracker_2:           {usd: power/pv_tracker_tall, pos: [22, 14], yaw_deg: 0, zone: Z2}
+  pv_tracker_3:           {usd: power/pv_tracker_tall, pos: [30, 14], yaw_deg: 0, zone: Z2}
+  pv_rack_1:              {usd: power/pv_rack_fixed, pos: [14, -3], yaw_deg: 0, zone: Z2}
+  pv_rack_2:              {usd: power/pv_rack_fixed, pos: [21, -3], yaw_deg: 0, zone: Z2}
+  ring_main_unit:         {usd: power/ring_main_unit_10kv, pos: [34, -7], yaw_deg: 0, zone: Z2}
+  bess:                   {usd: power/battery_storage_container, pos: [38, 13], yaw_deg: 180, zone: Z2}  # front (service side) faces west
+
+  comm_dish:              {usd: comms/industrial_antenna, pos: [-27.5, 21.5], yaw_deg: 30, zone: Z3}
+  comm_radome:            {usd: comms/radome, pos: [-18.5, 27.5], yaw_deg: 0, zone: Z3}
+  comm_relay_antennas:    {usd: comms/bts_antennas, pos: [-24, 12], yaw_deg: 0, zone: Z3}
+
+  cargo_carrier:          {usd: logistics/sli_cargo_carrier, pos: [10, -14], yaw_deg: 0, zone: Z4}
+  crew_rover_parked:      {usd: vehicles/mmsev_crew_rover, pos: [3, -18], yaw_deg: 30, zone: Z4}
+  starship_hls:           {usd: landers/starship_hls, pos: [-46, 56], yaw_deg: 0, zone: Z4}
+
+  isru_tank_skid:         {usd: isru/chemical_tank_skid, pos: [-28, -2], yaw_deg: -90, zone: Z5}  # service side faces south, into the sun
+  isru_rassor:            {usd: isru/rassor_excavator, pos: [-20, -12], yaw_deg: 40, zone: Z5}
+  isru_cable_reels:       {usd: isru/cable_reels, pos: [-30, -14], yaw_deg: 0, zone: Z5}
+
+# ---- interaction layer (scene/interaction.py) --------------------------------------------
+# Authored props (process/author_props.py). `attach` mounts a prop on an asset: `local` = [x, y, z] in the
+# asset frame ("front" = its front face), prop +X out of the face. PDUs: the reset panel and the spares
+# shelf sit >= 1.05 m apart so the robot's hull clears the shelf while pressing the button.
+props:
+  pdu_1_panel: {usd: props/pdu_service_panel, attach: pdu_1, local: [front, -1.3, 0]}
+  pdu_1_shelf: {usd: props/pdu_service_shelf, attach: pdu_1, local: [front, -0.25, 0]}
+  pdu_2_panel: {usd: props/pdu_service_panel, attach: pdu_2, local: [front, -1.3, 0]}
+  pdu_2_shelf: {usd: props/pdu_service_shelf, attach: pdu_2, local: [front, -0.25, 0]}
+  pdu_3_panel: {usd: props/pdu_service_panel, attach: pdu_3, local: [front, -1.3, 0]}
+  pdu_3_shelf: {usd: props/pdu_service_shelf, attach: pdu_3, local: [front, -0.25, 0]}
+  # each unit's ORU bay and radiator, >= 1.05 m from the neighbouring work point
+  pdu_1_bay: {usd: props/pdu_oru_bay, attach: pdu_1, local: [front, 0.85, 0]}
+  pdu_2_bay: {usd: props/pdu_oru_bay, attach: pdu_2, local: [front, 0.85, 0]}
+  pdu_3_bay: {usd: props/pdu_oru_bay, attach: pdu_3, local: [front, 0.85, 0]}
+  pdu_1_radiator: {usd: props/pdu_radiator, attach: pdu_1, local: [front, 1.75, 0]}
+  pdu_2_radiator: {usd: props/pdu_radiator, attach: pdu_2, local: [front, 1.75, 0]}
+  pdu_3_radiator: {usd: props/pdu_radiator, attach: pdu_3, local: [front, 1.75, 0]}
+  # the battery storage unit, on its open rack side: a battery-management box with its own
+  # control face, a battery-module cradle, and the unit's HVAC condenser standing in front of the container's end
+  # the enclosure is centred on its mount point: its centre sits half its depth (0.463) out from the container face (1.12),
+  # and the control face on its front
+  bess_enclosure: {usd: power/bms_enclosure, attach: bess, local: [1.35, -2.0, 0.55]}
+  bess_panel: {usd: props/bms_panel, attach: bess, local: [1.583, -2.0, 0]}
+  bess_cradle: {usd: props/battery_cradle, attach: bess, local: [front, -0.6, 0]}
+  bess_hvac: {usd: props/hvac_condenser, pos: [35.4, 11.2], yaw_deg: 180, zone: Z2}
+  bess_stand: {usd: props/receiving_stand, pos: [33.0, 17.0], yaw_deg: 0, zone: Z2}  # where a pulled module is set down
+  # the ISRU oxygen pilot plant on its tank skid: the plant controller with its control face, the dust-filter cartridge
+  # cradle, the plant's power-module cradle (the base's standard ORU), its spares stand, O2 storage bottles
+  # the controller turned so its 0.43 m depth is along the skid's normal (door face out), centred half that off the skid face
+  isru_controller: {usd: isru/plant_controller, attach: isru_tank_skid, local: [1.587, -2.0, 0], yaw_deg: 90}
+  isru_panel: {usd: props/plant_panel, attach: isru_tank_skid, local: [1.802, -2.0, 0]}
+  isru_filter: {usd: props/filter_cradle, attach: isru_tank_skid, local: [front, -0.5, 0]}
+  isru_power: {usd: props/pdu_oru_bay, attach: isru_tank_skid, local: [front, 1.0, 0]}
+  isru_stand: {usd: props/receiving_stand, pos: [-23.2, -2.6], yaw_deg: -90, zone: Z5}
+  # empty in every scenario: where a pulled cartridge is set down before the spare is fetched (L3 at the plant); across
+  # the ISRU road from the cradles, facing it, so the rover works it from the road (the nearest free support was ~41 m away)
+  isru_return_stand: {usd: props/receiving_stand, pos: [-25.5, -8.6], yaw_deg: 90, zone: Z5}
+  isru_o2_1: {usd: isru/o2_bottle, pos: [-31.8, -1.0], yaw_deg: 0, zone: Z5}
+  isru_o2_2: {usd: isru/o2_bottle, pos: [-31.8, -2.0], yaw_deg: 0, zone: Z5}
+  isru_o2_3: {usd: isru/o2_bottle, pos: [-31.8, -3.0], yaw_deg: 0, zone: Z5}
+  depot_spares_stand: {usd: props/receiving_stand, pos: [14.5, -16.0], yaw_deg: 90, zone: Z4}  # unit spares beside the returns point
+  depot_stand: {usd: props/staging_stand, pos: [5.5, -14.5], yaw_deg: 90, zone: Z4}   # Mission B source, +X faces the depot loop
+  # logistics beyond the depot: cargo offloaded at the landing pad, a delivery point at the
+  # habitat front, a returns point at the depot
+  # the offload stand stands where the landing-pad access road leaves the core platform (on the comm pad's north edge),
+  # not on the pad: in the pad's cut AMCL was 0.26-0.33 m off and a pick there missed the handle. Same
+  # relation to the road as before: box 1.88 m from the centre line, facing it, work poses on the road
+  landing_stand: {usd: props/staging_stand, pos: [-23.8, 29.3], yaw_deg: -132, zone: Z4}
+  habitat_stand: {usd: props/receiving_stand, pos: [4, 21.9], yaw_deg: -90, zone: Z1}  # habitat front, faces the road
+  return_stand: {usd: props/receiving_stand, pos: [14.5, -12.5], yaw_deg: 90, zone: Z4}  # depot returns point, faces north
+
+# Dynamic objects (SRB rigid bodies, spawned by the lunar_base task). `support` = a place frame; yaw is relative
+# to that frame's outward normal; spawn 5 mm above the support (never inside a collider).
+dynamic_objects:
+# `item` is what mission control's inventory calls it, `serial` what its label says.
+  spare_oru: {usd: power/oru_0417, support: depot_stand/slot_0, yaw_deg: 90, item: orbital replacement unit (ORU), serial: ORU-0417}
+  spare_crate: {usd: logistics/cargo_crate, support: depot_stand/slot_1, yaw_deg: 0, item: cargo crate, serial: CRT-0112}
+  oru_pdu_1: {usd: power/oru_0211, support: pdu_1_bay/tray, yaw_deg: 90, item: orbital replacement unit (ORU), serial: ORU-0211}
+  oru_pdu_2: {usd: power/oru_0233, support: pdu_2_bay/tray, yaw_deg: 90, item: orbital replacement unit (ORU), serial: ORU-0233}
+  oru_pdu_3: {usd: power/oru_0258, support: pdu_3_bay/tray, yaw_deg: 90, item: orbital replacement unit (ORU), serial: ORU-0258}
+  oru_isru: {usd: power/oru_0285, support: isru_power/tray, yaw_deg: 90, item: orbital replacement unit (ORU), serial: ORU-0285}
+  # a unit removed from service, staged at the landing pad for the next return flight: a second ORU on site that looks
+  # exactly like the spare and differs only by its serial. `status` is
+  # the record's; the module fails its unit's self-test if it is ever installed
+  oru_returned: {usd: power/oru_0272, support: landing_stand/slot_1, yaw_deg: 90, item: orbital replacement unit (ORU), serial: ORU-0272,
+                 status: "failed -- removed from service for failure analysis, awaiting return shipment"}
+  bat_bess: {usd: power/bat_0101, support: bess_cradle/tray, yaw_deg: 0, item: battery module, serial: BAT-0101}
+  bat_spare: {usd: power/bat_0102, support: depot_spares_stand/slot_0, yaw_deg: 0, item: battery module, serial: BAT-0102}
+  flt_isru: {usd: isru/flt_0201, support: isru_filter/tray, yaw_deg: 90, item: filter cartridge, serial: FLT-0201}
+  flt_spare: {usd: isru/flt_0202, support: isru_stand/slot_0, yaw_deg: 90, item: filter cartridge, serial: FLT-0202}
+  consumables_container: {usd: logistics/consumables_container, support: landing_stand/slot_0, yaw_deg: 0, item: consumables container, serial: CNS-0301}
+  return_container: {usd: logistics/return_container, support: return_stand/slot_0, yaw_deg: 0, item: return container, serial: RTN-0007}
+
+# Camera view poses (front RGB-D faces the target from distance_m): Mission A inspection.
+inspection_points:
+  pdu_1: {asset: pdu_1, local: [front, -1.3, 0.9], distance_m: 3.0}
+  pdu_2: {asset: pdu_2, local: [front, -1.3, 0.9], distance_m: 3.0}
+  pdu_3: {asset: pdu_3, local: [front, -1.3, 0.9], distance_m: 3.0}
+  pdu_1_radiator: {asset: pdu_1, local: [front, 1.75, 0.9], distance_m: 3.0}
+  pdu_2_radiator: {asset: pdu_2, local: [front, 1.75, 0.9], distance_m: 3.0}
+  pdu_3_radiator: {asset: pdu_3, local: [front, 1.75, 0.9], distance_m: 3.0}
+  bess: {asset: bess, local: [front, -1.3, 0.9], distance_m: 3.5}
+  bess_hvac: {asset: bess, local: [front, 1.8, 0.9], distance_m: 3.5}
+  # at the plant panel from 2.0 m: the front camera (fx 267 px at 640) puts the 0.068 m lamp at ~9 px there, ~5 px
+  # from 3.5 m -- too few for a green lamp on a white plate
+  isru: {asset: isru_tank_skid, local: [front, -2.0, 1.0], distance_m: 2.0}
+  pv_tracker_1: {asset: pv_tracker_1, local: [0, 0, 1.2], normal: [0, -1], distance_m: 3.5}
+  pv_tracker_2: {asset: pv_tracker_2, local: [0, 0, 1.2], normal: [0, -1], distance_m: 3.5}
+  pv_tracker_3: {asset: pv_tracker_3, local: [0, 0, 1.2], normal: [0, -1], distance_m: 3.5}
+  comm_dish: {asset: comm_dish, local: [0, 0, 1.5], normal: [1, 0], distance_m: 6.0}
+
+# Mission anchors for C3-C5 (straight-line distance from the dock centre). Kept short so one run's
+# driving stays ~1 min of sim time at the 0.57 m/s Nav2 cap; the landing pad is the single long-haul case.
+missions:
+  dock: {at: [0, 0]}
+  mission_a_service: {assets: [pdu_1, pdu_2, pdu_3], stand_off_south_m: 1.6}   # ~13 / 19 / 26 m
+  mission_b_source: {asset: cargo_carrier}          # ~17 m
+  mission_b_destination: {asset: pdu_1}             # ~19 m from the source
+  mission_b_long_haul_source: {asset: starship_hls} # ~73 m, one case only
+  routes:  # reference drives along the road network (srb_drive_check.py); robot centre line
+    dock_to_cargo_carrier: [[0, 0], [3, 1.5], [4, 1.5], [6, -6], [10, -11.8]]
+    cargo_carrier_to_pdu_1: [[10, -11.8], [6, -6], [4, 1.5], [9, 1.5], [12, 3.0]]
+    pdu_1_to_dock: [[12, 3.0], [9, 1.5], [1, 1.5], [0, 0]]
+    dock_to_landing_pad: [[0, 0], [-3, 1.5], [-4, 3], [-4, 20.5], [-12, 20.5], [-19, 22], [-40, 41], [-44, 44.5]]
+    landing_pad_to_dock: [[-44, 44.5], [-40, 41], [-19, 22], [-12, 20.5], [-4, 20.5], [-4, 3], [-3, 1.5], [0, 0]]
+
+# ---- serviced units: what each feeds, its control face, the thermal cover
+# it has (if any) and its module cradles. `srb/tasks/mobile_manipulation/lunar_base/site.py` models them all alike.
+units:
+  pdu_1: {name: PDU-1, load: habitat life support, criticality: crew-critical, panel: pdu_1_panel, cover: pdu_1_radiator, bays: [pdu_1_bay]}
+  pdu_2: {name: PDU-2, load: communication station, criticality: mission-critical, panel: pdu_2_panel, cover: pdu_2_radiator, bays: [pdu_2_bay]}
+  pdu_3: {name: PDU-3, load: science instruments, criticality: non-critical, panel: pdu_3_panel, cover: pdu_3_radiator, bays: [pdu_3_bay]}
+  bess: {name: BESS, load: base energy storage (battery charge/discharge), criticality: mission-critical, panel: bess_panel, cover: bess_hvac, bays: [bess_cradle]}
+  isru: {name: ISRU plant, load: ISRU oxygen pilot plant, criticality: non-critical, panel: isru_panel, cover: null, bays: [isru_filter, isru_power]}

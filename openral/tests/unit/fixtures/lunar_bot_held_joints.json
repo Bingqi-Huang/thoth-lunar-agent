@@ -1,0 +1,16 @@
+{
+  "source": "capability server log of a successful pick",
+  "arm": {
+    "posture": "other",
+    "joints_rad": [
+      0.626,
+      0.392,
+      -0.579,
+      -2.318,
+      0.104,
+      0.258,
+      1.276
+    ],
+    "jaw_rad": 0.169
+  }
+}

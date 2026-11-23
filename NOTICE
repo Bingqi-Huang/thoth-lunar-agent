@@ -1,0 +1,19 @@
+thoth-lunar-agent
+Copyright 2026 Bingqi Huang. Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository bundles modified copies of the following projects. Their licenses and copyright notices are kept
+in their directories; changes made for this work are described in each directory's MODIFICATIONS.md.
+
+- openral/                 OpenRAL, Apache-2.0 (OpenRAL Contributors). Upstream: https://github.com/OpenRAL/openral
+                           Based on commit 93385213 of the DsslRobot fork.
+- space_robotics_bench/    Space Robotics Bench, Apache-2.0 OR MIT (Andrej Orsula). Upstream:
+                           https://github.com/AndrejOrsula/space_robotics_bench
+                           Based on commit 94696f61 of the DsslRobot fork, with the lunar-base equipment dynamics
+                           added for this work. Includes lunar-base scene tooling.
+
+Simulation assets (not in git; see README) are built from third-party models. Each keeps its own license; the full
+list with authors and sources is space_robotics_bench/assets/lunar_base/ATTRIBUTION.md. Several are CC-BY-4.0 and one
+is CC-BY-SA-4.0, so the asset archive must be redistributed with that attribution file.
+
+External planners used by the baselines are not bundled and keep their own licenses: NASA PLEXIL and NASA EUROPA
+(see baselines/europa and baselines/plexil for build scripts and patches).

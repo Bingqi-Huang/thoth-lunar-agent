@@ -1,0 +1,95 @@
+"""openral inference runner — hardware-side counterpart to ``openral_sim``.
+
+Hosts the ``InferenceRunner`` Protocol + ``InferenceRunnerBase``
+shared between sim and hardware paths, the ``SensorReader`` Protocol,
+and the per-backend sensor readers (``openral_runner.backends``).
+
+Public surface:
+
+- ``InferenceRunner``: structural Protocol (``activate / tick / run /
+  deactivate``; ``rate_hz``).
+- ``InferenceRunnerBase``: rate-limited ``run()`` loop, ``rskill.tick`` OTel
+  parent span, ``RunResult`` aggregation, deadline-overrun policy;
+  subclasses implement ``_tick_impl``.
+- ``SensorReader``: structural Protocol (``open / close / read_latest``);
+  ``OpenCVThreadSensorReader`` is the default backend.
+- ``SafetyClient`` / ``NullSafetyClient``: pre-action safety seam called
+  before HAL dispatch; ``NullSafetyClient`` is a no-op stub pending the
+  real C++ safety kernel (CLAUDE.md §6 Layer 6).
+- ``DeployRunner``: concrete ``InferenceRunnerBase`` composing a real
+  ``HAL``, ``Skill``, ``WorldStateAggregator``, a list of
+  ``SensorReader``s, and a ``SafetyClient``.
+- ``precise_sleep`` / ``sleep_until``: cadence helpers (mirrors lerobot's
+  ``precise_sleep`` shape).
+
+Imports are PEP 562 lazy: ``import openral_runner`` no longer eagerly drags
+in torch (via ``base``); symbols still resolve via attribute access, on
+first use. Load-bearing: importing the gstreamer subpackage used to
+triple-load 582 torch modules, and the resulting ``glib`` state conflicts
+with ``rclpy.init()`` / ``Node()`` in the x86-ros Docker image (segfaults
+in the ROS-tee smoke test, PR I/8).
+"""
+
+from __future__ import annotations
+
+from importlib.metadata import version as _pkg_version
+from typing import TYPE_CHECKING, Any
+
+# Light imports — no torch, no gi, no rclpy in any of these.
+from openral_runner.clock import precise_sleep, sleep_until
+from openral_runner.protocol import InferenceRunner
+from openral_runner.sensor_reader import SensorReader
+
+if TYPE_CHECKING:
+    # Type checkers see the symbols at their true module locations.
+    from openral_runner.base import InferenceRunnerBase
+    from openral_runner.deploy_runner import DeployRunner
+    from openral_runner.factory import (
+        SENSOR_BACKEND_REGISTRY,
+        SKILL_REGISTRY,
+    )
+    from openral_runner.ros_publishing_hal import ROSPublishingHAL
+    from openral_runner.safety import NullSafetyClient, SafetyClient
+
+__all__ = [
+    "SENSOR_BACKEND_REGISTRY",
+    "SKILL_REGISTRY",
+    "DeployRunner",
+    "InferenceRunner",
+    "InferenceRunnerBase",
+    "NullSafetyClient",
+    "ROSPublishingHAL",
+    "SafetyClient",
+    "SensorReader",
+    "precise_sleep",
+    "sleep_until",
+]
+__version__ = _pkg_version("openral-runner")
+
+
+_LAZY_ATTRS: dict[str, tuple[str, str]] = {
+    "InferenceRunnerBase": ("openral_runner.base", "InferenceRunnerBase"),
+    "SENSOR_BACKEND_REGISTRY": ("openral_runner.factory", "SENSOR_BACKEND_REGISTRY"),
+    "SKILL_REGISTRY": ("openral_runner.factory", "SKILL_REGISTRY"),
+    "DeployRunner": ("openral_runner.deploy_runner", "DeployRunner"),
+    "NullSafetyClient": ("openral_runner.safety", "NullSafetyClient"),
+    "ROSPublishingHAL": (
+        "openral_runner.ros_publishing_hal",
+        "ROSPublishingHAL",
+    ),
+    "SafetyClient": ("openral_runner.safety", "SafetyClient"),
+}
+
+
+def __getattr__(name: str) -> Any:  # noqa: ANN401  # reason: PEP 562 attribute hook
+    """Resolve heavy symbols on first access (torch / glib-sensitive deferral)."""
+    target = _LAZY_ATTRS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = target
+    import importlib  # noqa: PLC0415
+
+    module = importlib.import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value

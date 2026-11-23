@@ -1,0 +1,545 @@
+// PLEXIL Release 6 interface adapter onto the common capability boundary.
+//
+// PLEXIL sees exactly the interface the agent sees, and nothing else:
+//   Command <capability>(args...)                                   -> Boolean success
+//     every Command without its own handler is a capability of contracts.yaml, its arguments positional in the
+//     contract's declared input order (e.g. Boolean Command dock_at_feature(String, Real, Real);)
+//   Command ExecuteCapability(String capability, String args_json)  -> Boolean success
+//     -> space_harness_msgs/ExecuteCapability on /space/capability/execute (one ExecuteRskill through the runner,
+//        safety kernel, HAL; the contract is checked by the server)
+//   Lookup  QueryCapability(String query, String args_json)          -> String value_json (UNKNOWN on failure)
+//     -> space_harness_msgs/QueryCapability on /space/capability/query
+//   Lookup  LastCapabilityResult()                                   -> String {capability, success, failure_kind,
+//                                                                       failure_reason, evidence}
+//   Lookup  PowerUnit(String unit, String field)                      -> String, one field of that unit in the power
+//                                                                       distribution units' telemetry (power_status),
+//                                                                       e.g. PowerUnit("pdu_2", "breaker") = "tripped";
+//                                                                       UNKNOWN when the field is null -- a typed read
+//                                                                       so a plan can branch without parsing JSON
+//   Command String RequestOperator(String question)                  -> the operator's answer
+//     -> publishes openral_msgs/PromptStamped {text: question, metadata_json: {"request_id"}} on
+//        /space/operator/request (the same topic space_runtime/agent.py and baselines/europa/host.py use), the
+//        Command stays EXECUTING (no Command Ack yet) until a matching request_id comes back on
+//        /space/operator/reply, published by experiments/operator_console/console.py; a plan escalates with this
+//        and reads the answer as a plain String -- no mission logic here about when to call it or what the answer
+//        means, that is the plan library's.
+//   Command Boolean RequestAuthorization(String question, String capability, String target, String reason)
+//                                                                    -> whether mission control granted that call
+//     -> the same topics, a request of the console's kind "authorization" carrying the one call it holds for approval
+//        (metadata_json: {"request_id", "kind": "authorization", "pending_approvals": [{capability, target, reason}]});
+//        returns whether the reply's `grants` holds that call (a denial, or a request the link only queued, is false)
+//   Lookup  MissionGoal(String field)                                -> String, one field of the launcher-supplied
+//                                                                       mission goal (env MISSION_GOAL, a JSON object,
+//                                                                       e.g. Mission B's {"item", "source", "destination"
+//                                                                       [, "serial"]}; UNKNOWN when the goal has no such
+//                                                                       field; baselines/europa/host.py reads the same
+//                                                                       variable)
+//   Lookup  ItemDescription(String item, String field)               -> String, one field of the baselines' shared item
+//                                                                       table (the file named by this adapter's
+//                                                                       ItemDescriptions attribute in interface-config.xml,
+//                                                                       baselines/item_descriptions.json), keyed by the
+//                                                                       item's equipment-catalogue name
+//   Lookup  RecordAt(String place, String field)                      -> String, one field (item, serial, status) of the
+//                                                                       inventory record's entry recorded at that place
+//                                                                       frame (the manifest query), UNKNOWN when the
+//                                                                       record puts no item there
+//   Lookup  ScanSerial()                                              -> String, the serial of the item on the support
+//                                                                       the last scan_label read: per its contract, the
+//                                                                       plate nearest the point the view was aimed at
+//                                                                       (evidence.scan.plates[*].px_from_aim); UNKNOWN
+//                                                                       when no plate was read or the last call was not
+//                                                                       a scan_label
+//   Lookup  ManifestAt(String place, String field)                  -> String, one field ("item", "serial", "status")
+//                                                                       of the manifest's inventory entry recorded at
+//                                                                       that place frame (manifest query); "" when the
+//                                                                       record lists nothing there -- a typed read like
+//                                                                       PowerUnit, so a plan can branch without parsing
+// Neither interprets what it carries: the goal is the launcher's, the table the baselines' own authored artifact.
+// No failure kind or stage is exposed as a typed Lookup (a plan branch on them is forbidden by the authoring
+// rules); LastCapabilityResult still carries the whole raw result.
+// No mission logic: no orderings, retries or recoveries -- those belong in the PLEXIL plan library (the baseline's
+// pre-engineered knowledge), never in the adapter.
+//
+
+#include <iostream>
+#include "AdapterConfiguration.hh"
+#include "AdapterExecInterface.hh"
+#include "AdapterFactory.hh"
+#include "Command.hh"
+#include "CommandHandle.hh"
+#include "CommandImpl.hh"
+#include "InterfaceAdapter.hh"
+#include "LookupReceiver.hh"
+#include "State.hh"
+#include "Value.hh"
+#include "Array.hh"
+
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <action_msgs/msg/goal_status.hpp>
+#include <openral_msgs/msg/prompt_stamped.hpp>
+#include <space_harness_msgs/action/execute_capability.hpp>
+#include <space_harness_msgs/srv/query_capability.hpp>
+#include <nlohmann/json.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <random>
+#include <string>
+#include <thread>
+
+using ExecuteCapability = space_harness_msgs::action::ExecuteCapability;
+using GetResult = ExecuteCapability::Impl::GetResultService;
+using SendGoal = ExecuteCapability::Impl::SendGoalService;
+using QueryCapability = space_harness_msgs::srv::QueryCapability;
+using PromptStamped = openral_msgs::msg::PromptStamped;
+namespace { char const *kRequestTopic = "/space/operator/request"; char const *kReplyTopic = "/space/operator/reply"; }
+
+namespace
+{
+std::string json_escape(std::string const &s);
+
+// One PLEXIL value as JSON (scalars and Real/Integer/Boolean/String arrays); empty on an unsupported/unknown value.
+std::string value_json(PLEXIL::Value const &v)
+{
+  switch (v.valueType()) {
+    case PLEXIL::BOOLEAN_TYPE: { bool b; return v.getValue(b) ? (b ? "true" : "false") : ""; }
+    case PLEXIL::INTEGER_TYPE: { PLEXIL::Integer i; return v.getValue(i) ? std::to_string(i) : ""; }
+    case PLEXIL::REAL_TYPE: {
+      PLEXIL::Real r;
+      if (!v.getValue(r)) return "";
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%.9g", r);
+      return buf;
+    }
+    case PLEXIL::STRING_TYPE: { PLEXIL::String str; return v.getValue(str) ? "\"" + json_escape(str) + "\"" : ""; }
+    case PLEXIL::BOOLEAN_ARRAY_TYPE:
+    case PLEXIL::INTEGER_ARRAY_TYPE:
+    case PLEXIL::REAL_ARRAY_TYPE:
+    case PLEXIL::STRING_ARRAY_TYPE: {
+      PLEXIL::Array const *arr;
+      if (!v.getValuePointer(arr)) return "";
+      std::string out = "[";
+      for (size_t i = 0; i < arr->size(); ++i) {
+        std::string e = value_json(arr->getElementValue(i));
+        if (e.empty()) return "";
+        out += (i ? ", " : "") + e;
+      }
+      return out + "]";
+    }
+    default:
+      return "";
+  }
+}
+
+std::string json_escape(std::string const &s)
+{
+  std::string out;
+  for (char c : s) {
+    if (c == '"' || c == '\\') out.push_back('\\');
+    out.push_back(c);
+  }
+  return out;
+}
+
+// The `"<key>": "<value>"` string field in a small flat JSON object (PromptStamped's own metadata_json here) --
+// a plain text scan, not a JSON parse. "" when the key is absent.
+std::string json_string_field(std::string const &json, std::string const &key)
+{
+  std::string const needle = "\"" + key + "\"";
+  auto pos = json.find(needle);
+  if (pos == std::string::npos) return "";
+  pos = json.find('"', pos + needle.size());  // opening quote of the value, past the key and the ':'
+  if (pos == std::string::npos) return "";
+  auto end = json.find('"', pos + 1);
+  return end == std::string::npos ? "" : json.substr(pos + 1, end - pos - 1);
+}
+}  // namespace
+
+class CapabilityAdapter : public PLEXIL::InterfaceAdapter
+{
+public:
+  CapabilityAdapter(PLEXIL::AdapterExecInterface &intf, PLEXIL::AdapterConf *conf)
+  : PLEXIL::InterfaceAdapter(intf, conf)
+  {
+  }
+
+  bool initialize(PLEXIL::AdapterConfiguration *config) override
+  {
+    if (!rclcpp::ok()) rclcpp::init(0, nullptr);
+    node_ = std::make_shared<rclcpp::Node>("plexil_capability_adapter");
+    execute_ = rclcpp_action::create_client<ExecuteCapability>(node_, "/space/capability/execute");
+    goal_ = node_->create_client<SendGoal>("/space/capability/execute/_action/send_goal");
+    result_ = node_->create_client<GetResult>("/space/capability/execute/_action/get_result");
+    query_ = node_->create_client<QueryCapability>("/space/capability/query");
+    request_pub_ = node_->create_publisher<PromptStamped>(kRequestTopic, 10);
+    reply_sub_ = node_->create_subscription<PromptStamped>(
+      kReplyTopic, 10, [this](PromptStamped::SharedPtr msg) { onOperatorReply(msg); });
+    config->registerCommandHandlerFunction(
+      "ExecuteCapability",
+      [this](PLEXIL::Command *cmd, PLEXIL::AdapterExecInterface *intf) {
+        std::vector<PLEXIL::Value> const &args = cmd->getArgValues();
+        std::string capability, args_json = "{}";
+        if (args.size() < 1 || !args[0].getValue(capability) || (args.size() > 1 && !args[1].getValue(args_json))) {
+          intf->handleCommandAck(cmd, PLEXIL::COMMAND_FAILED);
+          intf->notifyOfExternalEvent();
+          return;
+        }
+        send(cmd, intf, capability, args_json);
+      });
+    config->registerCommandHandlerFunction(
+      "RequestOperator",
+      [this](PLEXIL::Command *cmd, PLEXIL::AdapterExecInterface *intf) { requestOperator(cmd, intf); });
+    config->registerCommandHandlerFunction(
+      "RequestAuthorization",
+      [this](PLEXIL::Command *cmd, PLEXIL::AdapterExecInterface *intf) { requestAuthorization(cmd, intf); });
+    // every other Command is a capability with positional arguments (the Utility adapter's print/pprint keep theirs)
+    config->setDefaultCommandHandlerFunction(
+      [this](PLEXIL::Command *cmd, PLEXIL::AdapterExecInterface *intf) {
+        std::string args_json = "[";
+        std::vector<PLEXIL::Value> const &args = cmd->getArgValues();
+        for (size_t i = 0; i < args.size(); ++i) {
+          std::string e = value_json(args[i]);
+          if (e.empty()) {
+            intf->handleCommandAck(cmd, PLEXIL::COMMAND_FAILED);
+            intf->notifyOfExternalEvent();
+            return;
+          }
+          args_json += (i ? ", " : "") + e;
+        }
+        send(cmd, intf, cmd->getName(), args_json + "]");
+      });
+    config->registerLookupHandlerFunction(
+      "PowerUnit",
+      [this](PLEXIL::State const &state, PLEXIL::LookupReceiver *rcvr) {
+        std::string unit, field, value;
+        if (state.parameters().size() != 2 || !state.parameter(0).getValue(unit) || !state.parameter(1).getValue(field) ||
+            !query("power_status", "{}", value)) { rcvr->setUnknown(); return; }
+        auto const v = nlohmann::json::parse(value)["units"][unit][field];
+        if (v.is_null()) rcvr->setUnknown();
+        else rcvr->update(v.is_string() ? v.get<std::string>() : v.dump());
+      });
+    config->registerLookupHandlerFunction(
+      "QueryCapability",
+      [this](PLEXIL::State const &state, PLEXIL::LookupReceiver *rcvr) { queryCapability(state, rcvr); });
+    config->registerLookupHandlerFunction(
+      "LastCapabilityResult",
+      [this](PLEXIL::State const &, PLEXIL::LookupReceiver *rcvr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        rcvr->update(last_result_);
+      });
+    config->registerLookupHandlerFunction(
+      "MissionGoal",
+      [](PLEXIL::State const &state, PLEXIL::LookupReceiver *rcvr) {
+        std::string field;
+        state.parameter(0).getValue(field);
+        auto const goal = nlohmann::json::parse(std::getenv("MISSION_GOAL"));
+        if (goal.contains(field)) rcvr->update(goal[field].get<std::string>()); else rcvr->setUnknown();
+      });
+    config->registerLookupHandlerFunction(
+      "RecordAt",
+      [this](PLEXIL::State const &state, PLEXIL::LookupReceiver *rcvr) {
+        std::string place, field, value;
+        state.parameter(0).getValue(place);
+        state.parameter(1).getValue(field);
+        if (!query("manifest", "{}", value)) { rcvr->setUnknown(); return; }
+        auto const record = nlohmann::json::parse(value);
+        for (auto const &e : record["inventory"])
+          if (e["recorded_location"] == place) { rcvr->update(e[field].get<std::string>()); return; }
+        rcvr->setUnknown();
+      });
+    config->registerLookupHandlerFunction(
+      "ScanSerial",
+      [this](PLEXIL::State const &, PLEXIL::LookupReceiver *rcvr) {
+        nlohmann::json r;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          r = nlohmann::json::parse(last_result_);
+        }
+        nlohmann::json const *nearest = nullptr;
+        if (r.value("capability", "") == "scan_label")
+          for (auto const &p : r["evidence"]["scan"]["plates"])
+            if (!nearest || p["px_from_aim"].get<double>() < (*nearest)["px_from_aim"].get<double>()) nearest = &p;
+        if (nearest) rcvr->update((*nearest)["serial"].get<std::string>()); else rcvr->setUnknown();
+      });
+    config->registerLookupHandlerFunction(
+      "ItemDescription",
+      [this](PLEXIL::State const &state, PLEXIL::LookupReceiver *rcvr) {
+        std::string item, field;
+        state.parameter(0).getValue(item);
+        state.parameter(1).getValue(field);
+        std::ifstream table(getXml().attribute("ItemDescriptions").value());
+        rcvr->update(nlohmann::json::parse(table)[item][field].get<std::string>());
+      });
+    config->registerLookupHandlerFunction(
+      "ManifestAt",
+      [this](PLEXIL::State const &state, PLEXIL::LookupReceiver *rcvr) {
+        std::string place, field, value, found;
+        state.parameter(0).getValue(place);
+        state.parameter(1).getValue(field);
+        if (!query("manifest", "{}", value)) { rcvr->setUnknown(); return; }
+        auto const manifest = nlohmann::json::parse(value);  // kept: a range-for over a temporary's member dangles
+        for (auto const &entry : manifest["inventory"])
+          if (entry["recorded_location"] == place) found = entry[field].get<std::string>();
+        rcvr->update(found);
+      });
+    return true;
+  }
+
+  bool start() override
+  {
+    executor_ = std::make_unique<rclcpp::executors::MultiThreadedExecutor>();
+    executor_->add_node(node_);
+    spinner_ = std::thread([this] { executor_->spin(); });
+    // the boundary must be discovered before the first plan call, or requests go nowhere
+    return execute_->wait_for_action_server(std::chrono::seconds(30)) &&
+           query_->wait_for_service(std::chrono::seconds(30));
+  }
+
+  void stop() override
+  {
+    executor_->cancel();
+    if (spinner_.joinable()) spinner_.join();
+    rclcpp::shutdown();
+  }
+
+private:
+  void send(PLEXIL::Command *cmd, PLEXIL::AdapterExecInterface *intf, std::string const &capability,
+            std::string const &args_json)
+  {
+    ExecuteCapability::Goal goal;
+    goal.capability = capability;
+    goal.args_json = args_json;
+    // The plan node <-> capability call join key: the id of the Command node that issued this call, the same
+    // id the executive's own Node:transition trace prints on this stream (plexil_node_trace.log). Command's public
+    // interface has no node; the executive's CommandImpl carries it as its command handle variable's name
+    // (xml-parser/parseNode.cc: new CommandImpl(node->getNodeId(), ...)).
+    std::cout << "[CapabilityAdapter] COMMAND " << static_cast<PLEXIL::CommandImpl *>(cmd)->getAck()->getName() << " "
+              << capability << " " << args_json << std::endl;
+    // Only ack a genuine rejection here. PLEXIL's own actionComplete gate (CommandHandleKnown, src/intfc/CommandImpl.cc)
+    // is satisfied by ANY known command_handle, terminal or not -- acking COMMAND_SENT_TO_SYSTEM the instant the ROS
+    // goal is merely *accepted* (a handshake, not the robot moving) would make the executive treat every command as
+    // already finished while the real capability calls are still running. The command stays EXECUTING, with no ack
+    // and no known handle, until the terminal ack below actually arrives.
+    //
+    // The call is made on the action's own two services, with a goal id this adapter chose, not through
+    // rclcpp_action's client: a response the boundary sends before its writer has matched this client is dropped
+    // ("failed to send response (timeout)" in the boundary's log), and a client knowing no goal id would wait for ever.
+    // Knowing the id, the adapter
+    // asks for the result every kPollS until one answer comes: the boundary holds a request for a running goal and
+    // answers it at the end, answers a finished one at once (it keeps results 15 min), and answers an id it never
+    // received with STATUS_UNKNOWN -- then the goal request itself was lost and is sent again, same id (a goal already
+    // tracked under that id is refused, not run twice).
+    struct Call {
+      std::atomic<bool> delivered{false};
+      std::atomic<bool> refused{false};
+      rclcpp::TimerBase::SharedPtr poll;
+    };
+    auto call = std::make_shared<Call>();
+    auto send_goal = std::make_shared<SendGoal::Request>();
+    for (auto &b : send_goal->goal_id.uuid) b = static_cast<uint8_t>(rng_());
+    send_goal->goal = goal;
+    auto finish = [call]() {
+      if (call->delivered.exchange(true)) return false;
+      call->poll->cancel();
+      return true;
+    };
+    auto deliver = [this, cmd, intf, capability, finish](ExecuteCapability::Result const &r) {
+      if (!finish()) return;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_result_ = "{\"capability\": \"" + json_escape(capability) + "\", \"success\": " +
+                       (r.success ? "true" : "false") + ", \"failure_kind\": " + std::to_string(r.failure_kind) +
+                       ", \"failure_reason\": \"" + json_escape(r.failure_reason) + "\", \"evidence\": " +
+                       (r.evidence_json.empty() ? "{}" : r.evidence_json) + "}";
+      }
+      intf->handleCommandReturn(cmd, PLEXIL::Value(static_cast<bool>(r.success)));
+      intf->handleCommandAck(cmd, r.success ? PLEXIL::COMMAND_SUCCESS : PLEXIL::COMMAND_FAILED);
+      intf->notifyOfExternalEvent();
+    };
+    auto ask_result = [this, cmd, intf, call, send_goal, deliver, finish]() {
+      if (call->delivered.load()) return;
+      auto req = std::make_shared<GetResult::Request>();
+      req->goal_id = send_goal->goal_id;
+      result_->async_send_request(req, [this, cmd, intf, call, send_goal, deliver, finish](rclcpp::Client<GetResult>::SharedFuture f) {
+        using action_msgs::msg::GoalStatus;
+        auto const res = f.get();
+        if (res->status == GoalStatus::STATUS_SUCCEEDED || res->status == GoalStatus::STATUS_ABORTED ||
+            res->status == GoalStatus::STATUS_CANCELED) {
+          deliver(res->result);
+        } else if (res->status == GoalStatus::STATUS_UNKNOWN && call->refused.load()) {
+          if (!finish()) return;  // refused, and not tracked under this id: a genuine rejection
+          intf->handleCommandAck(cmd, PLEXIL::COMMAND_DENIED);
+          intf->notifyOfExternalEvent();
+        } else if (res->status == GoalStatus::STATUS_UNKNOWN && !call->delivered.load()) {
+          goal_->async_send_request(send_goal, [call](rclcpp::Client<SendGoal>::SharedFuture g) {
+            if (!g.get()->accepted) call->refused.store(true);
+          });
+        }
+      });
+    };
+    call->poll = node_->create_wall_timer(std::chrono::seconds(kPollS), ask_result);
+    goal_->async_send_request(send_goal, [call, ask_result](rclcpp::Client<SendGoal>::SharedFuture g) {
+      if (!g.get()->accepted) call->refused.store(true);
+      ask_result();
+    });
+  }
+
+  // RequestOperator(String question) -> String answer. No action server/goal handshake here (the console is a plain
+  // subscriber): publish the request and leave the command EXECUTING with no ack at all -- see send()'s comment on
+  // why an early COMMAND_SENT_TO_SYSTEM ack is wrong, not just superfluous -- until a reply with a matching
+  // request_id arrives and onOperatorReply() delivers the one real ack below.
+  void requestOperator(PLEXIL::Command *cmd, PLEXIL::AdapterExecInterface *intf)
+  {
+    std::vector<PLEXIL::Value> const &args = cmd->getArgValues();
+    std::string question;
+    if (args.size() < 1 || !args[0].getValue(question)) {
+      intf->handleCommandAck(cmd, PLEXIL::COMMAND_FAILED);
+      intf->notifyOfExternalEvent();
+      return;
+    }
+    std::string request_id = std::to_string(++request_seq_);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pending_operator_[request_id] = {cmd, intf};
+    }
+    PromptStamped m;
+    m.text = question;
+    m.metadata_json = "{\"request_id\": \"" + json_escape(request_id) + "\"}";
+    request_pub_->publish(m);
+  }
+
+  // RequestAuthorization(question, capability, target, reason) -> Boolean granted: the console's authorization
+  // request, the held call in its metadata; answered like RequestOperator (no ack until the reply).
+  void requestAuthorization(PLEXIL::Command *cmd, PLEXIL::AdapterExecInterface *intf)
+  {
+    std::vector<PLEXIL::Value> const &args = cmd->getArgValues();
+    std::string question, capability, target, reason;
+    args[0].getValue(question);
+    args[1].getValue(capability);
+    args[2].getValue(target);
+    args[3].getValue(reason);
+    std::string request_id = std::to_string(++request_seq_);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pending_operator_[request_id] = {cmd, intf};
+      pending_grant_[request_id] = {capability, target};
+    }
+    nlohmann::json held = {{"capability", capability}, {"target", target}, {"reason", reason}};
+    PromptStamped m;
+    m.text = question;
+    m.metadata_json = nlohmann::json{{"request_id", request_id}, {"kind", "authorization"},
+                                     {"pending_approvals", nlohmann::json::array({held})}}.dump();
+    request_pub_->publish(m);
+  }
+
+  void onOperatorReply(PromptStamped::SharedPtr msg)
+  {
+    std::string request_id = json_string_field(msg->metadata_json, "request_id");
+    PLEXIL::Command *cmd;
+    PLEXIL::AdapterExecInterface *intf;
+    std::pair<std::string, std::string> grant;  // (capability, target) of an authorization request
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = pending_operator_.find(request_id);
+      if (it == pending_operator_.end()) return;  // a reply to a report, or one already resolved
+      cmd = it->second.first;
+      intf = it->second.second;
+      pending_operator_.erase(it);
+      auto g = pending_grant_.find(request_id);
+      if (g != pending_grant_.end()) {
+        grant = g->second;
+        pending_grant_.erase(g);
+      }
+    }
+    if (grant.second.empty()) {
+      intf->handleCommandReturn(cmd, PLEXIL::Value(msg->text));
+    } else {
+      auto const meta = nlohmann::json::parse(msg->metadata_json);
+      bool granted = false;
+      for (auto const &g : meta.at("grants")) granted |= g.at("capability") == grant.first && g.at("target") == grant.second;
+      intf->handleCommandReturn(cmd, PLEXIL::Value(granted));
+    }
+    intf->handleCommandAck(cmd, PLEXIL::COMMAND_SUCCESS);
+    intf->notifyOfExternalEvent();
+  }
+
+  void queryCapability(PLEXIL::State const &state, PLEXIL::LookupReceiver *rcvr)
+  {
+    std::string q, args_json = "{}";
+    if (state.parameters().size() < 1 || !state.parameter(0).getValue(q) ||
+        (state.parameters().size() > 1 && !state.parameter(1).getValue(args_json))) {
+      rcvr->setUnknown();
+      return;
+    }
+    std::string value;
+    if (query(q, args_json, value)) rcvr->update(value); else rcvr->setUnknown();
+  }
+
+  // Humble's async_send_request returns a std::future: get() exactly once (a second get() threw inside the exec
+  // thread and stalled the plan). The wait is as long as a loaded host takes to answer: a Lookup that gives up
+  // resolves UNKNOWN, and an UNKNOWN SkipCondition runs the node -- a 5 s cap could have named a healthy unit the
+  // tripped one with six runs on one host. Past 120 s the boundary is gone.
+  // Revised L2-B task model only (BASELINE_REVISION=reauth/plexil-l2b; every other model asks once, as below):
+  // a response the boundary sends before its writer has matched this client is dropped ("failed to send response
+  // (timeout)" in its log -- the same loss send() works around for goals). A query only reads, so one not answered in kQueryWaitS is
+  // asked again, within the same 120 s.
+  bool query(std::string const &q, std::string const &args_json, std::string &value)
+  {
+    auto req = std::make_shared<QueryCapability::Request>();
+    req->query = q;
+    req->args_json = args_json;
+    if (requery_) {
+      for (int waited = 0; waited < 120; waited += kQueryWaitS) {
+        auto pending = query_->async_send_request(req);
+        if (pending.future.wait_for(std::chrono::seconds(kQueryWaitS)) == std::future_status::ready) {
+          auto response = pending.future.get();
+          value = response->value_json;
+          return response->success;
+        }
+        query_->remove_pending_request(pending);
+      }
+      return false;
+    }
+    auto pending = query_->async_send_request(req);
+    if (pending.future.wait_for(std::chrono::seconds(120)) != std::future_status::ready) return false;
+    auto response = pending.future.get();
+    value = response->value_json;
+    return response->success;
+  }
+
+  rclcpp::Node::SharedPtr node_;
+  rclcpp_action::Client<ExecuteCapability>::SharedPtr execute_;
+  rclcpp::Client<QueryCapability>::SharedPtr query_;
+  rclcpp::Client<SendGoal>::SharedPtr goal_;  // the action's own two services (send()); execute_ only finds the server
+  rclcpp::Client<GetResult>::SharedPtr result_;
+  std::random_device rng_;
+  static constexpr int kPollS = 10;
+  static constexpr int kQueryWaitS = 20;
+  bool const requery_ = [] {  // the revised L2-B model's query(); BASELINE_REVISION is the launcher's, as MISSION_GOAL
+    char const *r = std::getenv("BASELINE_REVISION");
+    return r != nullptr && std::string(r) == "reauth/plexil-l2b";
+  }();
+  rclcpp::Publisher<PromptStamped>::SharedPtr request_pub_;
+  rclcpp::Subscription<PromptStamped>::SharedPtr reply_sub_;
+  std::unique_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;  // after rclcpp::init
+  std::thread spinner_;
+  std::mutex mutex_;
+  std::string last_result_ = "{}";
+  std::atomic<int> request_seq_{0};
+  std::map<std::string, std::pair<PLEXIL::Command *, PLEXIL::AdapterExecInterface *>> pending_operator_;  // request_id -> the Command awaiting its answer
+  std::map<std::string, std::pair<std::string, std::string>> pending_grant_;  // request_id -> the held call (capability, target)
+};
+
+extern "C" {
+void initCapabilityAdapter()
+{
+  REGISTER_ADAPTER(CapabilityAdapter, "CapabilityAdapter");
+}
+}

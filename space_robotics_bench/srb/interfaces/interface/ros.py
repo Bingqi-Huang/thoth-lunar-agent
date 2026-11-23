@@ -1,0 +1,1365 @@
+try:
+    import rclpy
+except ImportError:
+    from srb.utils.ros import enable_ros2_bridge
+
+    enable_ros2_bridge()
+
+import array
+import json
+import os
+import threading
+import time
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Tuple, Type
+
+import numpy
+import rclpy
+import torch
+from builtin_interfaces.msg import Time
+from geometry_msgs.msg import Quaternion, Transform, TransformStamped, Twist, Vector3
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.publisher import Publisher
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.service import Service
+from rclpy.subscription import Subscription
+from rosgraph_msgs.msg import Clock
+from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import Imu as ImuMsg
+from sensor_msgs.msg import JointState, PointCloud2
+from sensor_msgs.msg import PointField as ROSPointField
+from std_msgs.msg import Bool as BoolMsg
+from std_msgs.msg import (
+    Float32,
+    Float32MultiArray,
+    Header,
+    MultiArrayDimension,
+    MultiArrayLayout,
+)
+from std_msgs.msg import String as StringMsg
+from std_srvs.srv import Empty as EmptySrv
+from std_srvs.srv import SetBool as SetBoolSrv
+from tf2_ros import TransformBroadcaster
+from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
+
+from srb.core.action import (
+    ActionGroup,
+    ActionTerm,
+    ActionTermCfg,
+    BinaryJointPositionAction,
+    BinaryJointVelocityAction,
+    BodyAccelerationAction,
+    DifferentialInverseKinematicsAction,
+    MulticopterBodyAccelerationAction,
+    NonHolonomicAction,
+    OperationalSpaceControllerAction,
+    WheeledDriveAction,
+)
+from srb.core.asset import Articulation, RigidObject, RigidObjectCollection
+from srb.core.manager import SimulationManager
+from srb.core.sensor import Camera, ContactSensor, Imu, RayCaster, RayCasterCamera
+from srb.utils.camera import create_pointcloud_from_depth, create_pointcloud_from_rgbd
+from srb.utils.math import subtract_frame_transforms
+
+from .base import InterfaceBase
+
+if TYPE_CHECKING:
+    from srb._typing import AnyEnv
+
+_MISSION_STATE_EVERY = 10  # control steps between env0/mission_state publications (~5 Hz at 50 Hz control)
+_PAUSE_POLL_S = 0.02  # wall seconds between two looks at the pause flag while the simulator is paused
+_PAUSE_CLOCK_EVERY_S = 0.5  # wall seconds between two re-publications of the (standing) /clock while paused
+_PAUSE_ACK_TIMEOUT_S = 60.0  # wall seconds the pause service waits for the driver loop to stop
+
+
+def _ros_bytes(buffer: numpy.ndarray) -> array.array:
+    """Pack a numpy buffer for a rosidl `uint8[]` field without the per-byte tax.
+
+    rosidl's generated `.data` setters accept two shapes: an `array.array('B')`
+    (stored as-is, one `isinstance` check) or any other sequence, which under
+    `__debug__` is validated **element by element in pure Python** — two full
+    passes of `all(isinstance(v, int) ...)` / `all(0 <= v < 256 ...)` over
+    every byte. A `bytes` object takes the slow path. For this bridge that is
+    a 640x480 RGB image (~0.9 MB), a 32FC1 depth image (~1.2 MB) and an
+    RGB pointcloud (~7 MB) per camera per tick — tens of millions of
+    Python-level iterations per publish, which is what pinned the whole
+    simulator to ~0.4 Hz with the GPU idle.
+    `array.array('B', bytes)` is a memcpy.
+    """
+    return array.array("B", buffer.tobytes())
+
+
+class RosInterface(InterfaceBase):
+    __QOS_PROFILE = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+    __QOS_PROFILE_TF = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+
+    def __init__(self, env: "AnyEnv", node: Node | None = None, *args, **kwargs):
+        self._env: "AnyEnv" = env.unwrapped  # type: ignore
+        self._num_envs = self._env.num_envs
+
+        ## Device for camera pointcloud unprojection. The env pins `sim.device` to
+        ## the CPU unless the scene has deformable objects (see
+        ## `_ensure_cuda_sim_device_for_deformable_objects`), which would otherwise
+        ## put the per-tick unprojection of every camera image on the CPU.
+        self._pointcloud_device = (
+            "cuda" if torch.cuda.is_available() else self._env.device
+        )
+
+        ## Optional per-tick timing breakdown (set `SRB_ROS_PROFILE=1`)
+        self._profile = bool(os.environ.get("SRB_ROS_PROFILE"))
+        self._profile_acc: Dict[str, float] = {}
+        self._profile_n = 0
+        self._published_stamp: Dict[str, float] = {}
+
+        ## Initialize node
+        if not node:
+            rclpy.init()
+            self._node = Node("sim", namespace="srb", start_parameter_services=False)  # type: ignore
+        else:
+            self._node = node
+
+        ## Keep track of whether a first update has been called
+        self._update_called = False
+
+        ## Initialize queue for async executing of callbacks
+        self._async_exec_queue: Dict[Callable, Dict[str, Any]] = {}
+
+        ## Initialize action buffer
+        assert self._env.action_space.shape is not None
+        self._actions = torch.zeros(
+            self._env.action_space.shape, dtype=torch.float32, device=self._env.device
+        )
+        # Binary joint commands (a gripper open/close) are states, not rates: the teleop-style cmd_vel / event
+        # callbacks below rebuild the whole action row and would reset them -- a base velocity command opened the
+        # gripper mid-carry and the payload rode on the open fingers. Commanded values are held
+        # here and re-applied over every rebuilt row.
+        self._held_actions = torch.zeros_like(self._actions)
+        self._held_mask = torch.zeros_like(self._actions, dtype=torch.bool)
+
+        ## Setup ROS interfaces
+        # Pub: Clock
+        self._clock_pub: Publisher = self._node.create_publisher(
+            msg_type=Clock,
+            topic="/clock",
+            qos_profile=self.__QOS_PROFILE,
+        )
+
+        # Pub: Reward
+        self._pub_reward: Sequence[Publisher] = tuple(
+            self._node.create_publisher(
+                Float32,
+                f"env{i}/reward",
+                qos_profile=self.__QOS_PROFILE,
+            )
+            for i in range(self._num_envs)
+        )
+        # Pub: Reward term
+        self._pub_reward_term: Dict[str, Sequence[Publisher]] = {}
+
+        # Pub: Terminated
+        self._pub_terminated: Sequence[Publisher] = tuple(
+            self._node.create_publisher(
+                BoolMsg,
+                f"env{i}/terminated",
+                qos_profile=self.__QOS_PROFILE,
+            )
+            for i in range(self._num_envs)
+        )
+        # Pub: Truncated
+        self._pub_truncated: Sequence[Publisher] = tuple(
+            self._node.create_publisher(
+                BoolMsg,
+                f"env{i}/truncated",
+                qos_profile=self.__QOS_PROFILE,
+            )
+            for i in range(self._num_envs)
+        )
+
+        # Pub: Mission verifier truth (tasks that define `mission_state()`; evaluation-side only,
+        # never a method observation). JSON on env0/mission_state, published every
+        # `_MISSION_STATE_EVERY` ticks -- the mission tasks evaluate it for env 0 only.
+        self._pub_mission_state: Publisher | None = (
+            self._node.create_publisher(StringMsg, "env0/mission_state", qos_profile=self.__QOS_PROFILE)
+            if hasattr(self._env, "mission_state")
+            else None
+        )
+
+        # Pub: equipment telemetry the site's own units broadcast (tasks that define `power_telemetry()`) -- unlike
+        # mission_state, an observation every method may use -- on the mission_state cadence; and mission control's
+        # inventory record (`inventory_record()`), latched once: a record, which can be wrong, not an observation.
+        self._pub_power_telemetry: Publisher | None = (
+            self._node.create_publisher(StringMsg, "env0/power_telemetry", qos_profile=self.__QOS_PROFILE)
+            if hasattr(self._env, "power_telemetry")
+            else None
+        )
+        # the operator's mission brief as the task defines it (`cfg.mission_brief()`), latched: the one wording every
+        # method receives, not a copy kept by each launcher
+        if hasattr(self._env.cfg, "mission_brief"):
+            self._pub_brief = self._node.create_publisher(StringMsg, "env0/mission_brief", qos_profile=QoSProfile(
+                depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+            self._pub_brief.publish(StringMsg(data=self._env.cfg.mission_brief()))
+        if hasattr(self._env, "inventory_record"):
+            self._pub_inventory = self._node.create_publisher(StringMsg, "env0/inventory_record", qos_profile=QoSProfile(
+                depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+            self._pub_inventory.publish(StringMsg(data=json.dumps(self._env.inventory_record())))
+
+        # Pub: the physical context of the body this scene is on, latched once. Gravity is not a constant of the
+        # software: the same base acceleration leans a load hanging from a gripper six times further here than on
+        # Earth, and a method that has to keep a grasp has to know which body it is standing on to work that out.
+        # Every method reads the same fact; what it costs each of them to use it is the interesting part.
+        try:
+            domain = self._env.cfg.domain
+            latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self._pub_space_context: Publisher | None = self._node.create_publisher(
+                StringMsg, "env0/space_context", qos_profile=latched)
+            self._pub_space_context.publish(StringMsg(data=json.dumps({
+                "body": domain.name.lower(),
+                "gravity_m_s2": round(float(domain.gravity_magnitude), 5),
+                "gravity_range_m_s2": [round(float(v), 5) for v in domain.gravity_range],
+                "light_intensity": round(float(domain.light_intensity), 1),
+                "source": "srb.core.domain.Domain, the body this environment is configured for",
+            })))
+        except AttributeError:  # an environment with no domain has no such context to publish
+            self._pub_space_context = None
+
+        # Srv: Reset all
+        self._srv_reset_all: Service = self._node.create_service(
+            EmptySrv, "envs/reset", self._create_cb_reset()
+        )
+        # Srv: Reset individual
+        self._srv_reset: Sequence[Service] = tuple(
+            self._node.create_service(
+                EmptySrv, f"env{i}/reset", self._create_cb_reset(i)
+            )
+            for i in range(self._num_envs)
+        )
+
+        # Sub/Pub: State snapshots for step-wise development: {"op": "save"|"restore", "path": ...}
+        # on envs/snapshot saves or restores every articulation's root and joint state, every rigid object's root state
+        # and the held action buffers, between two sim steps; envs/snapshot/done echoes the request once applied. The
+        # sim clock is not rewound.
+        self._pub_snapshot_done = self._node.create_publisher(StringMsg, "envs/snapshot/done", qos_profile=self.__QOS_PROFILE)
+        self._sub_snapshot = self._node.create_subscription(
+            StringMsg, "envs/snapshot", lambda msg: self._async_exec_queue.__setitem__(self._async_snapshot, json.loads(msg.data)),
+            qos_profile=self.__QOS_PROFILE,
+        )
+
+        # Srv: Pause. std_srvs/SetBool `envs/pause` (data=true: stop, false: continue). While paused the driver loop
+        # (`ros_agent`, via `hold_if_paused`) takes no env step: physics, /clock and every TF / sensor stamp stand still,
+        # while the executor thread keeps serving callbacks (commands are latched into the action buffer, nothing acts on
+        # them until the loop continues). The mission agent pauses the simulator while it waits for its
+        # foundation model, so mission time (sim seconds) excludes model latency and gateway queueing. The call returns
+        # once the loop has actually stopped (after the step in flight is finished and published); `message` is JSON
+        # {paused, sim_t, step} with the sim time the clock stands at. Nothing pauses unless a client calls it.
+        self._paused = False
+        self._pause_acked = threading.Event()
+        self._pause_clock_wall = 0.0
+        self._srv_pause: Service = self._node.create_service(
+            SetBoolSrv, "envs/pause", self._cb_pause, callback_group=MutuallyExclusiveCallbackGroup()
+        )
+
+        ## Pub: Transforms (all scene assets)
+        self._tf_broadcaster = TransformBroadcaster(
+            self._node, qos=self.__QOS_PROFILE_TF
+        )
+        self._tf_broadcaster_static = StaticTransformBroadcaster(
+            self._node, qos=self.__QOS_PROFILE_TF
+        )
+        self._broadcast_transforms_static()
+
+        ## Pub: Joint states (all scene articulations)
+        self._pub_joint_states: Dict[str, Sequence[Publisher]] = {
+            articulation_name: tuple(
+                self._node.create_publisher(
+                    JointState,
+                    f"env{i}/{articulation_name}/joint_states",
+                    qos_profile=self.__QOS_PROFILE,
+                )
+                for i in range(self._num_envs)
+            )
+            for articulation_name in self._env.scene._articulations.keys()
+        }
+
+        ## Pub: Sensors (all scene sensors)
+        self._setup_sensor_interfaces()
+
+        ## Spin up ROS executor
+        if not node:
+            self._executor = MultiThreadedExecutor(num_threads=2)
+            self._executor.add_node(self._node)
+            self._thread = threading.Thread(target=self._executor.spin)
+            self._thread.daemon = True
+            self._thread.start()
+
+    def __del__(self):
+        if hasattr(self, "_executor"):
+            self._executor.shutdown()
+            self._thread.join()
+            self._node.destroy_node()
+
+    @property
+    def action(self) -> torch.Tensor:
+        return self._actions
+
+    def update(
+        self,
+        observation: Dict[str, torch.Tensor],
+        reward: torch.Tensor,
+        terminated: torch.Tensor,
+        truncated: torch.Tensor,
+        info: Dict[str, Any],
+        action: torch.Tensor | None = None,
+        *args,
+        **kwargs,
+    ):
+        ## Perform delayed setup on first update
+        if not self._update_called:
+            self._update_called = True
+            # Pub: Reward term
+            if "reward_terms" in info:
+                self._pub_reward_term = {
+                    reward_term: tuple(
+                        self._node.create_publisher(
+                            Float32,
+                            f"env{i}/reward/{reward_term}",
+                            qos_profile=self.__QOS_PROFILE,
+                        )
+                        for i in range(self._num_envs)
+                    )
+                    for reward_term in info["reward_terms"]
+                }
+
+            # Pub: Actions (only if action subscription is not set up)
+            if not hasattr(self, "_sub_action_term") and action is not None:
+                self._pub_action = tuple(
+                    self._node.create_publisher(
+                        Float32MultiArray,
+                        f"env{i}/action",
+                        qos_profile=self.__QOS_PROFILE,
+                    )
+                    for i in range(self._num_envs)
+                )
+
+        ## Update clock
+        time_s = self._env.common_step_counter * self._env.step_dt
+        time_msg = Time(sec=int(time_s), nanosec=int((time_s % 1) * 1e9))
+        self._clock_pub.publish(Clock(clock=time_msg))
+
+        ## Publish per-env messages from the input
+        for i in range(self._num_envs):
+            self._pub_reward[i].publish(Float32(data=reward[i].item()))
+            for reward_term, pubs in self._pub_reward_term.items():
+                pubs[i].publish(
+                    Float32(data=info["reward_terms"][reward_term][i].item())
+                )
+            self._pub_terminated[i].publish(BoolMsg(data=terminated[i].item()))
+            self._pub_truncated[i].publish(BoolMsg(data=truncated[i].item()))
+
+        ## Publish mission verifier truth
+        if self._pub_mission_state is not None and self._env.common_step_counter % _MISSION_STATE_EVERY == 0:
+            self._pub_mission_state.publish(StringMsg(data=json.dumps(self._env.mission_state())))
+        if self._pub_power_telemetry is not None and self._env.common_step_counter % _MISSION_STATE_EVERY == 0:
+            self._pub_power_telemetry.publish(StringMsg(data=json.dumps(self._env.power_telemetry())))
+
+        ## Publish actions
+        if action is not None and hasattr(self, "_pub_action"):
+            layout = MultiArrayLayout(
+                dim=[
+                    MultiArrayDimension(
+                        label="action",
+                        size=action.shape[1],
+                        stride=4 * action.shape[1],
+                    )
+                ],
+                data_offset=0,
+            )
+            for i in range(self._num_envs):
+                self._pub_action[i].publish(
+                    Float32MultiArray(layout=layout, data=action[i].tolist())
+                )
+
+        ## Broadcast transforms (all scene assets)
+        _t0 = time.perf_counter()
+        self._broadcast_transforms(time_msg)
+        _t1 = time.perf_counter()
+
+        ## Publish joint states (all scene articulations)
+        for articulation_name, pubs in self._pub_joint_states.items():
+            articulation: Articulation = self._env.scene._articulations[
+                articulation_name
+            ]
+            for i in range(self._num_envs):
+                pubs[i].publish(
+                    JointState(
+                        header=Header(
+                            stamp=time_msg,
+                            frame_id=f"srb/env{i}/{articulation_name}",
+                        ),
+                        name=articulation.data.joint_names,
+                        position=articulation.data.joint_pos[i],
+                        velocity=articulation.data.joint_vel[i],
+                        effort=articulation.data.applied_torque[i],
+                    )
+                )
+
+        ## Publish sensor data (all scene sensors)
+        _t2 = time.perf_counter()
+        self._publish_sensor_data(time_msg)
+        _t3 = time.perf_counter()
+
+        ## Process async requests
+        for request, kwargs in self._async_exec_queue.items():
+            request(**kwargs)
+        self._async_exec_queue.clear()
+
+        if self._profile:
+            self._profile_tick(
+                tf=_t1 - _t0, joint_states=_t2 - _t1, sensors=_t3 - _t2
+            )
+
+    ## Pause ##
+
+    def _sim_time_s(self) -> float:
+        return self._env.common_step_counter * self._env.step_dt
+
+    def _cb_pause(self, request: SetBoolSrv.Request, response: SetBoolSrv.Response):
+        from srb.utils import logging
+
+        if request.data:
+            self._pause_acked.clear()
+            self._paused = True
+            response.success = self._pause_acked.wait(timeout=_PAUSE_ACK_TIMEOUT_S)
+            if not response.success:
+                self._paused = False  # the loop never stopped; leave the simulator running and let the client see the failure
+        else:
+            # the loop is stopped, so this is the sim time it continues from
+            response.success = True
+        response.message = json.dumps(
+            dict(
+                paused=bool(request.data) and response.success,
+                sim_t=self._sim_time_s(),
+                step=int(self._env.common_step_counter),
+            )
+        )
+        if not request.data:
+            self._paused = False
+            self._pause_acked.clear()
+        what = ("paused" if response.success else "PAUSE FAILED") if request.data else "resumed"
+        logging.info(f"[pause] {what}: {response.message}")
+        return response
+
+    def hold_if_paused(self) -> bool:
+        """Called by the driver loop before every env step: True while the simulator is paused, and the caller skips
+        the step. The first call that sees the pause acknowledges it to the service, i.e. the step in flight was
+        finished and published. While paused, the (standing) /clock is re-published at a low rate so that a node that
+        joins during the pause still gets a time."""
+        if not self._paused:
+            return False
+        self._pause_acked.set()
+        time.sleep(_PAUSE_POLL_S)
+        now = time.monotonic()
+        if now - self._pause_clock_wall >= _PAUSE_CLOCK_EVERY_S:
+            self._pause_clock_wall = now
+            time_s = self._sim_time_s()
+            self._clock_pub.publish(
+                Clock(clock=Time(sec=int(time_s), nanosec=int((time_s % 1) * 1e9)))
+            )
+        return True
+
+    def _profile_tick(self, **buckets_s: float):
+        """Accumulate per-tick timings and log the mean every 100 ticks."""
+        for name, dt in buckets_s.items():
+            self._profile_acc[name] = self._profile_acc.get(name, 0.0) + dt
+        self._profile_n += 1
+        if self._profile_n % 100 == 0:
+            from srb.utils import logging
+
+            n = self._profile_n
+            summary = ", ".join(
+                f"{name}={1e3 * acc / 100:.1f}ms"
+                for name, acc in self._profile_acc.items()
+            )
+            logging.info(f"[SRB_ROS_PROFILE] tick {n}: {summary}")
+            self._profile_acc.clear()
+
+    def profile_add(self, **buckets_s: float):
+        """Let the caller (the agent loop) contribute timings of its own."""
+        if self._profile:
+            for name, dt in buckets_s.items():
+                self._profile_acc[name] = self._profile_acc.get(name, 0.0) + dt
+
+    @staticmethod
+    def _has_subscribers(publishers: Sequence[Publisher]) -> bool:
+        return any(pub.get_subscription_count() > 0 for pub in publishers)
+
+    ## Action ##
+
+    def setup_action_sub(self):
+        ## Action terms
+        self._sub_action_term_all: Dict[str, Subscription] = {}
+        self._sub_action_term: Dict[str, Sequence[Subscription]] = {}
+        action_offset = 0
+        for action_key, action_term in self._env.action_manager._terms.items():
+            assert isinstance(action_term, ActionTerm)
+            assert isinstance(action_term.cfg, ActionTermCfg)
+            topic_base = (
+                f"{action_term.cfg.asset_name}/{action_key.rsplit('__', 1)[-1]}"
+            )
+            msg_type, msg_extractor = self._map_action_term(action_term)
+            action_dim = action_term.action_dim
+            # A client that commands an action term owns it from then on. `map_cmd_to_action` is the *teleoperation*
+            # mapping of one shared twist onto the whole action vector: for this robot it returns a zero mode flag and
+            # seven zeroed joint targets its own comment calls "an ignored placeholder". Holding only the Bool terms
+            # let every cmd_vel overwrite the arm: the first cmd_vel of the drive switched the arm out of
+            # joint-position mode and zeroed its targets, the arm stepped 23 deg at joint 2 and 36 deg at joint 6
+            # inside 0.22 s, and the carried ORU was thrown out of the closed jaws. Teleoperation is unaffected:
+            # it never publishes on these per-term topics, so nothing it drives is ever latched.
+            hold = True
+            assert (
+                msg_type is Float32MultiArray
+                or len(msg_extractor(msg_type())) == action_dim
+            )
+
+            self._sub_action_term_all[action_key] = self._node.create_subscription(
+                msg_type=msg_type,
+                topic=f"envs/{topic_base}",
+                callback=self._create_cb_action_any(
+                    dim=action_dim,
+                    key=action_key,
+                    extractor=msg_extractor,
+                    offset=action_offset,
+                    hold=hold,
+                ),
+                qos_profile=self.__QOS_PROFILE,
+            )
+            self._sub_action_term[action_key] = tuple(
+                self._node.create_subscription(
+                    msg_type=msg_type,
+                    topic=f"env{i}/{topic_base}",
+                    callback=self._create_cb_action_any(
+                        key=action_key,
+                        extractor=msg_extractor,
+                        dim=action_dim,
+                        offset=action_offset,
+                        env_id=i,
+                        hold=hold,
+                    ),
+                    qos_profile=self.__QOS_PROFILE,
+                )
+                for i in range(self._num_envs)
+            )
+
+            # A zero action is not "do nothing": for a term that takes position targets it is a command to go to
+            # zero, or -- for the switchable arm -- to a mode whose desired pose has never been set. Until the
+            # first skill claimed the arm it chased that for 150 s at its velocity limit, joint4 through
+            # 42 deg and joint6 through 72, while the rover stood still. A robot with nobody commanding it
+            # holds its posture, and only the term knows which of its own numbers say so.
+            if hasattr(action_term, "hold_action"):
+                hold_row = action_term.hold_action()
+                self._actions[:, action_offset:action_offset + action_dim] = hold_row
+                self._held_actions[:, action_offset:action_offset + action_dim] = hold_row
+                self._held_mask[:, action_offset:action_offset + action_dim] = True
+
+            action_offset += action_dim
+
+        ## Standard actions
+        if hasattr(self._env.cfg, "actions") and isinstance(
+            self._env.cfg.actions, ActionGroup
+        ):
+            try:
+                self._env.cfg.actions.map_cmd_to_action(torch.zeros(6), False)
+                env_supports_direct_teleop = True
+            except NotImplementedError:
+                env_supports_direct_teleop = False
+        else:
+            env_supports_direct_teleop = False
+        if env_supports_direct_teleop:
+            self._actions_cmd_vel = torch.zeros(
+                (self._num_envs, 6), dtype=torch.float32, device=self._env.device
+            )
+            self._actions_event = torch.zeros(
+                (self._num_envs, 1), dtype=torch.float32, device=self._env.device
+            )
+            self._sub_action_cmd_vel_all: Subscription = self._node.create_subscription(
+                Twist,
+                "envs/action/cmd_vel",
+                callback=self._create_cb_action_cmd_vel(),
+                qos_profile=self.__QOS_PROFILE,
+            )
+            self._sub_action_cmd_vel: Sequence[Subscription] = tuple(
+                self._node.create_subscription(
+                    Twist,
+                    f"env{i}/action/cmd_vel",
+                    callback=self._create_cb_action_cmd_vel(env_id=i),
+                    qos_profile=self.__QOS_PROFILE,
+                )
+                for i in range(self._num_envs)
+            )
+            self._sub_action_event_all: Subscription = self._node.create_subscription(
+                BoolMsg,
+                "envs/action/event",
+                callback=self._create_cb_action_event(),
+                qos_profile=self.__QOS_PROFILE,
+            )
+            self._sub_action_event: Sequence[Subscription] = tuple(
+                self._node.create_subscription(
+                    BoolMsg,
+                    f"env{i}/action/event",
+                    callback=self._create_cb_action_event(env_id=i),
+                    qos_profile=self.__QOS_PROFILE,
+                )
+                for i in range(self._num_envs)
+            )
+
+    def _create_cb_action_any(
+        self,
+        key: str,
+        extractor: Callable,
+        dim: int,
+        offset: int,
+        env_id: int | None = None,
+        hold: bool = False,
+    ) -> Callable:
+        start_idx = offset
+        end_idx = offset + dim
+
+        if env_id is not None:
+
+            def _proto_cb(self, msg: Any):
+                self._actions[env_id, start_idx:end_idx] = torch.tensor(
+                    extractor(msg), dtype=torch.float32, device=self._env.device
+                )
+                if hold:
+                    self._held_actions[env_id, start_idx:end_idx] = self._actions[env_id, start_idx:end_idx]
+                    self._held_mask[env_id, start_idx:end_idx] = True
+
+        else:
+
+            def _proto_cb(self, msg: Any):
+                self._actions[:, start_idx:end_idx] = torch.tensor(
+                    extractor(msg), dtype=torch.float32, device=self._env.device
+                )
+                if hold:
+                    self._held_actions[:, start_idx:end_idx] = self._actions[:, start_idx:end_idx]
+                    self._held_mask[:, start_idx:end_idx] = True
+
+        cb_name = f"__cb_action_{key}{env_id or ''}"
+        setattr(self, cb_name, _proto_cb.__get__(self, self.__class__))
+        return getattr(self, cb_name)
+
+    @staticmethod
+    def _map_action_term(action_term: ActionTerm) -> Tuple[Type, Callable]:
+        if isinstance(
+            action_term,
+            (
+                BodyAccelerationAction,
+                DifferentialInverseKinematicsAction,
+                OperationalSpaceControllerAction,
+            ),
+        ):
+            return Twist, lambda msg: [
+                msg.linear.x,
+                msg.linear.y,
+                msg.linear.z,
+                msg.angular.x,
+                msg.angular.y,
+                msg.angular.z,
+            ]
+
+        if isinstance(action_term, (NonHolonomicAction, WheeledDriveAction)):
+            return Twist, lambda msg: [msg.linear.x, msg.angular.z]
+
+        if isinstance(action_term, MulticopterBodyAccelerationAction):
+            return Twist, lambda msg: [
+                msg.linear.x,
+                msg.linear.y,
+                msg.linear.z,
+                msg.angular.z,
+            ]
+
+        if isinstance(
+            action_term, (BinaryJointPositionAction, BinaryJointVelocityAction)
+        ):
+            return BoolMsg, lambda msg: [-1.0 if msg.data else 1.0]
+
+        return Float32MultiArray, lambda msg: list(msg.data)
+
+    def _create_cb_action_cmd_vel(self, env_id: int | None = None) -> Callable:
+        if env_id is not None:
+
+            def _proto_cb(self, msg: Twist):
+                cmd_vel = torch.tensor(
+                    [
+                        msg.linear.x,
+                        msg.linear.y,
+                        msg.linear.z,
+                        msg.angular.x,
+                        msg.angular.y,
+                        msg.angular.z,
+                    ],
+                    dtype=torch.float32,
+                    device=self._env.device,
+                )
+                self._actions_cmd_vel[env_id] = cmd_vel
+                self._actions[env_id] = torch.where(
+                    self._held_mask[env_id],
+                    self._held_actions[env_id],
+                    self._env.cfg.actions.map_cmd_to_action(cmd_vel, self._actions_event[env_id].bool()),
+                )
+
+        else:
+
+            def _proto_cb(self, msg: Twist):
+                cmd_vel = torch.tensor(
+                    [
+                        msg.linear.x,
+                        msg.linear.y,
+                        msg.linear.z,
+                        msg.angular.x,
+                        msg.angular.y,
+                        msg.angular.z,
+                    ],
+                    dtype=torch.float32,
+                    device=self._env.device,
+                )
+                self._actions_cmd_vel = cmd_vel.unsqueeze(0).repeat(self._num_envs, 1)
+                for i in range(self._num_envs):
+                    self._actions[i] = torch.where(
+                        self._held_mask[i],
+                        self._held_actions[i],
+                        self._env.cfg.actions.map_cmd_to_action(cmd_vel, self._actions_event[i].bool()),
+                    )
+
+        cb_name = f"__cb_action_cmd_vel{env_id or ''}"
+        setattr(self, cb_name, _proto_cb.__get__(self, self.__class__))
+        return getattr(self, cb_name)
+
+    def _create_cb_action_event(self, env_id: int | None = None) -> Callable:
+        if env_id is not None:
+
+            def _proto_cb(self, msg: BoolMsg):
+                event = msg.data
+                self._actions_event[env_id] = event
+                self._actions[env_id] = torch.where(
+                    self._held_mask[env_id],
+                    self._held_actions[env_id],
+                    self._env.cfg.actions.map_cmd_to_action(self._actions_cmd_vel[env_id], event),
+                )
+
+        else:
+
+            def _proto_cb(self, msg: BoolMsg):
+                event = msg.data
+                self._actions_event = (
+                    torch.tensor([event], dtype=torch.float32, device=self._env.device)
+                    .unsqueeze(0)
+                    .repeat(self._num_envs, 1)
+                )
+                for i in range(self._num_envs):
+                    self._actions[i] = torch.where(
+                        self._held_mask[i],
+                        self._held_actions[i],
+                        self._env.cfg.actions.map_cmd_to_action(self._actions_cmd_vel[i], event),
+                    )
+
+        cb_name = f"__cb_action_event{env_id or ''}"
+        setattr(self, cb_name, _proto_cb.__get__(self, self.__class__))
+        return getattr(self, cb_name)
+
+    ## Sensors ##
+
+    def _setup_sensor_interfaces(self):
+        self._pub_sensors: Dict[str, Dict[str, Sequence[Publisher]]] = {}
+
+        for sensor_name, sensor in self._env.scene._sensors.items():
+            self._pub_sensors[sensor_name] = {}
+
+            if isinstance(sensor, (Camera, RayCasterCamera)):
+                if isinstance(sensor, Camera) and sensor.cfg.spawn is not None:
+                    self._pub_sensors[sensor_name]["depth_semantics"] = tuple(
+                        self._node.create_publisher(StringMsg, f"env{i}/{sensor_name}/depth_semantics",
+                                                    qos_profile=self.__QOS_PROFILE)
+                        for i in range(self._num_envs)
+                    )
+                self._pub_sensors[sensor_name]["camera_info"] = tuple(
+                    self._node.create_publisher(
+                        CameraInfo,
+                        f"env{i}/{sensor_name}/camera_info",
+                        qos_profile=self.__QOS_PROFILE,
+                    )
+                    for i in range(self._num_envs)
+                )
+
+                has_depth_streams = False
+                for data_type in sensor.cfg.data_types:
+                    if data_type in (
+                        "depth",
+                        "distance_to_camera",
+                        "distance_to_image_plane",
+                    ):
+                        has_depth_streams = True
+                    image_name = (
+                        "image_depth"
+                        if data_type == "distance_to_image_plane"
+                        else f"image_{data_type}"
+                    )
+                    self._pub_sensors[sensor_name][image_name] = tuple(
+                        self._node.create_publisher(
+                            Image,
+                            f"env{i}/{sensor_name}/{image_name}",
+                            qos_profile=self.__QOS_PROFILE,
+                        )
+                        for i in range(self._num_envs)
+                    )
+
+                if has_depth_streams:
+                    self._pub_sensors[sensor_name]["pointcloud"] = tuple(
+                        self._node.create_publisher(
+                            PointCloud2,
+                            f"env{i}/{sensor_name}/pointcloud",
+                            qos_profile=self.__QOS_PROFILE,
+                        )
+                        for i in range(self._num_envs)
+                    )
+
+            elif isinstance(sensor, RayCaster):
+                self._pub_sensors[sensor_name]["pointcloud"] = tuple(
+                    self._node.create_publisher(
+                        PointCloud2,
+                        f"env{i}/{sensor_name}/pointcloud",
+                        qos_profile=self.__QOS_PROFILE,
+                    )
+                    for i in range(self._num_envs)
+                )
+
+            elif isinstance(sensor, Imu):
+                self._pub_sensors[sensor_name]["imu"] = tuple(
+                    self._node.create_publisher(
+                        ImuMsg,
+                        f"env{i}/{sensor_name}",
+                        qos_profile=self.__QOS_PROFILE,
+                    )
+                    for i in range(self._num_envs)
+                )
+
+            ## Contact: the net contact force magnitude per body, unthresholded -- a task's contact penalty is a
+            ## threshold over this, and a definition decided later needs the raw values
+            elif isinstance(sensor, ContactSensor):
+                self._pub_sensors[sensor_name]["contact"] = tuple(
+                    self._node.create_publisher(
+                        Float32MultiArray,
+                        f"env{i}/{sensor_name}/force_norm",
+                        qos_profile=self.__QOS_PROFILE,
+                    )
+                    for i in range(self._num_envs)
+                )
+
+    def _publish_sensor_data(self, time_msg: Time):
+        for sensor_name, publishers in self._pub_sensors.items():
+            sensor = self._env.scene._sensors[sensor_name]
+            ## publish a sensor only when it produced new data: a 15 Hz camera or a 10 Hz lidar re-sent at every
+            ## 50 Hz step repeated the same images/point clouds
+            sensor.data  # refresh if outdated
+            stamp = float(sensor._timestamp_last_update[0])
+            if self._published_stamp.get(sensor_name) == stamp:
+                continue
+            self._published_stamp[sensor_name] = stamp
+
+            if "depth_semantics" in publishers:
+                # Sensor configuration, not scene/object truth. IsaacLab's
+                # positive infinity with clipping='none' denotes beyond far clip.
+                metadata = {
+                    "source": "IsaacLab.CameraCfg",
+                    "depth_axis": "image_plane",
+                    "data_types": list(sensor.cfg.data_types),
+                    "depth_clipping_behavior": sensor.cfg.depth_clipping_behavior,
+                    "near_m": sensor.cfg.spawn.clipping_range[0],
+                    "far_m": sensor.cfg.spawn.clipping_range[1],
+                    "positive_infinity": "beyond_far_clip" if sensor.cfg.depth_clipping_behavior == "none"
+                    and any(name in sensor.cfg.data_types for name in ("depth", "distance_to_image_plane")) else "unknown",
+                }
+                if self._has_subscribers(publishers["depth_semantics"]):
+                    for publisher in publishers["depth_semantics"]:
+                        publisher.publish(StringMsg(data=json.dumps(metadata)))
+
+            ## Cameras
+            if isinstance(sensor, (Camera, RayCasterCamera)):
+                # Camera info
+                for i in range(self._num_envs):
+                    camera_info_msg = CameraInfo()
+                    camera_info_msg.header = Header(
+                        stamp=time_msg, frame_id=f"srb/env{i}/{sensor_name}"
+                    )
+                    camera_info_msg.height = sensor.image_shape[0]
+                    camera_info_msg.width = sensor.image_shape[1]
+                    camera_info_msg.distortion_model = "plumb_bob"
+                    camera_info_msg.d = [0.0, 0.0, 0.0, 0.0, 0.0]  # No distortion
+                    intrinsic_matrix = sensor.data.intrinsic_matrices[i]
+                    camera_info_msg.k = [
+                        intrinsic_matrix[0, 0].item(),
+                        intrinsic_matrix[0, 1].item(),
+                        intrinsic_matrix[0, 2].item(),
+                        intrinsic_matrix[1, 0].item(),
+                        intrinsic_matrix[1, 1].item(),
+                        intrinsic_matrix[1, 2].item(),
+                        intrinsic_matrix[2, 0].item(),
+                        intrinsic_matrix[2, 1].item(),
+                        intrinsic_matrix[2, 2].item(),
+                    ]
+                    publishers["camera_info"][i].publish(camera_info_msg)
+
+                # Images
+                for data_type in sensor.data.output.keys():
+                    image_name = (
+                        "image_depth"
+                        if data_type == "distance_to_image_plane"
+                        else f"image_{data_type}"
+                    )
+                    if image_name not in publishers or not self._has_subscribers(
+                        publishers[image_name]
+                    ):
+                        # Nobody is listening: skip the copy + packing entirely
+                        continue
+                    img_data_all = sensor.data.output[data_type].cpu().numpy()
+                    for i in range(self._num_envs):
+                        img_data = img_data_all[i]
+
+                        # Create image message
+                        image_msg = Image()
+                        image_msg.header = Header(
+                            stamp=time_msg, frame_id=f"srb/env{i}/{sensor_name}"
+                        )
+                        image_msg.height = img_data.shape[0]
+                        image_msg.width = img_data.shape[1]
+
+                        # Handle different image types
+                        if data_type == "rgb" or img_data.shape[2] == 3:
+                            image_msg.encoding = "rgb8"
+                            image_msg.is_bigendian = False
+                            image_msg.step = 3 * img_data.shape[1]
+                            if img_data.dtype != numpy.uint8:
+                                img_data = (255.0 * img_data).astype(numpy.uint8)
+                            image_msg.data = _ros_bytes(img_data)
+
+                        elif data_type == "rgba" or img_data.shape[2] == 4:
+                            image_msg.encoding = "rgba8"
+                            image_msg.is_bigendian = False
+                            image_msg.step = 4 * img_data.shape[1]
+                            if img_data.dtype != numpy.uint8:
+                                img_data = (255.0 * img_data).astype(numpy.uint8)
+                            image_msg.data = _ros_bytes(img_data)
+
+                        elif data_type in (
+                            "depth",
+                            "distance_to_camera",
+                            "distance_to_image_plane",
+                        ):
+                            image_msg.encoding = "32FC1"
+                            image_msg.is_bigendian = False
+                            image_msg.step = 4 * img_data.shape[1]
+                            image_msg.data = _ros_bytes(img_data.astype(numpy.float32))
+
+                        elif img_data.shape[2] == 1:
+                            image_msg.encoding = "mono8"
+                            image_msg.is_bigendian = False
+                            image_msg.step = img_data.shape[1]
+                            if img_data.dtype != numpy.uint8:
+                                img_data = (255.0 * img_data).astype(numpy.uint8)
+                            image_msg.data = _ros_bytes(img_data)
+
+                        else:
+                            # Unsupported format
+                            break
+
+                        publishers[image_name][i].publish(image_msg)
+
+                # Pointcloud
+                depth_type = None
+                for depth_option in (
+                    "depth",
+                    "distance_to_image_plane",
+                    "distance_to_camera",
+                ):
+                    if depth_option in sensor.data.output:
+                        depth_type = depth_option
+                        break
+                if depth_type and self._has_subscribers(publishers["pointcloud"]):
+                    depth_data = sensor.data.output[depth_type]
+
+                    # Keep the unprojection on the accelerator: the helpers accept
+                    # tensors on any device and only the packed result comes back
+                    if "rgb" in sensor.data.output.keys():
+                        rgb_data = sensor.data.output["rgb"]
+                    elif "rgba" in sensor.data.output.keys():
+                        rgb_data = sensor.data.output["rgba"][..., :3]
+                    else:
+                        rgb_data = None
+
+                    for i in range(self._num_envs):
+                        if rgb_data is not None:
+                            points, colors = create_pointcloud_from_rgbd(
+                                intrinsic_matrix=sensor.data.intrinsic_matrices[i],
+                                depth=depth_data[i],
+                                rgb=rgb_data[i],
+                                normalize_rgb=True,
+                                device=self._pointcloud_device,
+                            )
+                            colors = colors.cpu().numpy().astype(numpy.float32)  # type: ignore
+                        else:
+                            points = create_pointcloud_from_depth(
+                                intrinsic_matrix=sensor.data.intrinsic_matrices[i],
+                                depth=depth_data[i],
+                                device=self._pointcloud_device,
+                            )
+                        points = points.cpu().numpy().astype(numpy.float32)  # type: ignore
+
+                        # Create PointCloud2 message
+                        pointcloud_msg = PointCloud2()
+                        pointcloud_msg.header = Header(
+                            stamp=time_msg, frame_id=f"srb/env{i}/{sensor_name}"
+                        )
+                        pointcloud_msg.height = 1
+                        pointcloud_msg.width = points.shape[0]  # type: ignore
+
+                        # Define fields
+                        fields = [
+                            ROSPointField(
+                                name="x",
+                                offset=0,
+                                datatype=ROSPointField.FLOAT32,
+                                count=1,
+                            ),
+                            ROSPointField(
+                                name="y",
+                                offset=4,
+                                datatype=ROSPointField.FLOAT32,
+                                count=1,
+                            ),
+                            ROSPointField(
+                                name="z",
+                                offset=8,
+                                datatype=ROSPointField.FLOAT32,
+                                count=1,
+                            ),
+                        ]
+                        if rgb_data is not None:
+                            fields.extend(
+                                [
+                                    ROSPointField(
+                                        name="r",
+                                        offset=12,
+                                        datatype=ROSPointField.FLOAT32,
+                                        count=1,
+                                    ),
+                                    ROSPointField(
+                                        name="g",
+                                        offset=16,
+                                        datatype=ROSPointField.FLOAT32,
+                                        count=1,
+                                    ),
+                                    ROSPointField(
+                                        name="b",
+                                        offset=20,
+                                        datatype=ROSPointField.FLOAT32,
+                                        count=1,
+                                    ),
+                                ]
+                            )
+                            pointcloud_data = numpy.hstack([points, colors])
+                            point_step = 24
+                        else:
+                            pointcloud_data = points
+                            point_step = 12
+
+                        pointcloud_msg.fields = fields
+                        pointcloud_msg.is_bigendian = False
+                        pointcloud_msg.point_step = point_step
+                        pointcloud_msg.row_step = (
+                            pointcloud_msg.point_step * pointcloud_msg.width
+                        )
+                        pointcloud_msg.is_dense = True
+                        pointcloud_msg.data = _ros_bytes(pointcloud_data)
+
+                        publishers["pointcloud"][i].publish(pointcloud_msg)
+
+            ## RayCaster (non-camera)
+            elif isinstance(sensor, RayCaster):
+                ## Points go out in the sensor frame, matching the header's
+                ## frame_id and the sensor TF below (world-frame hits under a
+                ## sensor frame_id put every point in the wrong place).
+                ray_hits_all = (
+                    sensor.ray_hits_sensor_frame().cpu().numpy().astype(numpy.float32)
+                )
+                for i in range(self._num_envs):
+                    ray_hits = ray_hits_all[i]
+
+                    pointcloud_msg = PointCloud2()
+                    pointcloud_msg.header = Header(
+                        stamp=time_msg, frame_id=f"srb/env{i}/{sensor_name}"
+                    )
+                    pointcloud_msg.height = 1
+                    pointcloud_msg.width = ray_hits.shape[0]
+
+                    # Define fields
+                    fields = [
+                        ROSPointField(
+                            name="x", offset=0, datatype=ROSPointField.FLOAT32, count=1
+                        ),
+                        ROSPointField(
+                            name="y", offset=4, datatype=ROSPointField.FLOAT32, count=1
+                        ),
+                        ROSPointField(
+                            name="z", offset=8, datatype=ROSPointField.FLOAT32, count=1
+                        ),
+                    ]
+
+                    pointcloud_msg.fields = fields
+                    pointcloud_msg.is_bigendian = False
+                    pointcloud_msg.point_step = 12
+                    pointcloud_msg.row_step = (
+                        pointcloud_msg.point_step * pointcloud_msg.width
+                    )
+                    pointcloud_msg.is_dense = False  # missed rays are non-finite
+                    pointcloud_msg.data = _ros_bytes(ray_hits)
+
+                    publishers["pointcloud"][i].publish(pointcloud_msg)
+
+            # IMU
+            elif isinstance(sensor, Imu):
+                lin_acc = sensor.data.lin_acc_b
+                ang_vel = sensor.data.ang_vel_b
+                for i in range(self._num_envs):
+                    imu_msg = ImuMsg()
+                    imu_msg.header = Header(
+                        stamp=time_msg, frame_id=f"srb/env{i}/{sensor_name}"
+                    )
+                    imu_msg.linear_acceleration.x = lin_acc[i, 0].item()
+                    imu_msg.linear_acceleration.y = lin_acc[i, 1].item()
+                    imu_msg.linear_acceleration.z = lin_acc[i, 2].item()
+                    imu_msg.angular_velocity.x = ang_vel[i, 0].item()
+                    imu_msg.angular_velocity.y = ang_vel[i, 1].item()
+                    imu_msg.angular_velocity.z = ang_vel[i, 2].item()
+
+                    publishers["imu"][i].publish(imu_msg)
+
+            # Contact
+            elif isinstance(sensor, ContactSensor):
+                force_norm = torch.norm(sensor.data.net_forces_w, dim=-1)
+                layout = MultiArrayLayout(
+                    dim=[MultiArrayDimension(label=",".join(sensor.body_names), size=force_norm.shape[1], stride=force_norm.shape[1])],
+                    data_offset=0,
+                )
+                for i in range(self._num_envs):
+                    publishers["contact"][i].publish(
+                        Float32MultiArray(layout=layout, data=force_norm[i].tolist())
+                    )
+
+    ## Transforms ##
+
+    def _broadcast_transforms(self, time_msg: Time):
+        # The same transforms as before, read from each asset's tensors with one `tolist()` instead of one `.item()` per
+        # number: every `.item()` on a device tensor synchronizes, and that was ~38 ms of every tick (SRB_ROS_PROFILE).
+        # Values, frames and rate are unchanged.
+        def stamped(parent: str, child: str, p, q) -> TransformStamped:
+            return TransformStamped(
+                header=Header(stamp=time_msg, frame_id=parent),
+                child_frame_id=child,
+                transform=Transform(
+                    translation=Vector3(x=p[0], y=p[1], z=p[2]),
+                    rotation=Quaternion(w=q[0], x=q[1], y=q[2], z=q[3]),
+                ),
+            )
+
+        transforms: List[TransformStamped] = []
+        for asset_name, asset in (
+            self._env.scene._rigid_objects.items()
+            | self._env.scene._articulations.items()
+        ):
+            assert isinstance(asset, (RigidObject, Articulation))
+            pos = (asset.data.root_pos_w - self._env.scene.env_origins).tolist()
+            quat = asset.data.root_quat_w.tolist()
+            transforms.extend(
+                stamped(f"srb/env{i}", f"srb/env{i}/{asset_name}", pos[i], quat[i])
+                for i in range(self._num_envs)
+            )
+        for asset_name, asset in self._env.scene._sensors.items():
+            if isinstance(asset, (Camera, RayCasterCamera)):
+                root_pos = asset.data.pos_w - self._env.scene.env_origins
+                root_quat = asset.data.quat_w_ros
+            elif isinstance(asset, (RayCaster, Imu)):
+                root_pos = asset.data.pos_w - self._env.scene.env_origins
+                root_quat = asset.data.quat_w
+            else:
+                continue
+            pos, quat = root_pos.tolist(), root_quat.tolist()  # type: ignore
+            transforms.extend(
+                stamped(f"srb/env{i}", f"srb/env{i}/{asset_name}", pos[i], quat[i])
+                for i in range(self._num_envs)
+            )
+        for asset_name, asset in self._env.scene._rigid_object_collections.items():
+            assert isinstance(asset, RigidObjectCollection)
+            pos = (
+                asset.data.object_pos_w
+                - self._env.scene.env_origins.unsqueeze(1).repeat(1, asset.num_objects, 1)
+            ).tolist()
+            quat = asset.data.object_quat_w.tolist()
+            transforms.extend(
+                stamped(f"srb/env{i}", f"srb/env{i}/{object_name}", pos[i][object_id], quat[i][object_id])
+                for i in range(self._num_envs)
+                for object_id, object_name in enumerate(asset.object_names)
+            )
+        for asset_name, asset in self._env.scene._articulations.items():
+            assert isinstance(asset, Articulation)
+            body_pos, body_quat = subtract_frame_transforms(
+                asset.data.root_pos_w.unsqueeze(1).repeat(1, asset.num_bodies, 1),
+                asset.data.root_quat_w.unsqueeze(1).repeat(1, asset.num_bodies, 1),
+                asset.data.body_pos_w,
+                asset.data.body_quat_w,
+            )
+            pos, quat = body_pos.tolist(), body_quat.tolist()
+            transforms.extend(
+                stamped(f"srb/env{i}/{asset_name}", f"srb/env{i}/{asset_name}/{body_name}", pos[i][body_id], quat[i][body_id])
+                for i in range(self._num_envs)
+                for (
+                    body_name,
+                    body_id,
+                ) in asset.root_physx_view.shared_metatype.link_indices.items()
+            )
+        self._tf_broadcaster.sendTransform(transforms)
+
+    def _broadcast_transforms_static(self):
+        static_transforms = [
+            # World -> Map (alias for simplicity)
+            TransformStamped(
+                header=Header(
+                    stamp=Time(sec=0, nanosec=0),
+                    frame_id="world",
+                ),
+                child_frame_id="map",
+                transform=Transform(
+                    translation=Vector3(x=0.0, y=0.0, z=0.0),
+                    rotation=Quaternion(w=1.0, x=0.0, y=0.0, z=0.0),
+                ),
+            ),
+            # World -> SRB World
+            TransformStamped(
+                header=Header(
+                    stamp=Time(sec=0, nanosec=0),
+                    frame_id="world",
+                ),
+                child_frame_id="srb/world",
+                transform=Transform(
+                    translation=Vector3(x=0.0, y=0.0, z=0.0),
+                    rotation=Quaternion(w=1.0, x=0.0, y=0.0, z=0.0),
+                ),
+            ),
+            # SRB World -> Envs
+            *(
+                TransformStamped(
+                    header=Header(
+                        stamp=Time(sec=0, nanosec=0),
+                        frame_id="srb/world",
+                    ),
+                    child_frame_id=f"srb/env{i}",
+                    transform=Transform(
+                        translation=Vector3(
+                            x=self._env.scene.env_origins[i, 0].item(),
+                            y=self._env.scene.env_origins[i, 1].item(),
+                            z=self._env.scene.env_origins[i, 2].item(),
+                        ),
+                        rotation=Quaternion(
+                            w=1.0,
+                            x=0.0,
+                            y=0.0,
+                            z=0.0,
+                        ),
+                    ),
+                )
+                for i in range(self._num_envs)
+            ),
+        ]
+        self._tf_broadcaster_static.sendTransform(static_transforms)
+
+    ## Reset ##
+
+    def _create_cb_reset(self, env_id: int | None = None) -> Callable:
+        if env_id is not None:
+
+            def _proto_cb(self, request: EmptySrv.Request, response: EmptySrv.Response):
+                if self._async_reset in self._async_exec_queue:
+                    if "env_ids" in self._async_exec_queue[self._async_reset]:
+                        self._async_exec_queue[self._async_reset]["env_ids"].add(env_id)
+                else:
+                    self._async_exec_queue[self._async_reset] = {"env_ids": {env_id}}
+
+                return response
+
+        else:
+
+            def _proto_cb(self, request: EmptySrv.Request, response: EmptySrv.Response):
+                self._async_exec_queue[self._async_reset] = {}
+                return response
+
+        cb_name = f"__cb_reset{env_id or ''}"
+        setattr(self, cb_name, _proto_cb.__get__(self, self.__class__))
+        return getattr(self, cb_name)
+
+    def _async_reset(self, env_ids: Sequence[int] | None = None):
+        if env_ids:
+            ids = torch.tensor(list(env_ids), dtype=torch.int, device=self._env.device)
+            self._actions[ids].zero_()
+            self._held_mask[ids] = False
+            self._env._reset_idx(ids)  # type: ignore
+
+            self._env.scene.write_data_to_sim()
+            self._env.sim.forward()
+
+            if self._env.sim.has_rtx_sensors():
+                if self._env.cfg.rerender_on_reset:
+                    self._env.sim.render()
+                if self._env.cfg.wait_for_textures:
+                    while SimulationManager.assets_loading():
+                        self._env.sim.render()
+        else:
+            self._actions.zero_()
+            self._env.reset()
+
+    ## Snapshots ##
+
+    def _async_snapshot(self, op: str, path: str):
+        scene = self._env.scene
+        if op == "save":
+            torch.save(dict(
+                articulations={k: dict(root=a.data.root_state_w.clone(), q=a.data.joint_pos.clone(), qd=a.data.joint_vel.clone())
+                               for k, a in scene.articulations.items()},
+                rigid_objects={k: o.data.root_state_w.clone() for k, o in scene.rigid_objects.items()},
+                actions=self._actions.clone(), held_actions=self._held_actions.clone(), held_mask=self._held_mask.clone(),
+            ), path)
+        else:
+            snap = torch.load(path, map_location=self._env.device)
+            for k, a in scene.articulations.items():
+                s = snap["articulations"][k]
+                a.write_root_state_to_sim(s["root"])
+                a.write_joint_state_to_sim(s["q"], s["qd"])
+                a.set_joint_position_target(s["q"])
+            for k, o in scene.rigid_objects.items():
+                o.write_root_state_to_sim(snap["rigid_objects"][k])
+            self._actions[:] = snap["actions"]
+            self._held_actions[:] = snap["held_actions"]
+            self._held_mask[:] = snap["held_mask"]
+            scene.write_data_to_sim()
+            self._env.sim.forward()
+        self._pub_snapshot_done.publish(StringMsg(data=json.dumps(dict(op=op, path=path))))

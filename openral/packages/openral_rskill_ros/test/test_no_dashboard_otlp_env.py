@@ -1,0 +1,220 @@
+"""Regression test: ``--no-dashboard`` skips OTLP endpoint forwarding.
+
+Asserts ``deploy_e2e.launch.compose_runtime_graph`` builds every spawned node's
+``additional_env`` WITHOUT ``OTEL_EXPORTER_OTLP_ENDPOINT`` / ``OTEL_EXPORTER_OTLP_PROTOCOL``
+when ``enable_dashboard=false``, WITH them when ``true``.
+
+Why: ``configure_observability`` (``_sdk.py:145``) no-ops with no endpoint set; with one set,
+every node installs exporters that retry against it at SIGINT shutdown. Before the guard at
+``deploy_e2e.launch.py:433-454``, ``--no-dashboard`` still pointed nodes at
+``http://127.0.0.1:<dashboard_port>`` with nothing listening, so teardown blocked ~30s per
+node — stalling CI and ``tools/audit_sim_configs.py``, surfacing as the audit's
+``fail-timeout`` (exit -9, SIGKILL'd after ``shutdown-grace``) on otherwise-healthy launches.
+
+``OTEL_RESOURCE_ATTRIBUTES`` (run id / mode / git sha) stays forwarded in both modes — cheap,
+harmless, useful if the operator points the parent shell at an external collector.
+
+Per CLAUDE.md §1.11: no mocks — real ``RobotDescription`` (``robots/openarm/robot.yaml``),
+real ``LaunchContext``, real ``compose_runtime_graph``; inspects each entity's
+``additional_env`` directly (matches ``test_kernel_params_no_empty_lists.py``).
+
+Run::
+
+    source /opt/ros/jazzy/setup.bash && source install/setup.bash
+    MUJOCO_GL=egl uv run pytest \
+        packages/openral_rskill_ros/test/test_no_dashboard_otlp_env.py -v
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+import pytest
+from _launch_test_common import import_launch_module as _import_launch_module
+
+# ── Guards ───────────────────────────────────────────────────────────────────
+
+pytest.importorskip("launch")
+pytest.importorskip("launch_ros")
+pytest.importorskip("openral_core")
+pytest.importorskip("openral_safety")
+pytest.importorskip("mujoco")
+
+_ROS2_AVAILABLE = bool(os.environ.get("ROS_DISTRO"))
+pytestmark = pytest.mark.skipif(
+    not _ROS2_AVAILABLE,
+    reason="ROS_DISTRO not set — these tests require a sourced ROS 2 installation.",
+)
+
+# parents[3]: test/ → openral_rskill_ros/ → packages/ → <repo-root>
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_LAUNCH_FILE = _REPO_ROOT / "packages" / "openral_rskill_ros" / "launch" / "deploy_e2e.launch.py"
+# openarm is a fixed-base arm with no opt-in extras (no SLAM/Nav2/octomap),
+# so the graph it produces is the minimal "kernel + reasoner + prompt_router
+# + hal + runtime" set — exactly the surface area we want to audit.
+_REPRESENTATIVE_ROBOT = "openarm"
+
+
+def _make_launch_context(*, enable_dashboard: bool, enable_reasoner: bool = True) -> Any:
+    """Return a launch context populated from the launch's own declarations."""
+    from launch import LaunchContext
+    from launch.actions import DeclareLaunchArgument
+
+    module = _import_launch_module(_LAUNCH_FILE)
+    ctx = LaunchContext()
+    cfg = ctx.launch_configurations
+    # Required CLI-provided arguments have no defaults.
+    cfg["robot_yaml"] = str(_REPO_ROOT / "robots" / _REPRESENTATIVE_ROBOT / "robot.yaml")
+    cfg["hal_package"] = "openral_hal_openarm"
+    cfg["hal_executable"] = "lifecycle_node.py"
+    cfg["hal_node_name"] = "openral_hal_test"
+    cfg["hal_params_file"] = "/tmp/openral-test-hal-params.yaml"
+
+    for entity in module.generate_launch_description().entities:
+        if isinstance(entity, DeclareLaunchArgument):
+            entity.execute(ctx)
+
+    cfg["enable_reasoner"] = "true" if enable_reasoner else "false"
+    cfg["enable_dashboard"] = "true" if enable_dashboard else "false"
+    return ctx
+
+
+def _collect_additional_envs(*, enable_dashboard: bool) -> list[tuple[str, dict[str, str]]]:
+    """Return ``[(node_package, additional_env), ...]`` for every spawned node.
+
+    Walks the entities ``compose_runtime_graph`` returns, picks the
+    ``Node`` / ``LifecycleNode`` instances, and resolves each one's
+    ``additional_env`` (a list of ``(key_substitutions, value_substitutions)``
+    tuples) via ``launch.utilities.perform_substitutions`` against
+    the launch context — the same call ``ros2 launch`` makes before
+    handing env to subprocess.Popen.
+
+    Non-Node entities (ExecuteProcess for the dashboard,
+    RegisterEventHandler for lifecycle wiring) are skipped — they
+    aren't subject to the OTLP forwarding contract.
+    """
+    from launch.utilities import perform_substitutions
+    from launch_ros.actions import LifecycleNode, Node
+
+    module = _import_launch_module(_LAUNCH_FILE)
+    ctx = _make_launch_context(enable_dashboard=enable_dashboard)
+    entities = module.compose_runtime_graph(ctx)
+
+    envs: list[tuple[str, dict[str, str]]] = []
+    for entity in entities:
+        if not isinstance(entity, Node | LifecycleNode):
+            continue
+        # ``_Node__package`` is the literal package string the launch
+        # file passed to the constructor; safer than ``node_name``
+        # which raises before the action executes.
+        pkg = getattr(entity, "_Node__package", None)
+        # ``additional_env`` is a public property exposing the raw
+        # substitution pairs; resolve them with the launch context to
+        # get a concrete ``{str: str}`` dict.
+        raw_env = entity.additional_env
+        if pkg is None or raw_env is None:
+            continue
+        resolved: dict[str, str] = {}
+        for key_subs, val_subs in raw_env:
+            resolved[perform_substitutions(ctx, key_subs)] = perform_substitutions(ctx, val_subs)
+        envs.append((pkg, resolved))
+    # Sanity floor: the openarm graph spawns at minimum
+    # safety_kernel + reasoner + prompt_router + hal + runtime → 5 nodes.
+    assert len(envs) >= 5, (
+        f"expected ≥5 nodes in the openarm graph, got {len(envs)}: {[pkg for pkg, _ in envs]}"
+    )
+    return envs
+
+
+def test_no_dashboard_omits_otlp_endpoint_from_every_node() -> None:
+    """``--no-dashboard`` → every node's additional_env lacks the OTLP endpoint.
+
+    The exact failure this pins: setting ``OTEL_EXPORTER_OTLP_ENDPOINT``
+    on every node when nothing is listening on ``dashboard_port`` causes
+    BatchSpanProcessor / PeriodicExportingMetricReader to retry against
+    the dead port at SIGINT, blocking shutdown for ~30s and stalling
+    every headless caller.
+    """
+    envs = _collect_additional_envs(enable_dashboard=False)
+    offenders = {
+        pkg: env
+        for pkg, env in envs
+        if "OTEL_EXPORTER_OTLP_ENDPOINT" in env or "OTEL_EXPORTER_OTLP_PROTOCOL" in env
+    }
+    assert not offenders, (
+        "--no-dashboard nodes must not forward OTEL_EXPORTER_OTLP_ENDPOINT / "
+        "OTEL_EXPORTER_OTLP_PROTOCOL (the SDK would install exporters that "
+        "block on shutdown retries). Offenders:\n"
+        + "\n".join(
+            f"  {pkg}: "
+            + ", ".join(f"{k}={v!r}" for k, v in env.items() if k.startswith("OTEL_EXPORTER_OTLP_"))
+            for pkg, env in offenders.items()
+        )
+    )
+
+
+def test_no_dashboard_keeps_otel_resource_attributes() -> None:
+    """``--no-dashboard`` → ``OTEL_RESOURCE_ATTRIBUTES`` still forwarded.
+
+    Resource attributes (dashboard run id / mode / git sha) are cheap,
+    harmless when no exporter is wired, and useful if the operator
+    points the parent shell at an external OTLP collector. Skipping the
+    endpoint is the bug fix; skipping the resource attrs would be
+    over-zealous.
+    """
+    envs = _collect_additional_envs(enable_dashboard=False)
+    missing = [pkg for pkg, env in envs if "OTEL_RESOURCE_ATTRIBUTES" not in env]
+    assert not missing, (
+        "OTEL_RESOURCE_ATTRIBUTES must reach every node even under --no-dashboard. "
+        f"Missing on: {missing}"
+    )
+
+
+def test_reasoner_uses_model_first_env() -> None:
+    envs = _collect_additional_envs(enable_dashboard=False)
+    reasoner_env = next(env for pkg, env in envs if pkg == "openral_reasoner_ros")
+    assert reasoner_env["OPENRAL_REASONER_MODEL"] == "gpt-5.5"
+    assert reasoner_env["OPENRAL_REASONER_MAX_TOKENS"] == "16384"
+
+
+def test_direct_rskill_mode_omits_reasoner_and_prompt_router() -> None:
+    from launch_ros.actions import LifecycleNode, Node
+
+    module = _import_launch_module(_LAUNCH_FILE)
+    ctx = _make_launch_context(enable_dashboard=False, enable_reasoner=False)
+    entities = module.compose_runtime_graph(ctx)
+    packages = {
+        getattr(entity, "_Node__package", None)
+        for entity in entities
+        if isinstance(entity, Node | LifecycleNode)
+    }
+    assert "openral_reasoner_ros" not in packages
+    assert "openral_prompt_router" not in packages
+    assert "openral_safety_kernel" in packages
+    assert "openral_rskill_ros" in packages
+
+
+def test_dashboard_enabled_forwards_otlp_endpoint_to_every_node() -> None:
+    """Default (``--dashboard``) → every node points OTLP at the dashboard port.
+
+    The symmetric guarantee: when the dashboard IS spawned, every node's
+    additional_env carries ``OTEL_EXPORTER_OTLP_ENDPOINT`` =
+    ``http://127.0.0.1:<dashboard_port>`` and the HTTP/protobuf protocol
+    selector. Pins the contract so a future refactor that accidentally
+    silences observability under the default mode is caught.
+    """
+    envs = _collect_additional_envs(enable_dashboard=True)
+    for pkg, env in envs:
+        assert env.get("OTEL_EXPORTER_OTLP_ENDPOINT") == "http://127.0.0.1:4318", (
+            f"{pkg} must forward OTLP endpoint to the dashboard; got "
+            f"{env.get('OTEL_EXPORTER_OTLP_ENDPOINT')!r}"
+        )
+        assert env.get("OTEL_EXPORTER_OTLP_PROTOCOL") == "http/protobuf", (
+            f"{pkg} must forward OTLP protocol selector; got "
+            f"{env.get('OTEL_EXPORTER_OTLP_PROTOCOL')!r}"
+        )
+        assert "OTEL_RESOURCE_ATTRIBUTES" in env, (
+            f"{pkg} must forward OTEL_RESOURCE_ATTRIBUTES even under --dashboard"
+        )

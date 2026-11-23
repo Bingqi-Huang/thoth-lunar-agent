@@ -1,0 +1,184 @@
+# The formal vocabulary of the AKR executor as data; space_runtime/akr/vocabulary.py reads it.
+#
+# Literals are strings: "name(arg,...)" is the positive literal, "not name(arg,...)" the negative one. Placeholders in
+# braces are filled when an action is grounded: {support} a site place point, {feature} a site point, {unit} a serviced
+# unit, {serial} an inventory serial, {occ} the support's occupancy proposition (occupied(S), or installed(S) when S is an
+# equipment bay).
+#
+# Propositions (all arguments are site point / unit / serial names of interaction.json):
+#   base_at(P)           docked at the work pose of place/press point P, or base_at(dock); dock band
+#   at_view(V)           within the navigation band of camera view pose V (only the views a camera question uses)
+#   gripper_empty, arm_stowed
+#   held(X)              serial X is between the jaws
+#   item_at(X,S)         serial X rests on place point S             [exogenous when S is an equipment bay: telemetry
+#                                                                     reports the module serial per bay]
+#   occupied(S)          something rests on place point S (a bay's occupancy is installed(S))
+#   installed(B)         a module is in equipment bay B               [exogenous]
+#   breaker_closed(U), energized(U)                                  [exogenous]; one signal in the simulator
+#   lamp_green(U)        the panel lamp of U is green (the breaker as the lamp shows it)  [exogenous; also camera]
+#   sink_hot(U)          the power converter's heat sink of U is above sink_hot_c (rejection impaired)  [exogenous]
+#   connector_ok(B)      the connector of equipment bay B is undamaged (a removal under power damages it for good)  [exogenous]
+#   shutter_open(U)      heat-rejection shutter of U open (PDU radiator, BESS HVAC condenser); camera only
+#   granted_remove(B)    ground authorization to take the module out of bay B   [grant]
+
+link: {one_way_s: 4.27, decision_s: 300.0}   # ground request cost c_g = 2 * one_way + decision = 308.54 s
+# Mission time at which Earth sets (T_vis), per mission: the nominal value of space_context/profiles/earth_link.json,
+# except the no-spare repair, whose mission starts earlier in the same pass so that Earth sets after five request
+# cycles (5 x 308.54 = 1543 s; latest request time 1234.5 s; start 2028-10-11T01:08:21 UTC, Earth +0.027 deg, Sun
+# +1.84 deg). The live runs and the Monte Carlo trials read it from here.
+earth_set_s: {nominal: 925.0, a_l4_cannibalize_pdu1: 1543.0}
+dock: {x: 0.0, y: 0.0, yaw: 0.0}
+exogenous: {families: [breaker_closed, energized, lamp_green, sink_hot, installed, connector_ok], serials_in_bays: true}
+sink_hot_c: 60.0           # heat-sink temperature above which telemetry is read as "hot" (ambient 25 C, cutout 85 C)
+grant: {family: granted_remove, capability: pick, role: equipment_bay}
+
+# Bands and thresholds of the evidence rules: the same numbers as configs/space_runtime_akr.yaml `verification`.
+bands:
+  dock: {position_m: 0.06, yaw_rad: 0.06}
+  navigate: {position_m: 0.25, yaw_rad: 0.3}
+  same_pose_m: 0.03        # a commanded pose this close to a named pose is that pose
+  no_claim_standoff_m: 0.4 # navigating to a feature closer than this may still end within the dock band of it
+jaw: {empty_max_rad: 0.12, open_min_rad: 0.6}
+hold: {flow_fraction: 0.35, min_lift_m: 0.05}
+place: {in_jaws_min_points: 200}
+
+# Work poses [x, y, yaw_deg] of the dockable points (interaction.json `work_poses`; dock_at_feature with standoff 0).
+work_poses:
+  pdu_1_panel/press: [10.7, 3.417, -90.0]
+  pdu_1_shelf/shelf: [11.75, 3.159, -90.0]
+  pdu_2_panel/press: [17.2, 3.417, -90.0]
+  pdu_2_shelf/shelf: [18.25, 3.159, -90.0]
+  pdu_3_panel/press: [23.7, 3.417, -90.0]
+  pdu_3_shelf/shelf: [24.75, 3.159, -90.0]
+  pdu_1_bay/tray: [12.85, 3.159, -90.0]
+  pdu_2_bay/tray: [19.35, 3.159, -90.0]
+  pdu_3_bay/tray: [25.85, 3.159, -90.0]
+  pdu_1_radiator/cover_button: [14.27, 3.417, -90.0]
+  pdu_2_radiator/cover_button: [20.77, 3.417, -90.0]
+  pdu_3_radiator/cover_button: [27.27, 3.417, -90.0]
+  bess_panel/press: [35.207, 15.0, 180.0]
+  bess_cradle/tray: [35.413, 13.6, 180.0]
+  bess_hvac/cover_button: [33.84, 10.41, 180.0]
+  bess_stand/slot_0: [34.178, 17.0, 0.0]
+  isru_panel/press: [-30.0, -5.012, -90.0]
+  isru_filter/tray: [-28.5, -4.84, -90.0]
+  isru_power/tray: [-27.0, -4.84, -90.0]
+  isru_stand/slot_0: [-23.2, -3.778, -90.0]
+  isru_return_stand/slot_0: [-25.5, -7.422, 90.0]
+  depot_spares_stand/slot_0: [14.5, -14.822, 90.0]
+  depot_stand/slot_0: [5.82, -13.322, 90.0]
+  depot_stand/slot_1: [5.18, -13.322, 90.0]
+  landing_stand/slot_0: [-24.826, 28.639, -132.0]
+  landing_stand/slot_1: [-24.35, 28.211, -132.0]
+  habitat_stand/slot_0: [4.0, 20.722, -90.0]
+  return_stand/slot_0: [14.5, -11.322, 90.0]
+
+# Tracked objects of the scene (interaction.json `objects`): evaluator object name -> serial and kind. The simulator's
+# evaluator state is keyed by the object name; the inventory and the executor use the serial.
+objects:
+  spare_oru: [ORU-0417, orbital replacement unit (ORU)]
+  spare_crate: [CRT-0112, cargo crate]
+  oru_pdu_1: [ORU-0211, orbital replacement unit (ORU)]
+  oru_pdu_2: [ORU-0233, orbital replacement unit (ORU)]
+  oru_pdu_3: [ORU-0258, orbital replacement unit (ORU)]
+  oru_isru: [ORU-0285, orbital replacement unit (ORU)]
+  oru_returned: [ORU-0272, orbital replacement unit (ORU)]
+  bat_bess: [BAT-0101, battery module]
+  bat_spare: [BAT-0102, battery module]
+  flt_isru: [FLT-0201, filter cartridge]
+  flt_spare: [FLT-0202, filter cartridge]
+  consumables_container: [CNS-0301, consumables container]
+  return_container: [RTN-0007, return container]
+
+# ---- actuation: preconditions, effects, durations ---------------------------------------------------------------------
+# Durations are simulated time (the clock held only while a model answers), medians of measured capability calls; the
+# duration is consumed whether or not the precondition holds. A navigation takes base_s + per_m_s x the straight
+# distance from where the rover is (least squares over the same calls); from an unknown start the distance is taken as
+# 0, the least it can be (the durations only enter the lower bound on mission time). A precondition appears only when the skill needs it: the
+# docked work pose and empty jaws for pick, press and scan; the held item and a free support for place; empty jaws for
+# stow. Navigation and docking need nothing: the effect sets the location from wherever the rover is.
+durations: {navigate_to_feature: {base_s: 15.4, per_m_s: 3.01}, navigate_to_pose: {base_s: 15.7, per_m_s: 2.37},
+            dock_at_feature: 13.4, dock_to_pose: 11.1, press: 37.8, pick: 83.2, removal: 83.2, place: 64.7, arm_ready: 2.8,
+            stow: 2.7}   # removal: a pick at a bay, not separable from pick in the records
+templates:
+  pick:
+    pre: ["base_at({support})", "gripper_empty", "item_at({serial},{support})"]
+    eff: ["held({serial})", "not gripper_empty", "not item_at({serial},{support})", "not {occ}", "not arm_stowed"]
+  # Module removal from an energized unit: the only irreversible action. Taking the module out empties an energized
+  # unit's bay, which trips its breaker at once (MODULE_MISSING), so the breaker and the energized state are in the effect.
+  removal:
+    pre: ["installed({support})", "{grant}"]
+    eff: ["not breaker_closed({unit})", "not energized({unit})", "not lamp_green({unit})", "not connector_ok({support})"]
+  place:
+    pre: ["base_at({support})", "held({serial})", "not {occ}"]
+    eff: ["item_at({serial},{support})", "not held({serial})", "gripper_empty", "{occ}"]
+  # The reset button closes a tripped breaker; the shutter button toggles the shutter, so opening it needs it closed.
+  # The press ends with the arm folded back to its travel posture. The evidence rule measures contact, not the equipment.
+  press_reset:
+    pre: ["base_at({feature})", "gripper_empty"]
+    eff: ["breaker_closed({unit})", "energized({unit})", "arm_stowed"]
+  press_shutter:
+    pre: ["base_at({feature})", "gripper_empty", "not shutter_open({unit})"]
+    eff: ["shutter_open({unit})", "arm_stowed"]
+  stow: {pre: ["gripper_empty"], eff: ["arm_stowed"]}
+  arm_ready: {pre: [], eff: ["not arm_stowed"]}
+
+# ---- sensing ---------------------------------------------------------------------------------------------------------
+# Telemetry (`power_status`) is implicit: cost 0, no precondition, window always; it reports the exogenous propositions.
+camera:   # one question per camera-observable proposition; "Answer yes or no first." (or, for a two-way choice, "Answer A
+          # or B first.", (B) the proposition true) is parsed by Vocabulary.read
+  cost_s: 0.02     # median sim time of a camera question with the clock held during inference
+  camera: front
+  # unit -> view pose the question is asked from (interaction.json view_poses)
+  lamp: {pdu_1: pdu_1, pdu_2: pdu_2, pdu_3: pdu_3, bess: bess, isru: isru}
+  shutter: {pdu_1: pdu_1_radiator, pdu_2: pdu_2_radiator, pdu_3: pdu_3_radiator, bess: bess_hvac}
+  # The lamp is red when the breaker is tripped and green when it is closed; in the simulator that is also energized.
+  lamp_question: "Straight ahead is the service panel of {name}. Is the round status lamp on it green (red means tripped, green means closed)? Answer yes or no first."
+  # the cover asked about by what each state looks like, not by its name
+  shutter_question:
+    pdu: "What is in the radiator opening of the {name} cabinet ahead: (A) a single flat plain grey panel, or (B) many thin vertical white fins? Answer A or B first."
+    bess: "What is on the front face of the HVAC condenser unit of {name} ahead: (A) a single flat plain grey panel, or (B) two large round fans? Answer A or B first."
+scan:     # serial-plate read: arm to one view of the lid, one frame, Data Matrix decode
+  cost_s: 5.7      # median sim time of a scan_label call
+  default_item: orbital replacement unit (ORU)
+held_item: {cost_s: 0.02}  # taken equal to the camera question (one frame, the model answering with the clock held)
+localization: {cost_s: 0.0}   # AMCL estimate, `base_pose`
+arm_posture: {cost_s: 0.0}    # joint encoders, `arm_state`
+
+# ---- missions: keys are the mission ids of experiments/akr/missions.py; goals are literal sets ---------------------------------
+# A goal is chosen so that knowing all of its literals implies the simulator's success predicate (SRB mission_success):
+#   maintenance: unit_healthy(U) and parked_and_stowed. unit_healthy = breaker closed with neither the overtemperature
+#   timer (shutter drawn on a closed breaker) nor the self-test timer (unserviceable module) pending. A goal names only
+#   what the mission statement asks for, never the condition a contingency mission introduces (that would hand the
+#   planner the answer): a drawn shutter re-trips the breaker 30 s after a reset (SRB retrip_delay_s), a bad module after
+#   3 s, and the rover needs more than 30 s from any unit to the dock (navigate 22.4 s + dock 11.1 s, medians), so the
+#   telemetry read before the success check shows the re-trip. parked_and_stowed is base_at(dock) and arm_stowed.
+#   delivery: the named item resting on its destination, parked and stowed (stowing needs empty jaws). An occupier must
+#   leave the destination for the place to be admissible; that it rests on some other support is a disjunction no
+#   literal expresses and is not in the goal (a dropped occupier is not excluded by knowledge).
+aliases:
+  restore_pdu_1_shutter: a_l2_radiator_cover_pdu1
+  no_spare_pdu_1: a_l4_cannibalize_pdu1
+  deliver_serial_mislocated: b_serial_mislocated
+  deliver_serial_swapped: b_serial_swapped
+missions:
+  # reference: Mission A
+  a_l0_pdu2_reset: [breaker_closed(pdu_2), base_at(dock), arm_stowed]
+  a_l1_bess_reset: [breaker_closed(bess), base_at(dock), arm_stowed]
+  a_l1_isru_reset: [breaker_closed(isru), base_at(dock), arm_stowed]
+  a_l1_misreport_bess: [breaker_closed(bess), base_at(dock), arm_stowed]
+  # reference: Mission B
+  b_l0_spare_oru_pdu3: ["item_at(ORU-0417,pdu_3_shelf/shelf)", base_at(dock), arm_stowed]
+  b_l1_bat_spare_bess: ["item_at(BAT-0102,bess_stand/slot_0)", base_at(dock), arm_stowed]
+  b_l1_consumables_habitat: ["item_at(CNS-0301,habitat_stand/slot_0)", base_at(dock), arm_stowed]
+  # contingency
+  a_l2_radiator_cover_pdu1: [breaker_closed(pdu_1), base_at(dock), arm_stowed]
+  a_l2_radiator_cover_bess: [breaker_closed(bess), base_at(dock), arm_stowed]
+  a_l3_module_failure_bess: [breaker_closed(bess), base_at(dock), arm_stowed]
+  a_l3_module_failure_isru: [breaker_closed(isru), base_at(dock), arm_stowed]
+  a_l4_cannibalize_pdu1: [breaker_closed(pdu_1), base_at(dock), arm_stowed]
+  b_l2_destination_occupied_habitat: ["item_at(CNS-0301,habitat_stand/slot_0)", base_at(dock), arm_stowed]
+  # sequential fault, and wrong records (the brief names the serial)
+  a_compound_fault_bess: [breaker_closed(bess), base_at(dock), arm_stowed]
+  b_serial_mislocated: ["item_at(ORU-0417,pdu_3_shelf/shelf)", base_at(dock), arm_stowed]
+  b_serial_swapped: ["item_at(ORU-0417,pdu_1_shelf/shelf)", base_at(dock), arm_stowed]

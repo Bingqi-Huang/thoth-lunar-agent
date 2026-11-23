@@ -1,0 +1,1247 @@
+// SPDX-License-Identifier: Apache-2.0
+// Allocation-free geometric self-collision core.
+//
+// Hand-rolled forward kinematics + closed-form capsule-capsule distance, with
+// NO external dependency (no Eigen / KDL / Pinocchio) so the safety kernel
+// stays small and auditable. All hot-path functions are
+// allocation-free: the model is built once at configure time and the FK
+// scratch is pre-sized and reused, so they only touch caller-owned storage.
+//
+// Frames: a capsule's segment runs along its local +Z from -half_length to
+// +half_length, swept by `radius` (the MJCF/URDF capsule convention).
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace openral_safety_kernel {
+
+/// Plain 3-vector.
+struct Vec3 {
+  double x{0.0};
+  double y{0.0};
+  double z{0.0};
+};
+
+/// Rigid transform: row-major 3x3 rotation `r` + translation `t`. POD, stack
+/// friendly. Default-constructs to the identity.
+struct Transform {
+  double r[9]{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+  Vec3 t{};
+};
+
+/// Joint connecting a link to its parent.
+enum class JointKind : std::uint8_t {
+  kFixed = 0,
+  kRevolute = 1,
+  kPrismatic = 2,
+};
+
+/// A capsule attached to a link, expressed in that link's frame.
+struct Capsule {
+  double radius{0.0};
+  double half_length{0.0};
+  Transform origin{};
+};
+
+/// An oriented box (OBB) attached to a link, expressed in that link's frame.
+/// The box spans `[-half_extents.k, +half_extents.k]` along each local axis k;
+/// `origin` places+orients it in the link frame (same convention as `Capsule`).
+/// A box fits a blocky link (a near-cubic housing, e.g. the SO-ARM100/101
+/// `base`) far tighter than a capsule, whose circular cross-section must bulge
+/// past the block's flat faces and over-report clearance (issue #84).
+struct Obb {
+  Vec3 half_extents{};
+  Transform origin{};
+};
+
+/// Number of axis directions in a 26-DOP: 3 face, 4 corner, 6 edge. Each
+/// direction carries a `lo`/`hi` slab, hence 26 halfspaces.
+inline constexpr int kDopAxes = 13;
+
+/// The 26-DOP's axis directions, unit-normalised, in the owning OBB's own local
+/// frame. The first three ARE the box's axes, which is what makes "the DOP is
+/// inside the shipped box" a two-line configure-time check rather than a
+/// polytope enumeration: a 26-DOP is contained in its own first three slabs, so
+/// `-half_extents <= dop_lo[k] <= dop_hi[k] <= half_extents` for k in {0,1,2}
+/// proves containment for the whole polytope.
+inline constexpr double kDopAxis[kDopAxes][3] = {
+    {1.0, 0.0, 0.0},
+    {0.0, 1.0, 0.0},
+    {0.0, 0.0, 1.0},
+    {0.5773502691896258, 0.5773502691896258, 0.5773502691896258},
+    {0.5773502691896258, 0.5773502691896258, -0.5773502691896258},
+    {0.5773502691896258, -0.5773502691896258, 0.5773502691896258},
+    {0.5773502691896258, -0.5773502691896258, -0.5773502691896258},
+    {0.7071067811865476, 0.7071067811865476, 0.0},
+    {0.7071067811865476, -0.7071067811865476, 0.0},
+    {0.7071067811865476, 0.0, 0.7071067811865476},
+    {0.7071067811865476, 0.0, -0.7071067811865476},
+    {0.0, 0.7071067811865476, 0.7071067811865476},
+    {0.0, 0.7071067811865476, -0.7071067811865476},
+};
+
+/// Hard ceiling on a stage-2 hull's vertex count, enforced at configure time.
+///
+/// Cost bound, measured not chosen: stage-2 support is an exhaustive vertex
+/// scan (the only form provably the true support — see hull_cell_distance),
+/// linear in vertex count. On the reference host the staged path beats
+/// box_box_distance up to ~320 vertices; past that it loses. Panda's link1
+/// hull (1588 vertices) measured 0.76x the shipped routine's speed at 400
+/// occupied cells, so it runs stage 1 only — still a strict tightening
+/// (25.7 mm support excess vs the shipped box's 53.3 mm) and ~9x cheaper per
+/// cleared cell. See docs/reference/collision-hull-narrow-phase.md.
+inline constexpr int kMaxTightHullVertices = 320;
+
+/// Floating-point slack (m) `validate_tight_geometry` allows when checking a
+/// stage-2 hull vertex against its own DOP slabs.
+///
+/// Tangent by construction — slab bound is h_mesh(u), the max of u.x over
+/// the same vertex set — so the true relation is equality on at least one
+/// vertex per axis, and producer/kernel evaluate that dot product in
+/// different orders. 1 nm is 11 orders below the 25 mm voxel pitch and 7
+/// below the shipped boxes' 0.055 mm containment margin — numerical
+/// agreement, not geometric room. The DOP-inside-OBB check takes no slack:
+/// that margin is real, measured 0.055-0.132 mm.
+inline constexpr double kTightContainmentEpsilonM = 1e-9;
+
+/// Slack (m) on a collision gate with an exact, documented threshold —
+/// currently the place-approach allowance ceiling, where "exactly at the
+/// ceiling it trips" is the accepted-cost bound itself.
+///
+/// A distance reaching such a gate ends a chain of rigid transforms; which
+/// side of an exact tie the last ULP falls on is association-order artefact,
+/// not a decision. Biasing onto STOP is conservative; 1 pm is 13 orders
+/// below the 25 mm lattice — numerical determinism, not geometric room, as
+/// with kTightContainmentEpsilonM.
+inline constexpr double kGateTieEpsilonM = 1e-12;
+
+/// Iteration ceiling for the stage-2 GJK loop. Hitting it is not a failure
+/// mode: every iteration's result is a *lower* bound on the true distance, so
+/// a truncated run is simply more conservative than a converged one.
+inline constexpr int kGjkMaxIterations = 24;
+
+/// Ceiling on stage-2 invocations in ONE check_voxel_collision call, across
+/// every link. Past it the check keeps refining with stage 1 and the shipped
+/// box_box_distance (today's behaviour or better), so the cap can only make
+/// the answer more conservative, never less.
+///
+/// The "hard cap on stage-2 invocations per step" that
+/// docs/reference/collision-tight-geometry.md §12.2 names as the alternative
+/// to shipping an oversized hull. Stage 2's cost is driven by how many cells
+/// stage 1 *cannot* clear — a property of the map, not the robot. Measured
+/// RoboCasa start state: two cells reach stage 2. Clutter pressed against
+/// the arm at the real HAL's 20 mm world-voxel margin drove that toward
+/// every occupied cell; unbounded stage 2 turned a 1.07x speedup into a
+/// 1.5x slowdown. The cap bounds the worst case at ~1.1x the shipped
+/// routine instead.
+///
+/// 32 is ~16x measured demand, ~0.4 ms of a 10 ms budget over a 16-step
+/// horizon. Changing it changes a real-time bound: belongs in the hazard log.
+inline constexpr int kMaxStage2PerCheck = 32;
+
+/// Convergence tolerance (m) for the stage-2 GJK loop. Four orders of
+/// magnitude below the 25 mm voxel pitch and three below anything the margin
+/// arithmetic resolves.
+inline constexpr double kGjkTolerance = 1e-9;
+
+/// Tight convex geometry refining ONE Obb in CollisionModel::boxes, for the
+/// arm-link-vs-world-voxel check only. Expressed in the box's own local
+/// frame, so the broad-phase window (sized from half_extents alone) never
+/// moves.
+///
+/// Two stages, both strict subsets of the shipped box:
+/// * Stage 1, always on: 26-DOP slabs [dop_lo[i], dop_hi[i]] along
+///   kDopAxis[i]. Built offline as tangent halfspaces u.x <= h_mesh(u), so
+///   containment of the true mesh is true by construction, not by fit — no
+///   optimiser tolerance in the argument.
+/// * Stage 2, optional: vertex_count vertices of the link's exact convex
+///   hull, CSR-packed at CollisionModel::hull_vertices[vertex_first].
+///   vertex_count == 0 stops at stage 1 (link1's representation: its exact
+///   hull exceeds kMaxTightHullVertices).
+struct LinkHull {
+  int vertex_first{0};        ///< offset into CollisionModel::hull_vertices
+  int vertex_count{0};        ///< hull vertex count; 0 = stage 1 only
+  double dop_lo[kDopAxes]{};  ///< per-axis lower slab, box-local frame
+  double dop_hi[kDopAxes]{};  ///< per-axis upper slab, box-local frame
+};
+
+/// Flattened kinematic + collision model. Links are topologically ordered so
+/// every parent index is < its children's. A link may carry zero, one, or
+/// several capsules (real MJCF bodies often have several collision geoms);
+/// `capsule_link[c]` names the link capsule `c` is rigidly attached to. Built
+/// once at configure time.
+struct CollisionModel {
+  std::size_t n_links{0};
+  std::vector<int> parent;            ///< parent link index; -1 for the root
+  std::vector<JointKind> joint_kind;  ///< joint connecting parent -> this link
+  std::vector<int> dof_index;         ///< qpos index for revolute/prismatic; -1 if fixed
+  std::vector<Transform> origin;      ///< fixed parent-link -> joint transform
+  std::vector<Vec3> axis;             ///< joint axis (unit) in the joint frame
+  std::vector<int> capsule_link;      ///< link index each capsule attaches to
+  std::vector<Capsule> capsules;      ///< parallel to capsule_link
+  std::vector<int> box_link;          ///< link index each OBB attaches to
+  std::vector<Obb> boxes;             ///< parallel to box_link (blocky links)
+  /// Parallel to `boxes`: index into `hulls` for the tight geometry refining
+  /// that box in the world-voxel check, or -1 for none. Empty means no box
+  /// carries tight geometry — the pre-#166 behaviour, which every
+  /// capsule-lowered robot and every manifest without `tight_geometry` keeps.
+  std::vector<int> box_hull;
+  std::vector<LinkHull> hulls;                     ///< tight geometry, box-local frame
+  std::vector<Vec3> hull_vertices;                 ///< CSR-packed stage-2 vertices, box-local
+  std::vector<std::pair<int, int>> allowed_pairs;  ///< unordered link pairs to skip
+};
+
+/// Pre-sized scratch reused across calls; resize `link_world` to `n_links`
+/// once at configure time so the hot path never allocates.
+struct CollisionScratch {
+  std::vector<Transform> link_world;  ///< per-link frame in the base frame
+};
+
+/// Bounded set of world obstacles, each a capsule already expressed in the
+/// robot base frame (`origin` is the absolute base-frame transform — no link
+/// composition). Ingested from perception into a pre-sized buffer.
+struct WorldModel {
+  std::vector<Capsule> capsules;
+};
+
+/// Binding absolute ceiling on the declaration-scoped place approach
+/// allowance (ADR-0097's 2026-08-14 amendment, Condition 1, calibrated by
+/// its Second Amendment 2026-08-15; hazard log HZ-0097-4 mitigation 1,
+/// "Calibration 2026-08-15"). Allowance = min(kPlaceApproachAllowanceVoxels
+/// x one voxel, this), so a coarser map can only *shrink* it, never widen.
+/// Both numbers are maintainer-set conditions, not implementation choices:
+/// Entry 010's HZ-0095-2 is the precedent this ceiling prevents recurring
+/// (a 25 mm sim-resolution parameter silently becoming 50 mm at real
+/// hardware's 5 cm resolution under a purely resolution-relative formula).
+/// Changing either needs a new recorded decision.
+///
+/// Was 0.025 until 2026-08-15, when the 5-run battery
+/// (spark:~/openral-runs/2026-08-15-baguette-battery/run1) showed a
+/// one-voxel allowance is *structurally* marginal, not occasionally short:
+/// sized to absorb exactly the ~one-voxel map-vs-truth error at a placement
+/// pose, leaving nothing for the real contact the witness is earned by
+/// (run 1 read 26.48 mm penetration at a -2.43 mm ground-truth contact,
+/// 1.48 mm past the old cap).
+inline constexpr double kMaxPlaceApproachAllowanceM = 0.04;
+
+/// Voxel multiple in the same allowance (ADR-0097's Second Amendment). 37.5 mm
+/// at sim's 25 mm grid; at a real 50 mm grid `1.5 × 50 = 75 mm` is capped by
+/// `kMaxPlaceApproachAllowanceM` to 40 mm, which is the whole point of having
+/// two numbers.
+inline constexpr double kPlaceApproachAllowanceVoxels = 1.5;
+
+/// The allowance cap at a given live voxel `resolution` — `min(1.5 × voxel,
+/// 4 cm)`, and `0.0` for an unusable resolution. One definition, so the geometry
+/// and the `safety.place_region_armed` log line can never quote different
+/// numbers for the same map.
+inline constexpr double place_approach_allowance_cap(double resolution) noexcept {
+  if (!(resolution > 0.0)) {
+    return 0.0;
+  }
+  const double scaled = kPlaceApproachAllowanceVoxels * resolution;
+  return scaled < kMaxPlaceApproachAllowanceM ? scaled : kMaxPlaceApproachAllowanceM;
+}
+
+/// How far PAST the approach allowance a declared payload's world contact
+/// may read before it stops being refusable and becomes a latched stop
+/// (#176).
+///
+/// Sized by measured OVERSHOOT, not a voxel multiple: the approach
+/// allowance is calibrated for a payload *reaching* its support through a
+/// voxel-inflated opening; an *arrived* payload reads deeper, purely from
+/// map discretisation. 2026-08-26 oriented-grid-2: baguette place read
+/// -38.22 mm against a 37.5 mm allowance (0.72 mm over) while ground truth
+/// measured -1.4 mm contact.
+///
+/// 0.2 voxels (5 mm on sim's 25 mm grid) is ~7x that overshoot — deliberately
+/// not larger. Per-cell penetration saturates near the allowance itself
+/// (measured deepest reachable payload-vs-cell: -37.50 mm at 25 mm,
+/// -50.00 mm at 50 mm), so a full-voxel band would cover the whole reachable
+/// range and stop bounding anything; at 0.2 voxels real depth still latches
+/// on both lattices.
+///
+/// Not permission to penetrate: a reading inside it refuses the candidate
+/// action the way a controller refuses an unreachable pose, not by latching
+/// a fault the operator must reset. Past the band it's the latched stop it
+/// is today.
+inline constexpr double kPlaceAdvisoryDepthVoxels = 0.2;
+
+/// Absolute ceiling on that band, the same two-number construction (and the
+/// same reason) as `kMaxPlaceApproachAllowanceM`: a coarser map must never buy
+/// a wider advisory band, only a narrower one. 5 mm holds the band at 5 mm on
+/// both the sim and real lattices, so the reachable depth past it — where a
+/// stop still latches — does not shrink as the map coarsens.
+inline constexpr double kMaxPlaceAdvisoryDepthM = 0.005;
+
+/// The advisory band at a given live voxel `resolution` — `min(0.2 × voxel,
+/// 5 mm)`, and `0.0` for an unusable resolution (which collapses the band and
+/// leaves today's latched stop).
+inline constexpr double place_advisory_depth(double resolution) noexcept {
+  if (!(resolution > 0.0)) {
+    return 0.0;
+  }
+  const double scaled = kPlaceAdvisoryDepthVoxels * resolution;
+  return scaled < kMaxPlaceAdvisoryDepthM ? scaled : kMaxPlaceAdvisoryDepthM;
+}
+
+/// Sanity bound on one side of a declared place region. A declaration names ONE
+/// receptacle, not a room, so a half-extent past this is a producer error and
+/// buys no allowance at all (fail-closed toward the unchanged margin).
+inline constexpr double kMaxPlaceRegionHalfExtentM = 1.5;
+
+/// Sanity bound on a declared place region's volume (m³) — a 2 m cube. Same
+/// fail-closed direction as `kMaxPlaceRegionHalfExtentM`.
+inline constexpr double kMaxPlaceRegionVolumeM3 = 8.0;
+
+/// Ceiling on the primitive count of a declared target's own geometry
+/// (ADR-0098). Matches `openral_core.PlaceRegion.MAX_GEOMETRY_PRIMITIVES` — one
+/// bound declared on both sides of the wire, so a region the schema accepts can
+/// never overflow the kernel. A list past this refuses the WHOLE region rather
+/// than truncating it: half a receptacle is a worse model than none, because the
+/// missing half would be adjudicated as if it were not there.
+inline constexpr std::size_t kMaxPlaceTargetPrimitives = 64;
+
+struct AttachedPrimitive;
+
+/// Producer-supplied region of a live place declaration (ADR-0097's
+/// 2026-08-14 amendment), lowered into the kernel's frame convention: an
+/// oriented box whose pose is in the robot base frame — same as the
+/// occupancy grid, which is why the node only accepts a region whose
+/// declared frame_id matches the grid's.
+///
+/// While valid, payload-vs-world voxel checks for objects in object_mask
+/// run at a margin reduced by place_approach_allowance_cap(resolution)
+/// against cells whose CENTRE lies inside the box. Everything else is
+/// untouched: arm-vs-world, payload-vs-world outside the box, the
+/// support-contact witness, the reported evidence. A license to *approach*
+/// the contact the declaration already licenses — the hard stop behind the
+/// reduced margin is unchanged, so deepening past the allowance still stops
+/// (HZ-0097-4 mitigation 3).
+///
+/// valid == false (no declaration, retracted/expired, never supplied, or
+/// failed ingest_place_region) means no allowance anywhere — identical to
+/// pre-amendment behaviour.
+///
+/// geometry is the ADR-0098 half: the declared target's OWN primitives,
+/// posed in the robot base frame, so a cell inside the box can be
+/// adjudicated against the modelled surface instead of the 25 mm cube that
+/// quantised it. A VIEW — the node owns the buffer, as with
+/// VoxelGrid::occupancy — and nullptr/n_geometry == 0 is the ordinary case
+/// for a producer that measures a box but no geometry, where the region
+/// behaves exactly as before ADR-0098.
+struct PlaceApproachRegion {
+  bool valid{false};            ///< a live, validated region is in force
+  std::uint8_t object_mask{0};  ///< bit i: attached object i is the declaration's payload
+  Transform pose{};             ///< region box centre pose, robot base frame
+  Vec3 half_extents{};          ///< region box half-extents (m, all > 0)
+  const AttachedPrimitive* geometry{nullptr};  ///< declared target's own geometry, base frame
+  std::size_t n_geometry{0};                   ///< primitives in `geometry` (0 = box only)
+};
+
+/// Outcome of a place-region ingest attempt (`ingest_place_region`).
+///
+/// Every value other than kOk means the same thing to the geometry (*no
+/// allowance* — unchanged pre-amendment margin) but something different to
+/// whoever reads the log, so the outcome is not a bool. kNoObject is the
+/// ordinary pre-grasp state: dispatch declares the place phase before the
+/// payload is attached, so the declaration resolves to no carried object
+/// until the grasp lands. The rest are producer errors. Collapsing both
+/// into one reason=bounds label is what round-8
+/// (spark:~/openral-runs/2026-08-15-round8/) reported as 672-811 identical
+/// bounds warnings per run, none describing a bound.
+enum class PlaceRegionStatus : std::uint8_t {
+  kOk = 0,
+  kNoObject = 1,          ///< empty object_mask — the declared payload is not carried
+  kBadPose = 2,           ///< non-finite region pose
+  kBadExtents = 3,        ///< non-finite half-extent
+  kDegenerate = 4,        ///< half-extent <= 0: a box with no interior licenses nothing
+  kOversize = 5,          ///< a side past kMaxPlaceRegionHalfExtentM
+  kOversizeVolume = 6,    ///< a box past kMaxPlaceRegionVolumeM3 — a room, not a receptacle
+  kBadGeometry = 7,       ///< a declared-target primitive with a malformed shape (ADR-0098)
+  kGeometryOverflow = 8,  ///< more target primitives than kMaxPlaceTargetPrimitives
+};
+
+/// A dense, fixed-capacity 3-D occupancy voxel grid in the robot base frame —
+/// the kernel-facing form of a 3-D world map (e.g. an OctoMap lowered by a
+/// perception bridge into a bounded local volume). `occupancy` is row-major
+/// with x fastest (`idx = x + sx*(y + sy*z)`); a cell is occupied when its
+/// value is non-zero. A view: `occupancy` points at a buffer the caller owns.
+struct VoxelGrid {
+  /// Base-frame pose of voxel (0,0,0)'s minimum corner.
+  ///
+  /// pose.r is NOT decoration: the grid's lattice is the source map's, fixed
+  /// in map/odom, so its axes turn relative to base_frame as the robot does.
+  /// Cell indices run along the grid's own axes, oriented by pose.r.
+  /// Publishing on the map's lattice removes the 29-40 mm dilation a
+  /// base-aligned grid paid to re-express one lattice on another (issue
+  /// #173); the rotation is carried here instead of dissolving into extra
+  /// occupied cells.
+  ///
+  /// Identity is correct only for a lattice that really is base-aligned;
+  /// ingest refuses a non-unit rotation rather than assuming one.
+  Transform pose{};
+  double resolution{0.0};  ///< voxel edge length (m)
+  int sx{0};               ///< grid dimensions
+  int sy{0};
+  int sz{0};
+  const std::uint8_t* occupancy{nullptr};              ///< sx*sy*sz cells, non-zero = occupied
+  const std::uint8_t* attached_contact_mask{nullptr};  ///< bit i: object i had attach-time contact
+  const double* attached_contact_distance{nullptr};    ///< object-major baseline distance
+  std::size_t attached_contact_stride{0};              ///< cells per object in baseline buffer
+  double attached_contact_tolerance{0.0};              ///< physical slack on an attested depth (m)
+  std::uint8_t support_witness_live{0};                ///< bit i: object i's witness is still live
+  PlaceApproachRegion place_region{};                  ///< live place declaration's region, if any
+};
+
+/// One collision check's outcome — and, on a hit, the E-stop evidence.
+///
+/// link_a, link_b and min_distance always describe ONE geometry pair: on a
+/// hit, the deepest pair that tripped the gate. Never sample them from
+/// different pairs — evidence naming one cell while quoting another's
+/// distance sends downstream diagnosis after a penetration that doesn't
+/// exist (e.g. an exempt attach-time contact residue reading as the fresh
+/// support contact that stopped the robot).
+///
+/// sweep_min_distance is the separate, sweep-wide minimum over EVERY pair
+/// checked, including pairs that stayed clear of the margin or were
+/// exempted. Diagnostic only, not the reason for the stop — its own field,
+/// its own log key.
+///
+/// With no hit there is no pair to describe, so `min_distance` keeps its
+/// clearance meaning and equals `sweep_min_distance`. Both are `+inf` when the
+/// check compared nothing.
+/// place_allowance_active is disclosure, never a decision (CLAUDE.md §1.4):
+/// true when the reported pair tripped a margin the declaration-scoped
+/// place approach allowance had *reduced*, so an operator knows the stop
+/// happened inside a declared region at a reduced margin. min_distance
+/// stays the pair's true surface distance either way.
+///
+/// advisory narrows what a hit *licenses the caller to do*, nothing else.
+/// True only for issue #176's one class: an attached payload against world
+/// occupancy, inside its own declared place region, past the approach
+/// allowance but still within kPlaceAdvisoryDepthVoxels of it — the caller
+/// refuses the action without latching a fault or E-stop, bounded to a
+/// capped number of consecutive refusals.
+///
+/// Never set for a robot link, never outside a live declaration, never past
+/// that depth — those stay the latched stop. hit is still true: an
+/// advisory hit is a refusal, not a pass.
+struct CollisionHit {
+  bool hit{false};
+  int link_a{-1};
+  int link_b{-1};
+  double min_distance{0.0};        ///< the reported pair's surface distance (clearance if no hit)
+  double sweep_min_distance{0.0};  ///< minimum over every checked pair, gated or exempted
+  bool place_allowance_active{false};  ///< the reported pair's margin was reduced by the allowance
+  bool advisory{false};                ///< refusable without a latch (see above)
+  /// The reported distance is to the declared place target's OWN geometry
+  /// (ADR-0098), not to the occupied cell `link_b` indexes. Set only on a pair
+  /// the declaration's shipped geometry adjudicated; the caller names the
+  /// declared target rather than the cell, so the evidence can never quote one
+  /// geometry's distance under another's identity.
+  bool place_target_adjudicated{false};
+  /// Reported min_distance is the OBB's BOUND, not a measurement of the
+  /// geometry named in the evidence.
+  ///
+  /// Set only for a self-collision pair whose two links both ship a stage-2
+  /// hull (#191/#202) and whose hulls GJK found OVERLAPPING. Penetration
+  /// depth needs an expanding-polytope step the kernel doesn't run, so on
+  /// that branch hull_hull_distance falls back to box_box_distance — sound
+  /// (hull is contained in its box, so the box can only report MORE
+  /// penetration) but can be far looser than truth: panda_link5<->panda_link7
+  /// at the 2026-09-04 battery's tripping configuration reads -31.97 mm for
+  /// a ~1.5 mm hull interpenetration, 20x.
+  ///
+  /// Publishing that under the identity of a check that exists BECAUSE the
+  /// box can't be trusted for the pair is the defect this flag closes. Trip
+  /// decision is unaffected (both numbers <= 0, pair trips either way) —
+  /// disclosure only, like place_target_adjudicated, never a gate.
+  bool depth_is_box_bound{false};
+};
+
+/// Convex shape of a collision object rigidly attached to a robot link
+/// (grasped payload). Numeric values match
+/// ``openral_msgs/AttachedCollisionObject.SHAPE_*`` so the ingest path can
+/// decode the wire field without translation.
+enum class AttachedShapeKind : std::uint8_t {
+  kSphere = 1,
+  kCapsule = 2,
+  kBox = 3,
+};
+
+/// One convex collision primitive belonging to an attached object, expressed
+/// in the object's frame by `pose_in_object`. A sphere is a capsule with
+/// `half_length == 0`. On each checked configuration the kernel composes it
+/// through FK: `scratch.link_world[attach_link] · object.pose_in_link ·
+/// pose_in_object` into the base frame.
+struct AttachedPrimitive {
+  AttachedShapeKind kind{AttachedShapeKind::kSphere};
+  double radius{0.0};          ///< sphere / capsule radius
+  double half_length{0.0};     ///< capsule half-length (0 for a sphere)
+  Vec3 half_extents{};         ///< box half-extents
+  Transform pose_in_object{};  ///< primitive pose in the owning object's frame
+  /// Index into `AttachedModel::hulls` of the stage-2 geometry refining this
+  /// primitive's box in the payload-vs-world-voxel check, or -1 for none.
+  ///
+  /// The payload-side twin of `CollisionModel::box_hull`, and it exists for
+  /// the same reason: a carried MESH geom's only lowering is its local AABB,
+  /// whose corners stood a median 50.78 mm (max 88.22 mm) proud of the mesh
+  /// across the 2026-09-10 resolution A/B — 2.3-3.9x the entire world-voxel
+  /// quantisation term, while 97% of the 15 mm arm's stops were
+  /// payload-vs-world and roughly half of those fired with the payload a
+  /// centimetre or more clear of anything (issue #266).
+  ///
+  /// -1 is the pre-#266 behaviour and the honest answer for everything that
+  /// needs no refinement: a sphere/capsule/box geom lowers exactly, and a
+  /// producer that shipped no refinement (or shipped one that failed the
+  /// containment proof at ingest) is checked as the plain box.
+  int hull_index{-1};
+};
+
+/// One collision object rigidly attached to a robot link (a grasped payload).
+/// The object keeps a single identity, attach link, touch-link set, and an
+/// object pose in the attach-link frame (`pose_in_link`), but may own several
+/// primitives. `prim_first` / `prim_count` index a slice of
+/// `AttachedModel.primitives` (the object's geometry); `touch_first` /
+/// `touch_count` index a slice of `AttachedModel.touch_links` naming the robot
+/// links explicitly allowed to contact this object (the attach link itself is
+/// always allowed).
+///
+/// `has_support_witness` and the four `support_*` fields carry World State's
+/// support-contact attestation (ADR-0092 D6) — the bounded statement that this
+/// payload rests on a named environment surface. The geometry is expressed in
+/// the **object's own frame**, not the base frame and not a voxel index, so it
+/// stays valid while the mobile base drives and the voxel lattice re-phases
+/// underneath the robot. `support_normal` is the support surface's outward unit
+/// normal: it points **from the supporting solid toward the payload**, so the
+/// support occupies the half-space `(x - support_point)·support_normal <= 0`.
+/// No attestation (`has_support_witness == false`) means no exemption.
+struct AttachedObject {
+  Transform pose_in_link{};             ///< object pose in the attach-link frame
+  int attach_link{-1};                  ///< robot link index the object is attached to
+  int prim_first{0};                    ///< offset into AttachedModel.primitives
+  int prim_count{0};                    ///< number of primitives owned by this object
+  int touch_first{0};                   ///< offset into AttachedModel.touch_links
+  int touch_count{0};                   ///< number of touch-link entries for this object
+  bool has_support_witness{false};      ///< World State attested a support contact
+  Vec3 support_point{};                 ///< attested contact point, object frame
+  Vec3 support_normal{0.0, 0.0, 1.0};   ///< unit outward support normal, object frame
+  double support_patch_radius{0.0};     ///< lateral radius of the supported patch (m)
+  double support_max_penetration{0.0};  ///< attested PHYSICAL contact depth bound (m)
+  /// ADR-0100 contact-force witness. has_contact_force_witness is the wire's
+  /// contact_force_valid; contact_force_calibrated is the witness's own
+  /// magnitude_calibrated — WITHOUT it, contact_force_magnitude is not in
+  /// Newtons and the gate must not read it (survey §21.7: no published work
+  /// validates MuJoCo force magnitudes against real F/T measurements).
+  /// contact_force_target_matches is resolved at ingest: witness's target_id
+  /// names the live declaration's target. All three default to no-gate.
+  bool has_contact_force_witness{false};
+  bool contact_force_calibrated{false};
+  bool contact_force_target_matches{false};
+  double contact_force_magnitude{0.0};  ///< Newtons ONLY when `contact_force_calibrated`
+};
+
+/// Bounded, fixed-capacity set of attached payloads ingested from the world
+/// state. `objects`, `primitives`, and `touch_links` are pre-sized to their
+/// configured caps at configure time; the ingest path fills the first
+/// `n_objects` / `n_primitives` entries and the hot path never allocates.
+/// `n_objects == 0` means nothing is carried.
+/// Ceiling on a declaration's contact-force threshold. Mirrors
+/// `openral_core.PlaceDeclaration.MAX_CONTACT_FORCE_THRESHOLD_N` — one bound
+/// declared on both sides of the wire, so a schema-valid declaration can never
+/// overflow the kernel. The value is ISO/TS 15066 Table A.2's quasi-static limit
+/// for hands and fingers (140 N), the most permissive body region in the table.
+inline constexpr double kMaxContactForceThresholdN = 140.0;
+
+/// Live declaration's contact-force bound (ADR-0100, survey Path C).
+///
+/// Deliberately NOT folded into PlaceApproachRegion: that struct is valid
+/// only when a producer measured a region, but dispatch publishes
+/// declarations with no region at all (region_valid=false). The force bound
+/// travels with the *declaration*, which exists in both cases, so it needs
+/// its own carrier.
+///
+/// valid == false (no declaration, retracted/expired, or threshold_n <= 0)
+/// means NO force gate anywhere — identical to pre-ADR-0100 behaviour. The
+/// default, and the fail-toward-shipped direction.
+struct PlaceForceGate {
+  bool valid{false};            ///< a live declaration supplies a positive threshold
+  std::uint8_t object_mask{0};  ///< bit i: attached object i is the declaration's payload
+  double threshold_n{0.0};      ///< the declaration's bound, in (0, kMaxContactForceThresholdN]
+};
+
+/// Outcome of the declaration-scoped contact-force gate.
+///
+/// tripped is the ONLY thing this can say. The gate adds a refusal, never
+/// removes one (ADR-0100 §1): evaluated after every geometric check passed,
+/// so tripped converts an accept into a refusal, nothing else — no branch
+/// turns a refusal into an accept, widens a margin, or creates an exemption.
+struct ContactForceGateResult {
+  bool tripped{false};
+  int object_index{-1};     ///< attached object whose witness tripped, or -1
+  double magnitude_n{0.0};  ///< the calibrated magnitude judged
+  double threshold_n{0.0};  ///< the declaration bound it was judged against
+};
+
+struct AttachedModel {
+  std::size_t n_objects{0};                   ///< active object count (<= objects.size())
+  std::size_t n_primitives{0};                ///< active primitive count (<= primitives.size())
+  std::vector<AttachedObject> objects;        ///< capacity = max attached objects
+  std::vector<AttachedPrimitive> primitives;  ///< flattened, capacity = max primitives
+  std::vector<int> touch_links;               ///< flattened touch-link indices, capacity = cap
+  PlaceForceGate force_gate{};                ///< live declaration's force bound, if any
+  /// Stage-2 geometry for the primitives that carry it, parallel to
+  /// `primitives` (entry p refines primitive p; `AttachedPrimitive::hull_index`
+  /// is the live cross-reference and is -1 when the entry is unused). Unlike a
+  /// robot's, a payload's hull arrives on the wire and changes whenever the
+  /// grasp does, so both buffers are sized to their caps at configure time and
+  /// refilled in place by `ingest_attached_objects` — the hot path never
+  /// allocates, exactly as for the fixed link hulls.
+  std::vector<LinkHull> hulls;
+  std::vector<Vec3> hull_vertices;  ///< CSR-packed stage-2 vertices, primitive-box-local
+};
+
+/// Parsed, still-by-name primitive record produced by the ROS ingest callback
+/// (one entry per wire `AttachedCollisionPrimitive`). Not on the hot path.
+struct AttachedPrimitiveInput {
+  AttachedShapeKind kind{AttachedShapeKind::kSphere};
+  double radius{0.0};
+  double half_length{0.0};
+  Vec3 half_extents{};
+  Transform pose_in_object{};
+  /// Wire stage-2 refinement, still UNVALIDATED. `has_tight` false (the
+  /// default, and every pre-#266 publisher) means the box is the model.
+  /// `ingest_attached_objects` proves containment before any of this reaches
+  /// `AttachedModel`; a refinement that fails is dropped and the primitive is
+  /// checked as the plain box, which is strictly the conservative direction.
+  bool has_tight{false};
+  double dop_lo[kDopAxes]{};
+  double dop_hi[kDopAxes]{};
+  std::vector<Vec3> hull_vertices;  ///< exact hull, box-local; empty = stage 1 only
+};
+
+/// Parsed, still-by-name attached-object record produced by the ROS ingest
+/// callback and handed to `ingest_attached_objects` for capacity + link-name
+/// validation. Not on the hot path (built once per world-state message).
+struct AttachedObjectInput {
+  Transform pose_in_link{};              ///< object pose in the attach-link frame
+  std::string attach_link;               ///< attach-link name (resolved against link_names)
+  std::vector<std::string> touch_links;  ///< touch-link names (resolved against link_names)
+  std::vector<AttachedPrimitiveInput> primitives;  ///< one or more owned primitives
+  bool has_support_witness{false};                 ///< wire `support_contact_valid`
+  Vec3 support_point{};                            ///< attested contact point, object frame
+  Vec3 support_normal{};                     ///< outward support normal, object frame (normalised)
+  double support_patch_radius{0.0};          ///< lateral patch radius (m)
+  double support_max_penetration{0.0};       ///< attested physical contact depth bound (m)
+  bool has_contact_force_witness{false};     ///< wire `contact_force_valid` (ADR-0100)
+  bool contact_force_calibrated{false};      ///< witness `magnitude_calibrated`
+  bool contact_force_target_matches{false};  ///< witness `target_id` names the declared target
+  double contact_force_magnitude{0.0};       ///< Newtons ONLY when calibrated
+};
+
+/// Outcome of an attachment-ingest attempt. Anything other than `kOk` is
+/// fail-closed at the call site (the world state is marked invalid and the next
+/// candidate action is dropped until a clean message lands).
+enum class AttachIngestStatus : std::uint8_t {
+  kOk = 0,
+  kOverflow = 1,     ///< object/primitive/touch-link cap exceeded
+  kUnknownLink = 2,  ///< attach_link or a touch_link not in the robot model
+  kMalformed = 3,    ///< bad primitive dimensions or an object with zero primitives
+};
+
+/// Build a rigid transform from a translation and fixed-axis XYZ Euler angles
+/// (roll about X, pitch about Y, yaw about Z), i.e. R = Rz(yaw)·Ry(pitch)·Rx(roll)
+/// — the URDF / ROS `<origin xyz rpy>` convention. Used at configure time to
+/// lower manifest origins into the `CollisionModel`; not on the hot path.
+Transform transform_from_xyz_rpy(double x, double y, double z, double roll, double pitch,
+                                 double yaw) noexcept;
+
+/// Build a rigid transform from a translation and a (x, y, z, w) unit
+/// quaternion — the ``geometry_msgs/Pose`` convention used by
+/// ``openral_msgs/AttachedCollisionObject.pose_in_link``. A non-unit quaternion
+/// is normalised; a zero quaternion degrades to the identity rotation. Used at
+/// ingest time (not the hot path) to lower a wire pose into the kernel's
+/// `Transform`.
+Transform transform_from_translation_quat(double x, double y, double z, double qx, double qy,
+                                          double qz, double qw) noexcept;
+
+/// Closest distance between the surfaces of two capsules, given each capsule's
+/// frame in a common frame. Negative means interpenetration. Allocation-free.
+double capsule_distance(const Transform& a, double a_radius, double a_half_length,
+                        const Transform& b, double b_radius, double b_half_length) noexcept;
+
+/// Closest distance between an OBB surface and a capsule surface, each given in
+/// a common frame (`box`/`cap` are the primitive origin transforms). Exact for
+/// the disjoint case (segment↔box closest distance minus the capsule radius);
+/// negative means interpenetration. Allocation-free.
+double box_capsule_distance(const Transform& box, const Vec3& half_extents, const Transform& cap,
+                            double cap_radius, double cap_half_length) noexcept;
+
+/// Conservative closest distance between two OBB surfaces. Uses the separating-
+/// axis theorem: the maximum gap over the 15 candidate axes (6 face normals + 9
+/// edge-edge cross products) is a lower bound on the true surface distance, so
+/// the kernel never *under*-reports a collision (safety §3 — at least as
+/// conservative). Negative means overlap. Allocation-free.
+double box_box_distance(const Transform& a, const Vec3& a_half, const Transform& b,
+                        const Vec3& b_half) noexcept;
+
+/// Why `validate_tight_geometry` refused a model. Anything but `kOk` is
+/// fail-closed at the call site: the kernel keeps the shipped OBB narrow phase
+/// for every link rather than loading geometry it could not prove contained.
+enum class TightGeometryStatus : std::uint8_t {
+  kOk = 0,
+  kBadArity = 1,         ///< box_hull/hulls/hull_vertices sizes disagree
+  kEscapesBox = 2,       ///< a DOP slab reaches outside the shipped half-extents
+  kHullEscapesDop = 3,   ///< a stage-2 vertex sits outside its own DOP
+  kTooManyVertices = 4,  ///< stage-2 hull over kMaxTightHullVertices
+  kDegenerate = 5,       ///< non-finite or inverted slab
+};
+
+/// The containment proof for ONE tight representation against ONE box, shared
+/// by the robot's configure-time check and the payload's per-message ingest so
+/// a link hull and a carried-payload hull can never be held to two different
+/// standards.
+///
+/// Chain checked: hull vertices ⊆ 26-DOP ⊆ the box, both links definitional
+/// rather than fitted:
+/// * a stage-2 vertex must satisfy every one of the 26 slab constraints;
+/// * the DOP's first three axes ARE the box's axes, and a 26-DOP lies inside
+///   its own first three slabs, so -half_extents[k] <= dop_lo[k] <= dop_hi[k]
+///   <= half_extents[k] proves the whole polytope is inside the box.
+///
+/// `vertices` is the buffer `hull.vertex_first` indexes. Allocation-free.
+TightGeometryStatus validate_tight_hull(const LinkHull& hull, const Vec3& half_extents,
+                                        const std::vector<Vec3>& vertices) noexcept;
+
+/// Proves, at configure time, that every declared tight representation is a
+/// subset of the shipped OBB it refines — the assertion that keeps the
+/// broad-phase window (check_voxel_collision's ex/ey/ez reach) correct
+/// without touching it.
+///
+/// Chain checked: hull vertices ⊆ 26-DOP ⊆ shipped OBB, both links
+/// definitional, not fitted:
+/// * a stage-2 vertex must satisfy every one of the 26 slab constraints;
+/// * the DOP's first three axes ARE the box's axes, and a 26-DOP lies
+///   inside its own first three slabs, so -half_extents[k] <= dop_lo[k] <=
+///   dop_hi[k] <= half_extents[k] proves the whole polytope is inside the box.
+///
+/// The remaining obligation — true link MESH inside the DOP — is discharged
+/// offline by construction (slabs are tangent halfspaces u.x <= h_mesh(u))
+/// and re-proved against the real mesh by
+/// tests/unit/test_collision_tight_geometry.py. The kernel never sees a mesh.
+///
+/// On refusal offending_box receives the offending index. Not on the hot
+/// path. Allocation-free.
+TightGeometryStatus validate_tight_geometry(const CollisionModel& model,
+                                            std::size_t& offending_box) noexcept;
+
+/// Stable snake_case token naming `status`, for the `reason=` key of the
+/// kernel's tight-geometry log line. Never null; unknown values read `unknown`.
+const char* tight_geometry_status_reason(TightGeometryStatus status) noexcept;
+
+/// Per-link-pose constants for the staged narrow phase, computed once per
+/// checked configuration outside the cell loop (the kernel streams cell centres
+/// against a fixed link pose, so every term that depends only on the pose is
+/// hoisted). Holds pointers into the caller's `CollisionModel`; it does not own
+/// anything and must not outlive it.
+struct TightPose {
+  double axis[kDopAxes][3]{};      ///< DOP axis in the base frame (R * u_i)
+  double axis_dot_t[kDopAxes]{};   ///< axis_i . box origin
+  double cell_radius[kDopAxes]{};  ///< voxel cube's support radius on axis_i
+  double lo[kDopAxes]{};
+  double hi[kDopAxes]{};
+  double slab_center[3]{};        ///< base-frame centre of the DOP's own axis-slab box
+  double slab_extent[3]{};        ///< that box's base-frame AABB half-extents
+  const Vec3* vertices{nullptr};  ///< stage-2 vertices, box-local; null if none
+  int n_vertices{0};              ///< 0 = stage 1 only
+  Transform box{};                ///< the OBB's frame in the base frame
+};
+
+/// Hoist the per-pose constants for `hull` at box pose `box_xf`, against a grid
+/// of half-cell `half_side`. Allocation-free.
+void tight_pose_init(const LinkHull& hull, const Vec3* hull_vertices, const Transform& box_xf,
+                     double half_side, TightPose& out) noexcept;
+
+/// Stage 1 — a conservative lower bound on the surface distance between the
+/// link's 26-DOP and the occupied voxel cube centred at `center`.
+///
+/// Separating-axis over 16 directions: the DOP's own 13 (where its support is
+/// exact, being a tangent slab) plus the three world axes (where the DOP's
+/// axis-slab AABB over-estimates its reach, which only makes the bound more
+/// conservative). The maximum gap over any set of unit axes lower-bounds the
+/// true Euclidean distance, which is the same argument `box_box_distance`
+/// already rests on — so this is the shipped conservatism property applied to a
+/// tighter, provably-contained solid.
+///
+/// `best_axis` (nullable) receives the base-frame normal of the winning
+/// separating axis: stage 2's search direction, and the reason stage 2
+/// converges in one or two iterations instead of five.
+/// Allocation-free.
+double dop_cell_lower_bound(const TightPose& pose, const Vec3& center, double half_side,
+                            Vec3* best_axis) noexcept;
+
+/// Stage-2 witness carried between adjacent cells in one window and between
+/// consecutive steps of the predictive horizon.
+///
+/// It stores hull vertex INDICES and cube-corner sign codes, never Minkowski
+/// difference points: the cube moves from cell to cell, so cached points would
+/// not lie in the current difference set and GJK's bounds would stop holding.
+/// Indices stay meaningful because they are only hints, re-evaluated against
+/// whichever cell is being checked. `n == 0` is a cold start.
+struct GjkWitness {
+  int vertex[4]{};
+  std::uint8_t corner[4]{};
+  int n{0};
+};
+
+/// Stage 2 — a lower bound on the surface distance between the link's EXACT
+/// CONVEX HULL and the occupied voxel cube, equal to that distance (to
+/// kGjkTolerance) on convergence. GJK over the hull's vertex list against
+/// the cube's eight corners.
+///
+/// Conservatism doesn't depend on convergence: every value returned is a
+/// supporting-hyperplane lower bound on the true distance, so the iteration
+/// cap, the early exit once the bound clears margin, and the overlap case
+/// can each only make the answer MORE conservative, never less. On overlap,
+/// or whenever the bound would be worse than stage 1's figure, fallback
+/// (stage 1's bound, <= 0 whenever hull and cell actually overlap since the
+/// DOP contains the hull) is returned instead.
+///
+/// Support function is an exhaustive vertex-list scan, deliberately — the
+/// reason kMaxTightHullVertices exists: the usual hill-climbing support
+/// over an edge graph can, under floating point, stop one vertex short of
+/// the true support, turning the supporting-hyperplane bound into an
+/// OVER-report of clearance. The kernel buys soundness with a linear scan
+/// and bounds cost with the vertex ceiling instead.
+///
+/// seed_dir is stage 1's winning separating-axis normal. Allocation-free
+/// (fixed-size stack simplex).
+double hull_cell_distance(const TightPose& pose, const Vec3& center, double half_side,
+                          const Vec3& seed_dir, double margin, double fallback,
+                          GjkWitness& witness) noexcept;
+
+/// Lower bound on the surface distance between TWO LINKS' exact convex
+/// hulls, equal to that distance (to kGjkTolerance) on convergence. Same GJK
+/// as hull_cell_distance, with the voxel cube's eight corners replaced by
+/// the second hull's vertex list.
+///
+/// Self-collision counterpart of stage 2, needed because the OBB can't
+/// separate a pair whose links interleave: on panda_link5<->panda_link7 the
+/// boxes overlap over 86.38% of the pair's (joint6, joint7) grid while real
+/// geometry interpenetrates over 6.60%, and no margin separates the two
+/// populations (deepest real collision: box gap -8.37 mm; shallowest false
+/// one: -36.64 mm) — why the pair shipped ACM-exempted "under protest"
+/// (issue #155, PR #169) until the hulls landed. See
+/// docs/reference/collision-hull-narrow-phase.md.
+///
+/// Conservatism as for hull_cell_distance: every value is a
+/// supporting-hyperplane lower bound, so the iteration cap can only make
+/// the answer more conservative. Unlike the cell routine this does NOT stop
+/// at the first bound clearing margin — its result is the reported
+/// sweep_min_distance, not one of hundreds of per-cell numbers, and the
+/// early exit was measured returning 4.2 mm for a pair genuinely 60.0 mm
+/// apart. On overlap, or whenever the bound is worse than fallback (the
+/// caller's box_box_distance, <= 0 whenever the hulls actually overlap
+/// since each box contains its hull), fallback is returned instead. A link
+/// with no stage-2 hull returns fallback unchanged, so a manifest without
+/// tight_geometry behaves exactly as before.
+///
+/// Refining is the less-conservative direction, and that's the point: the
+/// hull is conv(collision mesh), so it contains the geometry the robot is
+/// actually made of and can't clear a pose the real links occupy. What it
+/// removes is the box's corner slop — what forced the exemption.
+///
+/// Cold-started (no witness cache): a self-collision pair is checked at
+/// most once per configuration, no neighbouring cell to warm-start from.
+/// Allocation-free (fixed-size stack simplex).
+///
+/// Cost, measured on shipped panda_mobile at its robosuite reset pose (-O3,
+/// this dev host, 200000 calls): check_self_collision goes from 0.758 to
+/// 2.303 us/call, +1.545 us, 3.04x. Multiplier is large because the routine
+/// it sits in is small; over a 16-step horizon the addition is 24.7 us
+/// against a 10 ms budget, 0.25%. Close to sustained cost, not a spike:
+/// this pair's boxes fail to clear on 86.38% of its configuration space, so
+/// GJK runs nearly every call. If a future robot makes that bite, the next
+/// lever is a DOP-vs-DOP stage 1 in front of the GJK (same shape as
+/// dop_cell_lower_bound), not a looser support function — see
+/// kMaxTightHullVertices for why the scan stays exhaustive.
+double hull_hull_distance(const TightPose& a, const TightPose& b, double margin, double fallback,
+                          bool* depth_is_box_bound = nullptr) noexcept;
+
+/// Forward kinematics for one joint-position row (`qpos`, length `n_dof`):
+/// fills `scratch.link_world[i]` with each link's frame in the base frame.
+/// Allocation-free; `scratch.link_world` must already be sized to
+/// `model.n_links`.
+void forward_kinematics(const CollisionModel& model, const double* qpos, std::size_t n_dof,
+                        CollisionScratch& scratch) noexcept;
+
+/// Check every non-allowed capsule pair against a `margin` clearance using the
+/// link frames in `scratch`. On a hit the returned pair is the deepest pair
+/// within the margin and `min_distance` is that pair's distance;
+/// `sweep_min_distance` carries the minimum over every checked pair
+/// (`CollisionHit`). Allocation-free.
+///
+/// A box <-> box pair whose OBBs come within `margin` is re-asked of the two
+/// links' exact convex hulls (`hull_hull_distance`) when **both** ship a
+/// stage-2 hull. The OBB result stays the broad phase and the fallback, so a
+/// pair the boxes already clear costs nothing extra and a manifest without
+/// `tight_geometry` is bit-for-bit unchanged.
+CollisionHit check_self_collision(const CollisionModel& model, const CollisionScratch& scratch,
+                                  double margin) noexcept;
+
+/// Check every robot capsule (FK'd via `scratch`) against every world obstacle
+/// in `world` (base-frame capsules) at a `margin` clearance. On a hit,
+/// `link_a` is the robot link index and `link_b` is the world obstacle index
+/// of the deepest pair within the margin, and `min_distance` is that pair's
+/// distance (`CollisionHit`). Allocation-free.
+CollisionHit check_world_collision(const CollisionModel& model, const CollisionScratch& scratch,
+                                   const WorldModel& world, double margin) noexcept;
+
+/// Maximum joint count the allocation-free Jacobian step supports (stack scratch
+/// is sized to this). Covers every in-tree robot (humanoids ~30 dof) with
+/// headroom; a model exceeding it makes `jacobian_dls_step` fail-safe (returns
+/// false → caller falls back to the reactive check).
+inline constexpr std::size_t kMaxJacobianDof = 64;
+
+/// Damped-least-squares IK step for predictive Cartesian
+/// checking. Forward kinematics must already be run for the current
+/// configuration (`scratch`). Given the end-effector link index `ee_link` and a
+/// desired base-frame EE twist `ee_twist` (6 = [vx,vy,vz, wx,wy,wz], the
+/// per-step Cartesian delta), compute the joint increment `dq` (length `n_dof`,
+/// zeroed then filled only for the dofs on the kinematic chain root→ee_link):
+///     dq = Jᵀ (J Jᵀ + λ²·I)⁻¹ · ee_twist
+/// where `J` is the geometric Jacobian of `ee_link` and `lambda` damps motion
+/// near singularities. The caller integrates `q ← q + dq`, re-runs FK, and
+/// re-checks the capsule boundary; because DLS can *undershoot* the true motion,
+/// the caller must inflate the collision margin to bound the residual (the
+/// reactive measured-config check remains the guaranteed floor regardless).
+/// `dof_blocked` (nullable, length `n_dof`) excludes any dof whose entry is
+/// non-zero from the Jacobian — used on a mobile base to keep the EE twist
+/// realised by the arm joints only (the base dofs are not driven by the arm's
+/// Cartesian command and are zeroed before the collision FK). Pass nullptr for a
+/// fixed-base arm.
+/// Allocation-free (fixed stack scratch). Returns false and leaves `dq` zeroed
+/// if `ee_link` is out of range, `n_dof > kMaxJacobianDof`, or no usable
+/// (non-blocked, movable) joint feeds the EE.
+bool jacobian_dls_step(const CollisionModel& model, const CollisionScratch& scratch, int ee_link,
+                       const double ee_twist[6], double lambda, double* dq, std::size_t n_dof,
+                       const std::uint8_t* dof_blocked = nullptr) noexcept;
+
+/// Checks every robot capsule (FK'd via scratch) against the occupied cells
+/// of a dense voxel grid. Only voxels inside each capsule's inflated AABB
+/// are tested (bounded); each occupied voxel is treated conservatively as a
+/// cube at the cell centre. On a hit, link_a is the robot link index,
+/// link_b the linear index of the deepest cell within margin, min_distance
+/// that cell's distance (CollisionHit). Allocation-free.
+///
+/// A boxed link whose box_hull entry names a LinkHull runs the STAGED
+/// narrow phase instead of box_box_distance: a 26-DOP separating-axis bound
+/// on every occupied cell, then GJK on the link's exact convex hull only
+/// for cells the DOP can't clear. Both stages are strict subsets of the
+/// shipped OBB (proved at configure time by validate_tight_geometry), so
+/// the broad-phase window is unchanged and can't miss a cell it visits
+/// today. The reported distance is still a lower bound on the true
+/// link-mesh-to-cell distance, just TIGHTER — the kernel gives away less
+/// clearance it never had. Links without tight geometry, every
+/// capsule-lowered robot, and every other check here keep the shipped
+/// primitive path unchanged.
+///
+/// band_m widens ONLY the broad-phase cell window, never the trip
+/// threshold. A cell still trips at margin alone; band_m exists so cells
+/// clear but within margin + band_m are still visited and folded into
+/// sweep_min_distance. Without it, the window is sized by margin alone and
+/// on a real map the minimum jumps from "nothing in range" straight to a
+/// tripping cell — what made the #188 velocity band dead code on its first
+/// implementation. Default 0.0 is the shipped window byte-for-byte; extra
+/// cells are scanned only when a deployment arms the band.
+CollisionHit check_voxel_collision(const CollisionModel& model, const CollisionScratch& scratch,
+                                   const VoxelGrid& grid, double margin,
+                                   double band_m = 0.0) noexcept;
+
+/// Validate + resolve parsed attached-object inputs into the fixed-capacity
+/// `out` model. `out.objects` / `out.primitives` / `out.touch_links` must
+/// already be sized to their configured caps (`max_objects`, `max_primitives`,
+/// `max_touch_links`); this fills the first N entries and sets `out.n_objects`
+/// / `out.n_primitives`. Each object's primitives and touch links are appended
+/// to the flattened buffers and referenced by slice. Link names are resolved
+/// against `link_names` (the robot collision-link name table). Fail-closed:
+/// any cap overflow (objects, total primitives, or total touch links), unknown
+/// attach/touch link, malformed primitive shape, or an object carrying zero
+/// primitives leaves `out.n_objects == 0` and returns the offending status —
+/// the caller must then treat the attachment set as unavailable (drop the
+/// candidate action). Not on the hot path (called once per world-state
+/// message). Allocation-free with respect to `out` (only reads/writes the
+/// pre-sized buffers).
+AttachIngestStatus ingest_attached_objects(const std::vector<AttachedObjectInput>& inputs,
+                                           const std::vector<std::string>& link_names,
+                                           std::size_t max_objects, std::size_t max_primitives,
+                                           std::size_t max_touch_links,
+                                           AttachedModel& out) noexcept;
+
+/// Check every attached payload (FK'd via `scratch` through its attach link)
+/// against every world obstacle capsule at a `margin` clearance. On a hit,
+/// `link_a` is the attached-object index and `link_b` is the world obstacle
+/// index of the deepest pair within the margin, and `min_distance` is that
+/// pair's distance (`CollisionHit`). Allocation-free.
+CollisionHit check_attached_world_collision(const CollisionModel& model,
+                                            const AttachedModel& attached,
+                                            const CollisionScratch& scratch,
+                                            const WorldModel& world, double margin) noexcept;
+
+/// Checks every attached payload against the occupied cells of a dense
+/// voxel grid (same conservative per-voxel cube treatment as
+/// check_voxel_collision). On a hit, link_a is the attached-object index,
+/// link_b the linear index of the deepest cell that tripped, min_distance
+/// that cell's distance.
+///
+/// While a place declaration's region is live for this payload
+/// (grid.place_region), the margin each cell inside it is gated against is
+/// first reduced by place_approach_allowance — the bounded license to reach
+/// the contact the declaration already permits (ADR-0097's 2026-08-14
+/// amendment, capped per its Second Amendment at min(1.5 x voxel, 4 cm)). A
+/// margin change, not an exemption: a cell deeper than the reduced margin
+/// still stops the robot, and the reported distance is the cell's true
+/// distance.
+///
+/// When the declaration also ships the target's own geometry (ADR-0098,
+/// survey Path B), a covered cell is instead adjudicated against the
+/// MODELLED BODY: the pair's distance becomes place_target_distance, the
+/// gate moves to the surface itself, and place_target_adjudicated is set so
+/// the caller names the declared target, not the cell. A margin is a
+/// standoff for geometry the robot must not touch; the declared target is
+/// the one body it was dispatched to touch, so it's gated as an
+/// intended-contact pair at zero clearance — the contract Tesseract's
+/// negatable per-pair margins and MoveIt's touch_links both express
+/// (survey §17.2, §3.2). The advisory band still covers arrival overshoot;
+/// past it the latched stop is unchanged.
+///
+/// Two bounds carry the safety argument, in opposite directions on
+/// purpose:
+/// 1. Against TRUTH, strictly more conservative than the blanket allowance
+///    it refines: the blanket lets the payload sit `allowance` inside a
+///    cube whose near face may be a whole voxel in front of the real
+///    surface (unknowable permission against the real body); this permits
+///    zero penetration of the real body.
+/// 2. Against the CUBE, looser — by exactly the amount the cube
+///    over-stated the surface, never more than the blanket allowance
+///    already in force. Taken only while d_target <= d_cell + allowance; a
+///    model claiming more clearance than the map's quantisation could
+///    explain (a primitive fitted too small, a stale articulated door) is
+///    refused and falls back to the blanket path bit for bit.
+///
+/// A declaration with no geometry is byte-for-byte the pre-ADR-0098 path.
+///
+/// Two — and only two — exemptions can spare a cell outright, both bounded:
+/// 1. Support-contact witness (ADR-0092 D6): object i carries a World
+///    State attestation, its bit live in grid.support_witness_live, and
+///    the cell satisfies support_contact_exempts — inside the attested
+///    patch laterally, no higher above the attested plane than the voxel
+///    cube's projected half-width + attested physical depth +
+///    grid.attached_contact_tolerance + one voxel of co-planar headroom.
+///    Lets a ~1 mm physical support contact survive 25 mm voxels: depth is
+///    measured against the attested plane, so cell-cube inflation is
+///    accounted for exactly instead of absorbed by a widened tolerance.
+/// 2. Embedded attach-time residue: the payload's own uncleared occupancy
+///    left in the map at attach (a cell already >= half a voxel inside the
+///    payload when the baseline was snapshotted). Stale self-occupancy,
+///    not support contact — the witness deliberately doesn't cover it.
+///
+/// An exempted cell never supplies the reported identity or distance —
+/// reaches sweep_min_distance only, so it can never be published as the
+/// contact that stopped the robot (CollisionHit). Allocation-free. band_m
+/// widens only the broad-phase cell window, exactly as for
+/// check_voxel_collision.
+CollisionHit check_attached_voxel_collision(const CollisionModel& model,
+                                            const AttachedModel& attached,
+                                            const CollisionScratch& scratch, const VoxelGrid& grid,
+                                            double margin, double band_m = 0.0) noexcept;
+
+/// The declaration-scoped contact-force gate (ADR-0100, survey Path C).
+///
+/// At the instant of a place the true clearance IS zero, so no geometric margin
+/// at any resolution separates "set the object down" from "crush it" (survey §9
+/// point 4). Force is the axis that does, and this is the check that reads it.
+///
+/// It only ever adds a refusal. Evaluated after every geometric check has
+/// passed, so a tripped gate converts an accept into a refusal — no path
+/// widens a margin, creates an exemption, or lets a measured force license
+/// contact the geometry refused; that direction is the whole safety
+/// argument, enforced by this function having no way to express anything
+/// but `tripped` (ADR-0100 §1).
+///
+/// Arms only when ALL FOUR hold, each failing toward shipped geometry-only
+/// behaviour:
+/// 1. attached.force_gate.valid — a live declaration supplies a positive,
+///    in-range threshold. Dispatch's default is 0.0 (no gate).
+/// 2. Object i's bit is set in force_gate.object_mask — follows the
+///    DECLARED payload, never a second object the robot happens to carry.
+/// 3. has_contact_force_witness && contact_force_target_matches — a
+///    witness is present and names the declared target.
+/// 4. contact_force_calibrated — producer asserted a named calibration.
+///    Without it contact_force_magnitude is not in Newtons and isn't read:
+///    no published work validates MuJoCo contact-force magnitudes against
+///    real force-torque measurements (survey §21.7), so uncalibrated is a
+///    producer quantity, never a physical claim (CLAUDE.md §1.2).
+///
+/// Absence of a witness is NOT evidence of absence of contact — the sim
+/// producer reads MuJoCo's solver contact list, which contype/conaffinity
+/// suppression can leave empty under demonstrable contact. Absence only
+/// means the gate doesn't arm and geometry decides alone.
+///
+/// Comparison is strict: a magnitude exactly at threshold passes, so "up
+/// to N newtons" permits N. Allocation-free; O(n_objects) over a cap of
+/// eight.
+ContactForceGateResult check_contact_force_gate(const AttachedModel& attached) noexcept;
+
+/// Margin reduction the live place declaration grants object `object_index`
+/// against an occupied cell centred at `center` — `0.0` whenever it grants none.
+///
+/// The whole predicate, and every way it fails closed:
+///
+/// * No valid region, or a grid with no usable resolution → `0.0`.
+/// * `object_index` outside the declaration's `object_mask` (or past the
+///   eight-object schema cap) → `0.0`. The allowance follows the *declared*
+///   payload, never a second object the robot happens to be carrying.
+/// * A degenerate or non-finite region box → `0.0`. Validation belongs to
+///   `ingest_place_region`; this re-checks because a permissive allowance is
+///   never the safe default.
+/// * The cell centre outside the region box (an exact point-in-OBB test in the
+///   box's own frame) → `0.0`.
+///
+/// Otherwise the reduction is `place_approach_allowance_cap(grid.resolution)` —
+/// `min(1.5 × voxel, 4 cm)`, the amendment's binding Condition 1 as calibrated
+/// by its Second Amendment (2026-08-15), computed here against the *live*
+/// resolution so it can never desynchronise from the map actually being checked.
+/// Allocation-free.
+double place_approach_allowance(const VoxelGrid& grid, std::size_t object_index,
+                                const Vec3& center) noexcept;
+
+/// Validate a producer-supplied place region and lower it into `out`.
+///
+/// Fail-closed means *no allowance* here, not a dropped message: unlike a
+/// malformed support-contact attestation (which fails the whole attachment
+/// closed because a producer over-claiming measured contact is not one to trust
+/// with the payload model), a bad region can only ever make the kernel *more*
+/// permissive, so refusing it restores exactly the pre-amendment margin. The
+/// caller logs the refusal; nothing else changes.
+///
+/// Rejects a non-finite pose or half-extent, a non-positive half-extent, a
+/// half-extent past `kMaxPlaceRegionHalfExtentM`, a box past
+/// `kMaxPlaceRegionVolumeM3`, and an empty `object_mask` (a declaration whose
+/// payload is not among the carried objects). Returns `PlaceRegionStatus::kOk`
+/// iff `out.valid` was set; every other value leaves `out` inert. Not on the
+/// hot path (once per world-state message).
+PlaceRegionStatus ingest_place_region(const Transform& pose, const Vec3& half_extents,
+                                      std::uint8_t object_mask, PlaceApproachRegion& out) noexcept;
+
+/// Lower the declared target's OWN collision geometry into an already-validated
+/// `region` (ADR-0098, collision-safety survey Path B).
+///
+/// Split from `ingest_place_region` because the two answer different questions:
+/// the box says *where* the declared receptacle is, this says *what it is*. Call
+/// it only after the box validated; on anything but `kOk` the caller must reset
+/// the whole region — a producer that cannot describe the target it declared is
+/// not one whose box is trusted either (#142/#146), and the fail-closed
+/// direction here is no allowance at all, not a silent downgrade to box-only.
+///
+/// `store` must already be sized to at least `kMaxPlaceTargetPrimitives`; this
+/// fills its first N entries and points `region.geometry` at it, so the buffer
+/// has to outlive every check that reads the region. An empty `geometry` is the
+/// ordinary case and leaves `region` exactly as `ingest_place_region` left it.
+/// Rejects a malformed shape (`kBadGeometry`) and a list past the cap
+/// (`kGeometryOverflow`). Not on the hot path.
+PlaceRegionStatus ingest_place_target_geometry(const std::vector<AttachedPrimitiveInput>& geometry,
+                                               std::vector<AttachedPrimitive>& store,
+                                               PlaceApproachRegion& region) noexcept;
+
+/// Exact surface distance from one attached payload primitive (base frame
+/// `prim_xf`) to the declared place target's own geometry — `+infinity` when the
+/// declaration ships none, which is what makes "no geometry" collapse to the
+/// pre-ADR-0098 behaviour at every call site without a branch.
+///
+/// This is the mm-resolution half of survey Path B. The voxel grid can only
+/// answer "is this 25 mm cube occupied"; the declared body answers "how far is
+/// the payload from the receptacle it was declared to be placed into", against
+/// the same certified primitive routines every other check in this header uses.
+/// Allocation-free.
+double place_target_distance(const PlaceApproachRegion& region, const AttachedPrimitive& prim,
+                             const Transform& prim_xf) noexcept;
+
+/// Stable snake_case token naming `status`, for the `reason=` key of the
+/// kernel's place-region log lines. Never null; unknown values read `unknown`.
+const char* place_region_status_reason(PlaceRegionStatus status) noexcept;
+
+/// Does object i's attested support contact explain occupied cell `center`?
+///
+/// Purely geometric and index-free, so it doesn't decorrelate as the base
+/// drives. With the attested plane lifted into the base frame
+/// (p = obj_xf . support_point, n = obj_xf.R . support_normal) and
+/// s = (center - p).n the cell centre's height above that plane:
+/// * BOUNDED LATERALLY — the cell must lie within support_patch_radius of
+///   the contact point (padded by the voxel cube's circumradius, the exact
+///   discretisation slop). A new contact elsewhere (wall, fixture) is
+///   outside the patch and still stops the robot.
+/// * BOUNDED IN HEIGHT — s <= w + support_max_penetration + slack +
+///   resolution, where w = half_resolution . (|n.x|+|n.y|+|n.z|) is the
+///   EXACT half-width of the voxel cube projected on the support normal. A
+///   surface cell flush with the attested plane has |s| <= w by
+///   construction; the fourth term is ONE VOXEL of co-planar headroom
+///   (hazard log Entry 012, "Calibration 2026-08-15"): cells of adjacent
+///   co-planar structure (a raised edge, a neighbouring stack on the same
+///   surface) sit ~1 voxel above the attested plane during genuine support
+///   contact (round-8 r2: +42.9 mm against a ~15-19 mm envelope). Past that
+///   bound, solid genuinely higher than the support face still trips, and a
+///   payload sinking into its support raises s at the physical rate (1 mm
+///   sink = 1 mm s) until it trips. The lateral bound is untouched by that
+///   calibration: it widens height, never reach.
+///
+/// Caller must have already established the witness is live; this function
+/// doesn't consult grid.support_witness_live. Allocation-free.
+bool support_contact_exempts(const AttachedObject& object, const Transform& object_xf,
+                             const Vec3& center, double resolution, double slack) noexcept;
+
+/// Refresh the per-object support-contact witness latch against the measured
+/// configuration. Bit `i` of `live_mask` survives only while object `i`'s
+/// attestation is still doing work: some occupied cell it would exempt is
+/// within `margin` of the payload. Once the payload separates from its attested
+/// support, the bit is cleared and this function never sets it again — a fresh
+/// attestation from World State is the only way to re-arm, so a regrasp or a
+/// re-contact after lift is a new violation, not a resurrected exemption.
+/// Returns the updated mask. Allocation-free; supports the first eight attached
+/// objects (the schema cap).
+std::uint8_t update_support_contact_witnesses(const AttachedModel& attached,
+                                              const CollisionScratch& scratch,
+                                              const VoxelGrid& grid, std::uint8_t live_mask,
+                                              double margin) noexcept;
+
+/// Snapshot or refresh the bounded attach-time voxel contacts allowed for each
+/// payload. On `snapshot=true`, occupied cells already intersecting object i
+/// receive bit i and their minimum surface distance is recorded. On refresh,
+/// each bit is cleared permanently once that payload separates from the cell.
+/// Only the *embedded* subset of that baseline still exempts anything: the
+/// payload's own uncleared occupancy residue. The non-deepening index-keyed
+/// allowance this used to grant was removed — voxel indices shift under a
+/// driving base while the physical contact persists, so it decorrelated; the
+/// support-contact witness replaced it.
+/// Allocation-free; supports the first eight attached objects (the schema cap).
+bool update_attached_voxel_contacts(const AttachedModel& attached, const CollisionScratch& scratch,
+                                    const VoxelGrid& grid, std::uint8_t* contact_mask,
+                                    double* contact_distance, std::size_t mask_capacity,
+                                    std::size_t distance_capacity, bool snapshot) noexcept;
+
+/// Check every attached payload against the robot's own link geometry
+/// (capsules + boxes), skipping each object's attach link and its explicit
+/// touch links (a grasped object legitimately contacts the fingers that hold
+/// it). On a hit, `link_a` is the attached-object index and `link_b` is the
+/// robot link index of the deepest pair within the margin, and `min_distance`
+/// is that pair's distance (`CollisionHit`). Allocation-free.
+CollisionHit check_attached_self_collision(const CollisionModel& model,
+                                           const AttachedModel& attached,
+                                           const CollisionScratch& scratch, double margin) noexcept;
+
+}  // namespace openral_safety_kernel

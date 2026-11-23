@@ -1,0 +1,103 @@
+{
+  "$defs": {
+    "AttachmentEvidenceKind": {
+      "description": "Evidence source that confirmed a robot/object attachment or its support.\n\n``SIM_CONTACT`` and ``SIM_GEOM_DISTANCE`` are both simulator ground truth,\nand the distinction is load-bearing rather than cosmetic. A simulator's\n*contact list* is not a proximity oracle: MuJoCo's ``contype`` /\n``conaffinity`` bitmasks suppress whole geom pairs, so an object flush on a\ncounter can generate no contact record at all. ``SIM_GEOM_DISTANCE`` names\nthe signed closest-distance probe (``mj_geomDistance``), which sees the\npairs the contact list hides. A consumer reading a witness must not infer\nfrom ``SIM_CONTACT`` that a solver contact existed, nor from\n``SIM_GEOM_DISTANCE`` that one did not.",
+      "enum": [
+        "sim_contact",
+        "sim_geom_distance",
+        "gripper_force",
+        "perception_track",
+        "operator",
+        "vision_segmentation",
+        "sim_contact_force"
+      ],
+      "title": "AttachmentEvidenceKind",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Bounded attestation of a MEASURED contact force on the declared target.\n\nThe second observable on the place path (ADR-0100, Path C): force is what\ndistinguishes \"set down\" from \"crush\" once position clearance hits zero.\nThe gate this feeds only ever adds a refusal \u2014 never widens an ADR-0097\nallowance or moves a margin. ``magnitude_n`` is Newtons only when\n``magnitude_calibrated`` (no published work validates MuJoCo contact\nforce against real F/T measurements; FORGE arXiv:2408.04587 re-tunes on\nhardware); ``direction_in_object`` has no such caveat (arXiv:2602.14174).\nAbsence of a witness is never evidence of no contact \u2014 ``contype``/\n``conaffinity`` suppression can empty the solver's contact list under a\npayload demonstrably in contact.\n\nAttributes:\n    target_id: Surface the measured contact is against; the gate arms\n        only when this names the live declaration's target or a surface of it.\n    direction_in_object: Unit contact-force direction in the attached\n        object's frame (not base frame \u2014 decorrelates as a mobile base drives).\n    magnitude_n: Contact force magnitude; Newtons only when\n        ``magnitude_calibrated``, else an ignored uncalibrated number.\n    magnitude_calibrated: ``False`` (default, uncalibrated) means the force gate does not arm.\n    calibration_ref: Names the calibration ``magnitude_n`` was produced\n        under; required when ``magnitude_calibrated``.\n    confidence: Witness confidence in ``[0, 1]``.\n    evidence_kind: Source that measured the force; the MuJoCo producer\n        attests ``AttachmentEvidenceKind.SIM_CONTACT_FORCE``.\n    evidence_ref: Optional trace / producer reference.\n    stamp_ns: Producer timestamp; with ``target_id`` keys the kernel's re-arm check.\n\nExample:\n    >>> witness = ContactForceWitness(\n    ...     target_id=\"sim:cab_1_left_group_main\",\n    ...     direction_in_object=(0.0, 0.0, 1.0),\n    ...     magnitude_n=4.5,\n    ...     magnitude_calibrated=False,\n    ...     confidence=1.0,\n    ...     evidence_kind=AttachmentEvidenceKind.SIM_CONTACT_FORCE,\n    ...     stamp_ns=1,\n    ... )\n    >>> witness.magnitude_calibrated\n    False",
+  "properties": {
+    "target_id": {
+      "minLength": 1,
+      "title": "Target Id",
+      "type": "string"
+    },
+    "direction_in_object": {
+      "maxItems": 3,
+      "minItems": 3,
+      "prefixItems": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "number"
+        }
+      ],
+      "title": "Direction In Object",
+      "type": "array"
+    },
+    "magnitude_n": {
+      "minimum": 0.0,
+      "title": "Magnitude N",
+      "type": "number"
+    },
+    "magnitude_calibrated": {
+      "default": false,
+      "title": "Magnitude Calibrated",
+      "type": "boolean"
+    },
+    "calibration_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Calibration Ref"
+    },
+    "confidence": {
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Confidence",
+      "type": "number"
+    },
+    "evidence_kind": {
+      "$ref": "#/$defs/AttachmentEvidenceKind"
+    },
+    "evidence_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Evidence Ref"
+    },
+    "stamp_ns": {
+      "minimum": 0,
+      "title": "Stamp Ns",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "target_id",
+    "direction_in_object",
+    "magnitude_n",
+    "confidence",
+    "evidence_kind",
+    "stamp_ns"
+  ],
+  "title": "ContactForceWitness",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

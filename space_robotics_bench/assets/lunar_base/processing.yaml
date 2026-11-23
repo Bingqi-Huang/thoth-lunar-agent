@@ -1,0 +1,258 @@
+# How each raw source becomes a scene-ready USD (run: python3 process/process.py [--only <out> ...]).
+#
+# Per output:
+#   source:      raw/<category>/<slug> directory to import
+#   exclude:     regex list; meshes whose name matches are deleted (baked backdrops, terrain, platforms)
+#   crop:        [xmin, ymin, zmin, xmax, ymax, zmax] in source units after import; faces whose
+#                centroid falls outside are deleted (pick one item out of a collection)
+#   scale:       uniform factor applied first (source units -> metres), or
+#   target:      {height|longest: metres} uniform scale to hit that dimension
+#   max_faces:   decimate (collapse) down to this face budget
+#   physics:     static (convex-hull colliders) | dynamic (rigid body + mass_kg, convex-hull colliders)
+#   friction/restitution: physics material bound to every collider ([static, dynamic], restitution)
+#   max_depenetration_velocity: m/s cap for dynamic bodies (spawn-overlap launches)
+# The result is re-centred so the footprint centre sits at the origin and the lowest point at z = 0.
+
+defaults:
+  max_faces: 250000
+  physics: static
+  friction: [0.8, 0.6]
+  restitution: 0.05
+  max_depenetration_velocity: 0.5
+
+outputs:
+  # --- habitat -----------------------------------------------------------------------------
+  mars_one_base:
+    category: habitat
+    source: habitat/mars_one_base
+    exclude: ["^Object_(2|3|4|5|6|7|8|9|10|11|12)$"]
+    scale: 1.0
+
+  mars_one_habitat_row:
+    category: habitat
+    source: habitat/mars_one_base
+    exclude: ["^Object_(2|3|4|5|6|7|8|9|10|11|12|13|14|29|30|31)$"]
+    crop: [-16, -4, -2, 16, 8, 12]
+    scale: 1.0
+
+  # --- power ---------------------------------------------------------------------------------
+  electrical_distribution_cabinet:
+    category: power
+    source: power/electrical_distribution_cabinet
+    target: {height: 2.2}
+
+  pv_tracker_tall:
+    category: power
+    source: power/pv_racks_trackers
+    crop: [880, -340, -10, 1060, -200, 400]
+    target: {height: 2.0}
+    material_overrides:  # cell surface is coplanar with the grey panel slab; push it out and make it read as PV glass
+      0109_DarkSlateBlue: {offset_m: 0.015, base_color: [0.03, 0.04, 0.09], roughness: 0.18, metallic: 0.0}
+
+  pv_rack_fixed:
+    category: power
+    source: power/pv_racks_trackers
+    crop: [190, -195, -10, 360, 5, 200]
+    scale: 0.016  # same shrink as pv_tracker_tall (2.0 / 3.17 of the source's inch scale)
+    material_overrides:  # cell surface is coplanar with the grey panel slab; push it out and make it read as PV glass
+      0109_DarkSlateBlue: {offset_m: 0.015, base_color: [0.03, 0.04, 0.09], roughness: 0.18, metallic: 0.0}
+
+  ring_main_unit_10kv:
+    category: power
+    source: power/ring_main_unit_10kv
+    target: {height: 2.6}
+
+  battery_storage_container:
+    category: power
+    source: power/box_energy_storage
+    # z from 19: drops the source's plinth (an open two-walled shell, z 1.7-20.1 in source units, that read as the
+    # unit floating); the container body has its own closed floor at 20.1 and now stands on the graded pad
+    crop: [-150, 1690, 19, -50, 1905, 400]
+    target: {longest: 6.06}
+
+  orbital_replacement_unit:
+    category: power
+    source: power/nasa_orbital_replacement_unit
+    target: {longest: 0.45}
+    physics: dynamic
+    mass_kg: 1.0  # kept light for reliable holding
+    top_handle: {axis: X}  # captive lifting collar; jaws close along X (spawn yaw 90 puts that across the approach). The head takes the lift and the collar below stops the load rolling out of the slot
+
+  # One output per ORU in the scene: the same unit, each with its own identification label (Data Matrix + S/N,
+  # NASA-STD-6002). The installed ones sit in the PDUs' bays, the spare on the depot stand.
+  oru_0417: {like: orbital_replacement_unit, serial_label: ORU-0417, no_collision: [serial_label]}
+  oru_0211: {like: orbital_replacement_unit, serial_label: ORU-0211, no_collision: [serial_label]}
+  oru_0233: {like: orbital_replacement_unit, serial_label: ORU-0233, no_collision: [serial_label]}
+  oru_0258: {like: orbital_replacement_unit, serial_label: ORU-0258, no_collision: [serial_label]}
+  oru_0272: {like: orbital_replacement_unit, serial_label: ORU-0272, no_collision: [serial_label]}  # battery unit (BCDU role)
+  oru_0285: {like: orbital_replacement_unit, serial_label: ORU-0285, no_collision: [serial_label]}  # ISRU yard unit
+
+  # --- comms ---------------------------------------------------------------------------------
+  industrial_antenna:
+    category: comms
+    source: comms/industrial_antenna
+    exclude: ["^pPlane1"]
+    target: {height: 7.0}
+
+  bts_antennas:
+    category: comms
+    source: comms/bts_antennas
+    target: {height: 2.0}
+
+  radome:
+    category: comms
+    source: comms/nasa_radome
+    target: {height: 4.0}
+
+  # --- landers -------------------------------------------------------------------------------
+  starship_hls:
+    category: landers
+    source: landers/starship_s25
+    crop: [-50, -50, 57.5, 50, 50, 130]
+    target: {height: 50.0}
+
+  # --- logistics -----------------------------------------------------------------------------
+  sli_cargo_carrier:
+    category: logistics
+    source: logistics/nasa_sli_carrier
+    target: {longest: 2.5}
+
+  cargo_crate:
+    category: logistics
+    source: logistics/scifi_crate_1
+    target: {longest: 0.45}
+    physics: dynamic
+    mass_kg: 1.0  # kept light for reliable holding
+    top_handle: {axis: Y}  # spawn yaw 0: jaws close along local Y; same captive collar
+    serial_label: CRT-0112  # cargo transfer tag, same label form as the ORUs
+    no_collision: [serial_label]
+
+  # Look-alike logistics containers: the cargo crate's shape and handle, its texture tinted so each reads as its own
+  # kind at a glance. ~1 kg like every carried item here.
+  consumables_container:  # a sci-fi supply case, its own kind (not a recoloured crate), carried by the standard handle
+    category: logistics
+    source: logistics/scifi_crate_2
+    target: {longest: 0.45}
+    physics: dynamic
+    mass_kg: 1.0
+    top_handle: {axis: Y}  # as the crate: the long side across the approach, so the tool reaches in over the short one
+    serial_label: CNS-0301
+    no_collision: [serial_label]
+
+  # Each serviced unit type's own replaceable module, all carried by the standard handle:
+  # the battery storage unit's battery module and the ISRU plant's filter cartridge. ~1 kg look-alikes (stated).
+  # at its own height again (0.262 m): the 1.40 stretch (to 0.367 m) raised its handle within reach from the cradle's
+  # stand, but every neck now sits at the ORU's height above the item's base by its column
+  # (blender_process.py `neck_above_base_m`), and the stretched body left a 0.10 m column: the palm rode just above the
+  # lid and rubbed it while carried (the ORU's column is 0.205 m).
+  bat_0101: {category: power, source: power/scifi_power_battery, target: {longest: 0.42}, physics: dynamic, mass_kg: 1.0,
+             top_handle: {axis: Y}, serial_label: BAT-0101, no_collision: [serial_label]}
+  bat_0102: {like: bat_0101, serial_label: BAT-0102}
+  # the same modules with one data plate on the crown in front of the column, where the scan view reads it (the plates
+  # above sat low on the body's far ends and did not decode); geometry, mass, handle and serials unchanged.
+  # New paths so simulations running with the originals are untouched; a run picks them with SRB_LB_USD_OVERRIDE.
+  bat_0101_v2: {like: bat_0101, serial_label: BAT-0101, serial_label_seat: front}
+  bat_0102_v2: {like: bat_0101, serial_label: BAT-0102, serial_label_seat: front}
+  flt_0201: {category: isru, source_root: authored, source: filter_cartridge, scale: 1.0, physics: dynamic, mass_kg: 1.0,
+             top_handle: {axis: X}, serial_label: FLT-0201, no_collision: [serial_label]}
+  flt_0202: {like: flt_0201, serial_label: FLT-0202}
+  # enclosures from the collected set, the interaction faces authored on them (props below)
+  bms_enclosure: {category: power, source: power/power_box_01, target: {height: 0.50}}
+  plant_controller: {category: isru, source: power/utility_box_02, target: {height: 1.12}}
+  o2_bottle: {category: isru, source: isru/gas_bottles_set, exclude: ["fire", "dirt"], target: {height: 1.40}}  # ISRU product storage, dressing
+  return_container: {like: cargo_crate, serial_label: RTN-0007, no_collision: [serial_label], material_overrides: {"^base$": {tint: [1.0, 0.62, 0.3]}}}
+
+  # --- isru ----------------------------------------------------------------------------------
+  rassor_excavator:
+    category: isru
+    source: isru/nasa_rassor
+    target: {longest: 1.8}
+    max_faces: 150000
+
+  chemical_tank_skid:
+    category: isru
+    source: isru/chemical_tank_skid
+    scale: 1.0
+
+  cable_reels:
+    category: isru
+    source: isru/cable_reels
+    exclude: ["^Object_2"]
+    crop: [-100, -100, 0.85, 100, 100, 100]  # drops the grass base baked into each reel mesh
+    target: {height: 1.4}
+
+  light_tower:
+    category: isru
+    source: isru/light_tower
+    scale: 1.0
+
+  # --- dock ----------------------------------------------------------------------------------
+  rover_charging_station:
+    category: dock
+    source: dock/charging_station_set
+    exclude: ["^Material3\\.001$", "^Material2\\.021$", "^Material3\\.002$"]
+    crop: [-300, -80, -5, -140, 120, 300]
+    target: {height: 2.2}
+
+  # --- vehicles ------------------------------------------------------------------------------
+  mmsev_crew_rover:
+    category: vehicles
+    source: vehicles/mmsev
+    target: {longest: 1.6}  # user: parked rovers about LunarBot size (1.32 x 1.05 m)
+    max_faces: 200000
+
+  exomars_rover:
+    category: vehicles
+    source: vehicles/exomars_rover
+    target: {longest: 1.5}
+
+  # --- props authored by process/author_props.py (CC0, this project) -------------------------------
+  staging_stand:
+    category: props
+    source_root: authored
+    source: staging_stand
+    keep_origin: true
+    scale: 1.0
+
+  receiving_stand:
+    category: props
+    source_root: authored
+    source: receiving_stand
+    keep_origin: true
+    scale: 1.0
+
+  pdu_service_panel:
+    category: props
+    source_root: authored
+    source: pdu_service_panel
+    keep_origin: true
+    scale: 1.0
+
+  pdu_service_shelf:
+    category: props
+    source_root: authored
+    source: pdu_service_shelf
+    keep_origin: true
+    scale: 1.0
+
+  pdu_oru_bay:  # the same tray as the service shelf, 0.75 m deep (process/author_props.py)
+    category: props
+    source_root: authored
+    source: pdu_oru_bay
+    keep_origin: true
+    scale: 1.0
+
+  bms_panel: {category: props, source_root: authored, source: bms_panel, keep_origin: true, scale: 1.0}
+  plant_panel: {category: props, source_root: authored, source: plant_panel, keep_origin: true, scale: 1.0}
+  battery_cradle: {category: props, source_root: authored, source: battery_cradle, keep_origin: true, scale: 1.0}
+  filter_cradle: {category: props, source_root: authored, source: filter_cradle, keep_origin: true, scale: 1.0}
+  hvac_condenser: {category: props, source_root: authored, source: hvac_condenser, keep_origin: true, scale: 1.0, no_collision: ["cover_closed"]}
+
+  pdu_radiator:
+    category: props
+    source_root: authored
+    source: pdu_radiator
+    keep_origin: true
+    scale: 1.0
+    no_collision: ["cover_closed"]  # the drawn shutter is a look the task shows or hides, not a body
+

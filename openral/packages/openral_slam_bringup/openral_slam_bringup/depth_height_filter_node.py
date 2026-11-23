@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""Filter metric depth to a robot-derived height band before nvblox mapping.
+
+nvblox's ``static_occupancy_grid`` is the backend-agnostic ``/map``
+OpenRAL gives Nav2 and the dashboard. Isaac ROS nvblox 4.4 applies
+``static_mapper.workspace_bounds_*`` to TSDF integration, but the static
+occupancy camera integrator still projects all depth returns into 2D. A
+forward/downward camera therefore marks the floor as occupied.
+
+This node removes depth pixels outside the robot's navigation body height before
+nvblox receives them. The band is derived from the loaded ``RobotDescription``
+and shifted by the live ``global_frame -> base_frame`` TF, so a robot with the
+same measurements works across scenes whose map-frame floor height differs. The
+output remains a standard ``32FC1`` depth image plus ``CameraInfo``; nvblox then
+builds a floor-excluded 2D obstacle grid.
+"""
+
+from __future__ import annotations
+
+import math
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any
+
+__all__ = [
+    "RobotRelativeHeightBand",
+    "derive_robot_relative_height_band",
+    "filter_depth_by_global_height",
+    "main",
+    "quaternion_to_matrix_z_row",
+]
+
+
+@dataclass(frozen=True)
+class RobotRelativeHeightBand:
+    """Navigation-relevant vertical band in the robot ``base_frame``."""
+
+    min_z_m: float
+    max_z_m: float
+    source: str
+
+
+def quaternion_to_matrix_z_row(
+    x: float, y: float, z: float, w: float
+) -> tuple[float, float, float]:
+    """Return the third row of the rotation matrix for quaternion ``(x, y, z, w)``.
+
+    The height filter only needs the global-frame z coordinate of each projected
+    depth point, so computing the full 3x3 matrix would be unnecessary.
+    """
+    return (
+        2.0 * (x * z - w * y),
+        2.0 * (y * z + w * x),
+        1.0 - 2.0 * (x * x + y * y),
+    )
+
+
+def _rpy_to_matrix(roll: float, pitch: float, yaw: float) -> tuple[tuple[float, float, float], ...]:
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    return (
+        (cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr),
+        (sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr),
+        (-sp, cp * sr, cp * cr),
+    )
+
+
+def _mat_vec(
+    r: tuple[tuple[float, float, float], ...],
+    v: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (
+        r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2],
+        r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2],
+        r[2][0] * v[0] + r[2][1] * v[1] + r[2][2] * v[2],
+    )
+
+
+def _mat_mul(
+    a: tuple[tuple[float, float, float], ...],
+    b: tuple[tuple[float, float, float], ...],
+) -> tuple[tuple[float, float, float], ...]:
+    cols = ((b[0][0], b[1][0], b[2][0]), (b[0][1], b[1][1], b[2][1]), (b[0][2], b[1][2], b[2][2]))
+    return tuple(tuple(sum(row[i] * col[i] for i in range(3)) for col in cols) for row in a)  # type: ignore[return-value] # reason: tuple comprehension has fixed 3x3 shape.
+
+
+def _vec_add(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def _compose(
+    parent_r: tuple[tuple[float, float, float], ...],
+    parent_t: tuple[float, float, float],
+    child_r: tuple[tuple[float, float, float], ...],
+    child_t: tuple[float, float, float],
+) -> tuple[tuple[tuple[float, float, float], ...], tuple[float, float, float]]:
+    return _mat_mul(parent_r, child_r), _vec_add(parent_t, _mat_vec(parent_r, child_t))
+
+
+def _urdf_root_seed(
+    description: Any,
+) -> tuple[str, tuple[tuple[tuple[float, float, float], ...], tuple[float, float, float]]] | None:
+    """The manifest's declared ``base_frame -> urdf root`` bridge, if it has one.
+
+    ``joints`` only enumerates *movable* joints, so a manifest whose URDF root
+    differs from ``base_frame`` (UR's ``ur5e_base_link`` over ``base_link``,
+    Franka's ``base_link`` over ``panda_link0``) leaves that root outside the
+    chain. ``assets.urdf.root_frame`` + ``assets.urdf.base_to_root_xyz_rpy``
+    carry that transform — the same static TF ``deploy_e2e.launch.py`` publishes,
+    kept consistent with the band derivation here.
+    """
+    assets = getattr(description, "assets", None)
+    urdf = getattr(assets, "urdf", None) if assets is not None else None
+    if urdf is None:
+        return None
+    root_frame = getattr(urdf, "root_frame", None)
+    xyz_rpy = getattr(urdf, "base_to_root_xyz_rpy", None)
+    if root_frame is None or xyz_rpy is None:
+        return None
+    x, y, z, roll, pitch, yaw = (float(v) for v in xyz_rpy)
+    return str(root_frame), (_rpy_to_matrix(roll, pitch, yaw), (x, y, z))
+
+
+def _link_transforms_at_zero(
+    description: Any,
+) -> dict[str, tuple[tuple[tuple[float, float, float], ...], tuple[float, float, float]]]:
+    identity = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    transforms: dict[
+        str, tuple[tuple[tuple[float, float, float], ...], tuple[float, float, float]]
+    ] = {str(description.base_frame): (identity, (0.0, 0.0, 0.0))}
+    # ``joints`` enumerates only the robot's *movable* joints, so a rigid mount
+    # — a Franka hand on the flange, a bimanual rig's arm pedestals — is not in
+    # it. ``fixed_attachments`` carries exactly that connectivity, with the same
+    # ``parent_link`` / ``child_link`` / ``origin_xyz`` / ``origin_rpy`` fields
+    # and the same zero-configuration convention, so it walks identically. This
+    # is the same union the safety kernel's collision tree is built from
+    # (``openral_safety.envelope_loader``), which is what keeps the height band
+    # measuring the same robot the kernel checks.
+    pending = [*description.joints, *(getattr(description, "fixed_attachments", None) or ())]
+    # The chain stays normative: seed the URDF-root bridge only for a root the
+    # chain does not place itself, so a manifest that articulates its root can
+    # never be overridden by the static transform.
+    root_seed = _urdf_root_seed(description)
+    if root_seed is not None:
+        chain_placed = {str(description.base_frame)} | {str(j.child_link) for j in pending}
+        if root_seed[0] not in chain_placed:
+            transforms[root_seed[0]] = root_seed[1]
+    progressed = True
+    while pending and progressed:
+        progressed = False
+        rest = []
+        for joint in pending:
+            parent = transforms.get(str(joint.parent_link))
+            if parent is None:
+                rest.append(joint)
+                continue
+            jr = _rpy_to_matrix(*[float(v) for v in joint.origin_rpy])
+            jt = tuple(float(v) for v in joint.origin_xyz)
+            transforms[str(joint.child_link)] = _compose(parent[0], parent[1], jr, jt)  # type: ignore[arg-type] # reason: JointSpec origin_xyz is a fixed 3-tuple.
+            progressed = True
+        pending = rest
+    return transforms
+
+
+def _footprint_body_height_m(description: Any) -> float | None:
+    if description.footprint_polygon:
+        xs = [float(p[0]) for p in description.footprint_polygon]
+        ys = [float(p[1]) for p in description.footprint_polygon]
+        return max(max(xs) - min(xs), max(ys) - min(ys))
+    if description.footprint_radius is not None:
+        return 2.0 * float(description.footprint_radius)
+    return None
+
+
+def _shape_z_span_m(
+    shape: Any,
+    rotation: tuple[tuple[float, float, float], ...],
+    center_z_m: float,
+    *,
+    link_name: str,
+) -> tuple[float, float]:
+    """Exact world-frame ``(z_min, z_max)`` of one convex collision primitive.
+
+    Closed-form projection onto world z, no radius approximation:
+
+    * ``sphere`` — ``center_z +/- radius_m``, orientation-free.
+    * ``capsule`` — half-span ``|R[2][2]| * length_m / 2 + radius_m`` along local +Z.
+    * ``box`` — OBB support projection ``sum_k |R[2][k]| * half_extents_m[k]``.
+
+    A box has no radius; the inscribed surrogate hides obstacles (shrinks the
+    band), the circumscribed one drags the lower edge through the floor
+    (grows it) — hence the exact span.
+
+    Raises:
+        ROSConfigError: If ``shape`` is not a shape this band understands —
+            never falls back to a default span (would silently drop obstacles).
+    """
+    kind = str(getattr(shape, "shape", ""))
+    if kind == "sphere":
+        radius = float(shape.radius_m)
+        return (center_z_m - radius, center_z_m + radius)
+    if kind == "capsule":
+        radius = float(shape.radius_m)
+        half_span = abs(rotation[2][2]) * float(shape.length_m) * 0.5 + radius
+        return (center_z_m - half_span, center_z_m + half_span)
+    if kind == "box":
+        hx, hy, hz = (float(v) for v in shape.half_extents_m)
+        half_span = abs(rotation[2][0]) * hx + abs(rotation[2][1]) * hy + abs(rotation[2][2]) * hz
+        return (center_z_m - half_span, center_z_m + half_span)
+
+    from openral_core import ROSConfigError
+
+    raise ROSConfigError(
+        f"link {link_name!r} declares collision shape {kind or type(shape).__name__!r}, "
+        "which the nvblox height band cannot measure; supported shapes are "
+        "'sphere', 'capsule', 'box'"
+    )
+
+
+def _collision_z_extent_m(description: Any) -> tuple[float, float] | None:
+    """World-frame ``(z_min, z_max)`` over every declared collision volume.
+
+    Returns ``None`` only when the manifest declares **no** collision geometry
+    at all — the documented sparse-geometry case the ``min_body_height_m``
+    floor exists for. A manifest that declares geometry the derivation cannot
+    place raises instead of quietly measuring the subset it can reach; see
+    ``derive_robot_relative_height_band``.
+    """
+    transforms = _link_transforms_at_zero(description)
+    z_values: list[float] = []
+    unplaceable: list[str] = []
+    for geom in description.collision_geometry:
+        link_tf = transforms.get(str(geom.link_name))
+        if link_tf is None:
+            unplaceable.append(str(geom.link_name))
+            continue
+        link_r, link_t = link_tf
+        ox, oy, oz, roll, pitch, yaw = (float(v) for v in geom.origin_xyz_rpy)
+        geom_r, geom_t = _compose(link_r, link_t, _rpy_to_matrix(roll, pitch, yaw), (ox, oy, oz))
+        z_values.extend(
+            _shape_z_span_m(geom.shape, geom_r, geom_t[2], link_name=str(geom.link_name))
+        )
+    if unplaceable:
+        from openral_core import ROSConfigError
+
+        total = len(list(description.collision_geometry))
+        raise ROSConfigError(
+            f"{len(unplaceable)} of {total} collision volumes cannot be placed relative to "
+            f"base_frame {str(description.base_frame)!r}: link(s) "
+            f"{sorted(set(unplaceable))} are reachable through neither the manifest's "
+            "'joints' chain nor its 'assets.urdf.root_frame' / 'base_to_root_xyz_rpy' "
+            "bridge. The nvblox height band would silently cover only the volumes it "
+            "could reach, so it refuses instead: declare the missing link placement in "
+            "the manifest, or set the node's explicit 'min_height_m'/'max_height_m' "
+            "override."
+        )
+    if not z_values:
+        return None
+    return min(z_values), max(z_values)
+
+
+def derive_robot_relative_height_band(
+    description: Any,
+    *,
+    floor_clearance_m: float = 0.10,
+    min_body_height_m: float = 0.30,
+) -> RobotRelativeHeightBand:
+    """Derive the depth-retention band from robot measurements.
+
+    Lower edge = robot-relative floor + ``floor_clearance_m``. Upper edge =
+    measured body height from footprint + collision/link geometry (each
+    shape's exact z span via ``_shape_z_span_m``, placed by
+    ``_link_transforms_at_zero``). Relative to ``base_frame``; the node
+    shifts it into ``global_frame`` via live TF per frame.
+    ``min_body_height_m`` is the floor for a manifest with **no** collision
+    geometry — not a fallback for geometry that failed to place.
+
+    Raises:
+        ValueError: If ``floor_clearance_m`` is negative, or
+            ``min_body_height_m`` does not exceed it.
+        ROSConfigError: If the manifest declares an unmeasurable shape or an
+            unplaceable collision volume — refuses rather than silently
+            reporting a partial band as if it covered the whole robot.
+    """
+    if floor_clearance_m < 0.0:
+        raise ValueError(f"floor_clearance_m must be non-negative, got {floor_clearance_m}")
+    if min_body_height_m <= floor_clearance_m:
+        raise ValueError(
+            "min_body_height_m must exceed floor_clearance_m "
+            f"(got {min_body_height_m} <= {floor_clearance_m})"
+        )
+
+    collision_extent = _collision_z_extent_m(description)
+    footprint_height = _footprint_body_height_m(description)
+
+    floor_z = min(0.0, collision_extent[0]) if collision_extent is not None else 0.0
+    measured_max = floor_z + min_body_height_m
+    sources = ["minimum"]
+    if footprint_height is not None:
+        measured_max = max(measured_max, floor_z + footprint_height)
+        sources.append("footprint")
+    if collision_extent is not None:
+        measured_max = max(measured_max, collision_extent[1])
+        sources.append("collision_geometry")
+
+    min_z = floor_z + floor_clearance_m
+    if measured_max <= min_z:
+        measured_max = min_z + min_body_height_m
+    return RobotRelativeHeightBand(min_z_m=min_z, max_z_m=measured_max, source="+".join(sources))
+
+
+def filter_depth_by_global_height(
+    depth_m: Any,
+    *,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    rotation_z_row: tuple[float, float, float],
+    translation_z_m: float,
+    min_height_m: float,
+    max_height_m: float,
+) -> Any:
+    """Zero depth pixels whose back-projected point is outside a global height band.
+
+    Args:
+        depth_m: ``HxW`` float depth image in metres, optical-Z convention.
+        fx: Camera focal length in x, pixels.
+        fy: Camera focal length in y, pixels.
+        cx: Camera principal point x, pixels.
+        cy: Camera principal point y, pixels.
+        rotation_z_row: Third row of the camera-optical-frame to global-frame
+            rotation matrix.
+        translation_z_m: Camera origin z in ``global_frame`` metres.
+        min_height_m: Inclusive minimum allowed global z.
+        max_height_m: Inclusive maximum allowed global z.
+
+    Returns:
+        A contiguous ``float32`` copy where out-of-band or invalid depths are 0.
+
+    Raises:
+        ValueError: If the depth array is not 2-D, intrinsics are invalid, or the
+            height band is inverted.
+    """
+    import numpy as np
+
+    if fx <= 0.0 or fy <= 0.0:
+        raise ValueError(f"invalid pinhole intrinsics: fx={fx}, fy={fy}")
+    if min_height_m > max_height_m:
+        raise ValueError(
+            f"invalid height band: min_height_m={min_height_m} > max_height_m={max_height_m}"
+        )
+
+    depth = np.asarray(depth_m, dtype=np.float32)
+    if depth.ndim != 2:
+        raise ValueError(f"depth must be 2-D HxW, got shape {depth.shape}")
+    h, w = depth.shape
+    u = np.arange(w, dtype=np.float32)[None, :]
+    v = np.arange(h, dtype=np.float32)[:, None]
+    valid = np.isfinite(depth) & (depth > 0.0)
+
+    r20, r21, r22 = rotation_z_row
+    x_opt = ((u - float(cx)) / float(fx)) * depth
+    y_opt = ((v - float(cy)) / float(fy)) * depth
+    z_global = (r20 * x_opt) + (r21 * y_opt) + (r22 * depth) + float(translation_z_m)
+    keep = valid & (z_global >= float(min_height_m)) & (z_global <= float(max_height_m))
+
+    filtered = np.zeros_like(depth, dtype=np.float32)
+    filtered[keep] = depth[keep]
+    return np.ascontiguousarray(filtered)
+
+
+def _depth_array_from_image(msg: Any) -> Any:
+    import numpy as np
+
+    if msg.encoding != "32FC1":
+        raise ValueError(f"unsupported depth encoding {msg.encoding!r}; expected '32FC1'")
+    expected_step = int(msg.width) * 4
+    if int(msg.step) != expected_step:
+        raise ValueError(
+            f"unsupported padded depth rows: step={msg.step}, expected {expected_step}"
+        )
+    return np.frombuffer(bytes(msg.data), dtype=np.float32).reshape(int(msg.height), int(msg.width))
+
+
+def _depth_image_from_array(depth_m: Any, template: Any) -> Any:
+    import numpy as np
+    from sensor_msgs.msg import Image
+
+    arr = np.ascontiguousarray(depth_m, dtype=np.float32)
+    msg = Image()
+    msg.header = deepcopy(template.header)
+    msg.height = int(arr.shape[0])
+    msg.width = int(arr.shape[1])
+    msg.encoding = "32FC1"
+    msg.is_bigendian = 0
+    msg.step = msg.width * 4
+    msg.data = arr.tobytes()
+    return msg
+
+
+def main(args: Any = None) -> None:
+    """Entry point for ``ros2 run openral_slam_bringup depth_height_filter_node.py``."""
+    import rclpy
+    from rclpy.duration import Duration
+    from rclpy.executors import ExternalShutdownException
+    from rclpy.node import Node
+    from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+    from rclpy.time import Time
+    from sensor_msgs.msg import CameraInfo, Image
+    from tf2_ros import Buffer, TransformException, TransformListener
+
+    class DepthHeightFilterNode(Node):  # type: ignore[misc]  # reason: rclpy.node.Node is untyped
+        """ROS node wrapper around ``filter_depth_by_global_height``."""
+
+        def __init__(self) -> None:
+            super().__init__("openral_nvblox_depth_height_filter")
+            self.declare_parameter("input_depth_topic", "/openral/cameras/front_depth/depth/image")
+            self.declare_parameter(
+                "input_camera_info_topic", "/openral/cameras/front_depth/depth/camera_info"
+            )
+            self.declare_parameter("output_depth_topic", "/openral/nvblox/depth_filtered/image")
+            self.declare_parameter(
+                "output_camera_info_topic", "/openral/nvblox/depth_filtered/camera_info"
+            )
+            self.declare_parameter("global_frame", "map")
+            self.declare_parameter("base_frame", "base_link")
+            self.declare_parameter("robot_yaml", "")
+            self.declare_parameter("floor_clearance_m", 0.10)
+            self.declare_parameter("min_body_height_m", 0.30)
+            self.declare_parameter("min_height_m", float("nan"))
+            self.declare_parameter("max_height_m", float("nan"))
+            self.declare_parameter("tf_timeout_ms", 50)
+
+            gp = self.get_parameter
+            self._global_frame = gp("global_frame").get_parameter_value().string_value
+            self._base_frame = gp("base_frame").get_parameter_value().string_value
+            self._floor_clearance = gp("floor_clearance_m").get_parameter_value().double_value
+            self._min_body_height = gp("min_body_height_m").get_parameter_value().double_value
+            self._override_min_height = gp("min_height_m").get_parameter_value().double_value
+            self._override_max_height = gp("max_height_m").get_parameter_value().double_value
+            self._tf_timeout = Duration(
+                seconds=gp("tf_timeout_ms").get_parameter_value().integer_value / 1000.0
+            )
+            self._relative_band: RobotRelativeHeightBand | None = None
+            robot_yaml = gp("robot_yaml").get_parameter_value().string_value
+            if robot_yaml:
+                from openral_core import RobotDescription
+
+                description = RobotDescription.from_yaml(robot_yaml)
+                self._base_frame = description.base_frame
+                self._global_frame = description.map_frame
+                self._relative_band = derive_robot_relative_height_band(
+                    description,
+                    floor_clearance_m=self._floor_clearance,
+                    min_body_height_m=self._min_body_height,
+                )
+            if math.isfinite(self._override_min_height) != math.isfinite(self._override_max_height):
+                raise RuntimeError("min_height_m and max_height_m overrides must be set together")
+            self._latest_info: CameraInfo | None = None
+            self._warned_no_info = False
+
+            self._tf_buffer = Buffer()
+            self._tf_listener = TransformListener(self._tf_buffer, self)
+
+            sensor_qos = QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=5,
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            )
+            info_qos = QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            )
+            self._depth_pub = self.create_publisher(
+                Image, gp("output_depth_topic").get_parameter_value().string_value, sensor_qos
+            )
+            self._info_pub = self.create_publisher(
+                CameraInfo,
+                gp("output_camera_info_topic").get_parameter_value().string_value,
+                info_qos,
+            )
+            self._info_sub = self.create_subscription(
+                CameraInfo,
+                gp("input_camera_info_topic").get_parameter_value().string_value,
+                self._on_camera_info,
+                info_qos,
+            )
+            self._depth_sub = self.create_subscription(
+                Image,
+                gp("input_depth_topic").get_parameter_value().string_value,
+                self._on_depth,
+                sensor_qos,
+            )
+            band_desc = (
+                f"override {self._global_frame} z="
+                f"[{self._override_min_height:.2f}, {self._override_max_height:.2f}]"
+                if math.isfinite(self._override_min_height)
+                else (
+                    f"robot-relative {self._base_frame} z="
+                    f"[{self._relative_band.min_z_m:.2f}, {self._relative_band.max_z_m:.2f}] "
+                    f"({self._relative_band.source})"
+                    if self._relative_band is not None
+                    else f"fallback live {self._base_frame}/camera height"
+                )
+            )
+            self.get_logger().info(
+                "depth_height_filter: "
+                f"{gp('input_depth_topic').get_parameter_value().string_value} -> "
+                f"{gp('output_depth_topic').get_parameter_value().string_value} "
+                f"({band_desc})"
+            )
+
+        def _on_camera_info(self, msg: CameraInfo) -> None:
+            self._latest_info = msg
+
+        def _lookup_or_latest(self, source_frame: str, stamp: Any) -> Any:
+            """``global_frame`` ← ``source_frame`` at ``stamp``, else the latest.
+
+            Visual odometry (cuVSLAM) publishes ``map → odom`` slightly behind the
+            camera stamp, so an exact-stamp lookup extrapolates into the future and
+            drops the frame — starving nvblox. Fall back to the latest available
+            transform (``Time()``); a sub-100 ms-stale pose is negligible at the
+            map's voxel size and keeps the occupancy grid building.
+            """
+            try:
+                return self._tf_buffer.lookup_transform(
+                    self._global_frame, source_frame, Time.from_msg(stamp), timeout=self._tf_timeout
+                )
+            except TransformException:
+                return self._tf_buffer.lookup_transform(
+                    self._global_frame, source_frame, Time(), timeout=self._tf_timeout
+                )
+
+        def _on_depth(self, msg: Image) -> None:
+            if self._latest_info is None:
+                if not self._warned_no_info:
+                    self.get_logger().warning("skip depth frame: no CameraInfo received yet")
+                    self._warned_no_info = True
+                return
+
+            info = self._latest_info
+            try:
+                depth = _depth_array_from_image(msg)
+            except ValueError as exc:
+                self.get_logger().warning(f"skip depth frame: {exc}")
+                return
+
+            try:
+                transform = self._lookup_or_latest(msg.header.frame_id, msg.header.stamp)
+            except TransformException as exc:
+                self.get_logger().warning(f"skip depth frame: TF lookup failed: {exc}")
+                return
+
+            q = transform.transform.rotation
+            t = transform.transform.translation
+            try:
+                min_height_m = self._override_min_height
+                max_height_m = self._override_max_height
+                if not math.isfinite(min_height_m):
+                    base_transform = self._lookup_or_latest(self._base_frame, msg.header.stamp)
+                    base_z = float(base_transform.transform.translation.z)
+                    if self._relative_band is not None:
+                        min_height_m = base_z + self._relative_band.min_z_m
+                        max_height_m = base_z + self._relative_band.max_z_m
+                        max_height_m = max(max_height_m, float(t.z) + self._floor_clearance)
+                    else:
+                        min_height_m = base_z + self._floor_clearance
+                        max_height_m = max(
+                            base_z + self._min_body_height,
+                            float(t.z) + self._floor_clearance,
+                        )
+                filtered = filter_depth_by_global_height(
+                    depth,
+                    fx=float(info.k[0]),
+                    fy=float(info.k[4]),
+                    cx=float(info.k[2]),
+                    cy=float(info.k[5]),
+                    rotation_z_row=quaternion_to_matrix_z_row(q.x, q.y, q.z, q.w),
+                    translation_z_m=float(t.z),
+                    min_height_m=min_height_m,
+                    max_height_m=max_height_m,
+                )
+            except (TransformException, ValueError) as exc:
+                self.get_logger().warning(f"skip depth frame: {exc}")
+                return
+
+            out_info = deepcopy(info)
+            out_info.header.stamp = msg.header.stamp
+            out_info.header.frame_id = msg.header.frame_id
+            self._depth_pub.publish(_depth_image_from_array(filtered, msg))
+            self._info_pub.publish(out_info)
+
+    rclpy.init(args=args)
+    node = DepthHeightFilterNode()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

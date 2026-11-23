@@ -1,0 +1,36 @@
+{
+ "cover_button": {
+  "type": "press",
+  "xyz": [
+   0.44199999999999995,
+   0.79,
+   0.78
+  ],
+  "normal": [
+   1,
+   0,
+   0
+  ],
+  "interface": {
+   "kind": "mushroom_button",
+   "cap_radius_m": 0.032,
+   "cap_centre_height_m": 0.039999999999999994,
+   "collar_radius_m": 0.036,
+   "collar_top_height_m": 0.02,
+   "travel_m": 0.01
+  }
+ },
+ "condenser": {
+  "type": "indicator",
+  "xyz": [
+   0.37,
+   0.0,
+   0.78
+  ],
+  "normal": [
+   1,
+   0,
+   0
+  ]
+ }
+}

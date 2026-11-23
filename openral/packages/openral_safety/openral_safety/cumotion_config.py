@@ -1,0 +1,310 @@
+"""cuRobo robot-config emission from the lowered safety collision model.
+
+cuMotion's planner (cuRobo) represents each link's collision volume as a set of
+**spheres**, while the OpenRAL safety kernel lowers links to **capsules/spheres**.
+To keep plan-time (cuMotion) and kernel-time collision geometry
+consistent — a single source of truth — this module derives cuRobo collision
+spheres directly from the same lowered capsule geometry, by sampling spheres
+along each capsule's central segment.
+
+Pure module: no ROS, no cuRobo import, no I/O. The only heavy dependency
+(``numpy``) is pulled in lazily by the reused capsule→segment helper.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import yaml
+from openral_core import BoxShape, CapsuleShape, JointType, LinkCollisionGeometry, SphereShape
+
+if TYPE_CHECKING:
+    from openral_core import RobotDescription
+
+    from openral_safety.urdf_lowering import LoweredCollisionModel
+
+# Fit plan-time spheres to a capsule that CONTAINS the kernel's geometry. cuRobo
+# can only express spheres, so a link that is not one has to be approximated —
+# and for a planner the only safe direction is outward: a planner that believes
+# the arm is thinner than it is emits trajectories the kernel then E-stops.
+# `bounding_capsule_segment` is the shared, over-covering lowering (it replaced
+# `urdf_lowering._capsule_segment_radius`, which modelled a box by its
+# *inscribed* sphere — issue #155).
+from openral_safety.kernel_predicates import bounding_capsule_segment
+
+__all__ = [
+    "CuMotionSphere",
+    "actuated_joint_names",
+    "capsule_to_spheres",
+    "link_collision_spheres",
+    "render_cumotion_config",
+    "sphere_model_geometry",
+    "spheres_for_capsule",
+]
+
+# Single-DOF movable joints cuMotion plans over. FIXED/FLOATING/PLANAR are
+# excluded — fixed joints don't move; floating/planar are multi-DOF and not part
+# of an arm cspace.
+_ACTUATED_JOINT_TYPES = frozenset({JointType.REVOLUTE, JointType.PRISMATIC, JointType.CONTINUOUS})
+
+_Vec3 = tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class CuMotionSphere:
+    """One cuRobo collision sphere in its link frame.
+
+    Attributes:
+        center: ``(x, y, z)`` sphere centre in metres, in the link frame.
+        radius: Sphere radius in metres (the capsule's radius).
+    """
+
+    center: _Vec3
+    radius: float
+
+
+def capsule_to_spheres(p0: _Vec3, p1: _Vec3, radius: float, *, count: int) -> list[CuMotionSphere]:
+    """Sample ``count`` spheres of ``radius`` evenly along the segment ``p0``→``p1``.
+
+    For ``count >= 2`` the spheres include both endpoints (parameters
+    ``t = i / (count - 1)``). For ``count == 1`` a single sphere is placed at the
+    segment midpoint, which collapses to the point itself for a zero-length
+    (sphere) segment.
+
+    Args:
+        p0: Segment start in the link frame.
+        p1: Segment end in the link frame.
+        radius: Sphere radius in metres (must be > 0).
+        count: Number of spheres to emit (must be >= 1).
+
+    Returns:
+        The sampled spheres, ordered from ``p0`` to ``p1``.
+
+    Example:
+        >>> [s.center for s in capsule_to_spheres((0, 0, 0), (1, 0, 0), 0.1, count=3)]
+        [(0.0, 0.0, 0.0), (0.5, 0.0, 0.0), (1.0, 0.0, 0.0)]
+    """
+    if count < 1:
+        raise ValueError(f"count must be >= 1, got {count}")
+    if count == 1:
+        mid: _Vec3 = (
+            (p0[0] + p1[0]) / 2.0,
+            (p0[1] + p1[1]) / 2.0,
+            (p0[2] + p1[2]) / 2.0,
+        )
+        return [CuMotionSphere(center=mid, radius=radius)]
+    spheres: list[CuMotionSphere] = []
+    for i in range(count):
+        t = i / (count - 1)
+        center: _Vec3 = (
+            p0[0] + (p1[0] - p0[0]) * t,
+            p0[1] + (p1[1] - p0[1]) * t,
+            p0[2] + (p1[2] - p0[2]) * t,
+        )
+        spheres.append(CuMotionSphere(center=center, radius=radius))
+    return spheres
+
+
+def spheres_for_capsule(shape: CapsuleShape | SphereShape | BoxShape) -> int:
+    """Number of spheres needed to tile a lowered ``shape`` with spacing <= radius.
+
+    A sphere (or a zero-length capsule) needs exactly one. A capsule of length
+    ``L`` and radius ``r`` needs ``ceil(L / r) + 1`` spheres so adjacent centres
+    sit no more than one radius apart, covering the swept volume. A box is first
+    taken to its bounding capsule (``bounding_capsule_segment``) and counted
+    the same way.
+
+    Example:
+        >>> spheres_for_capsule(CapsuleShape(radius_m=0.05, length_m=0.30))
+        7
+    """
+    if isinstance(shape, SphereShape):
+        return 1
+    if isinstance(shape, BoxShape):
+        p0, p1, radius = bounding_capsule_segment(shape, (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+        length = math.dist(p0, p1)
+        return 1 if length == 0.0 else max(2, math.ceil(length / radius) + 1)
+    if shape.length_m == 0.0:
+        return 1
+    return max(2, math.ceil(shape.length_m / shape.radius_m) + 1)
+
+
+def link_collision_spheres(
+    geom: LinkCollisionGeometry, *, count: int | None = None
+) -> list[CuMotionSphere]:
+    """Lower one link's collision volume to cuRobo spheres in the link frame.
+
+    Takes the link to a capsule that **contains** it
+    (``bounding_capsule_segment``), then samples spheres along that segment.
+    ``count`` defaults to ``spheres_for_capsule``.
+
+    Args:
+        geom: A lowered link collision volume (capsule, sphere or box).
+        count: Optional explicit sphere count; defaults to the radius-spacing
+            heuristic.
+
+    Returns:
+        The link's cuRobo collision spheres.
+    """
+    p0, p1, radius = bounding_capsule_segment(geom.shape, geom.origin_xyz_rpy)
+    n = spheres_for_capsule(geom.shape) if count is None else count
+    return capsule_to_spheres(p0, p1, radius, count=n)
+
+
+def sphere_model_geometry(
+    geoms: list[LinkCollisionGeometry],
+) -> dict[str, LinkCollisionGeometry]:
+    """Each link as the **capsule cuRobo's spheres actually cover**, by link name.
+
+    ``link_collision_spheres`` samples spheres along
+    ``bounding_capsule_segment``, so this is
+    the geometry the planner checks — strictly larger than the kernel's box, and
+    therefore a *different* collision model with a different allowed-collision
+    matrix. Handing it back as ``LinkCollisionGeometry`` lets
+    ``acm_for_geometry`` decide that matrix
+    with the same proof it uses for the kernel's.
+
+    A link that is already a capsule or a sphere is returned unchanged.
+
+    Returns:
+        ``{link_name: geometry}`` where every box has become its bounding capsule.
+    """
+    out: dict[str, LinkCollisionGeometry] = {}
+    for geom in geoms:
+        if not isinstance(geom.shape, BoxShape):
+            out[geom.link_name] = geom
+            continue
+        p0, p1, radius = bounding_capsule_segment(geom.shape, geom.origin_xyz_rpy)
+        dx, dy, dz = (b - a for a, b in zip(p0, p1, strict=True))
+        length = math.sqrt(dx * dx + dy * dy + dz * dz)
+        # A capsule's axis is its local +Z, so name the rotation that sends +Z
+        # there: roll is free (the shape is a surface of revolution), and
+        # `Rz(yaw)·Ry(pitch)` sends +Z to `(cos y·sin p, sin y·sin p, cos p)`.
+        flat = math.hypot(dx, dy)
+        yaw = math.atan2(dy, dx) if flat > 0.0 else 0.0
+        pitch = math.atan2(flat, dz) if length > 0.0 else 0.0
+        out[geom.link_name] = LinkCollisionGeometry(
+            link_name=geom.link_name,
+            shape=CapsuleShape(radius_m=radius, length_m=length),
+            origin_xyz_rpy=(
+                (p0[0] + p1[0]) / 2.0,
+                (p0[1] + p1[1]) / 2.0,
+                (p0[2] + p1[2]) / 2.0,
+                0.0,
+                pitch,
+                yaw,
+            ),
+        )
+    return out
+
+
+def actuated_joint_names(robot: RobotDescription) -> list[str]:
+    """The robot's single-DOF movable joint names, in manifest order.
+
+    These become the cuRobo ``cspace.joint_names`` — the joints the planner
+    solves for. Fixed/floating/planar joints are excluded.
+    """
+    return [j.name for j in robot.joints if j.joint_type in _ACTUATED_JOINT_TYPES]
+
+
+_SPHERE_DP = 6
+
+
+def render_cumotion_config(
+    robot: RobotDescription, model: LoweredCollisionModel, *, urdf_path: str | None = None
+) -> str:
+    """Render a cuRobo ``robot_cfg`` fragment from a lowered collision model.
+
+    Emits the collision geometry cuMotion needs — per-link ``collision_spheres``
+    sampled from the kernel's own lowered capsules, ``self_collision_ignore``
+    from the allowed-collision matrix, and ``cspace.joint_names`` — so plan-time
+    and kernel-time collision geometry share one source of truth.
+    ``retract_config`` and acceleration/jerk limits are planner tuning, not
+    geometry; intentionally left out (the header documents this).
+
+    **The ACM is not simply copied.** The manifest's matrix is decided against
+    the *kernel's* geometry, and the spheres emitted here are strictly larger
+    (``sphere_model_geometry``), so a pair the kernel can separate may be
+    always-colliding for the planner — ``panda_link5``<->``panda_link7`` is
+    exactly that pair: the kernel separates it at exact-hull fidelity (issue
+    #191) while the spheres overlap at **100.00%** of its (joint6, joint7)
+    grid, shallowest by 1.03 mm. Given ``urdf_path``, this re-runs
+    ``acm_for_geometry`` against the sphere
+    geometry and unions it in, so the planner's model stays **looser** than the
+    kernel's — never tighter, the only safe direction for a planner (PR #169).
+    Without it, the manifest's matrix is used as-is and the header says so.
+
+    Args:
+        robot: The robot manifest (provides ``base_frame`` and joints).
+        model: The lowered collision model (capsule geometry + ACM).
+        urdf_path: Concrete on-disk URDF, for re-deriving the ACM against the
+            emitted sphere geometry. Omitted → the manifest ACM alone.
+
+    Returns:
+        A YAML document string with a generated-provenance header.
+    """
+    # The kernel checks the MANIFEST's geometry; `model.collision_geometry` is what the
+    # lowering tool would *write*, a different (looser) solid for a hand-authored box manifest
+    # (`urdf_lowering.lower_link_geometry` still emits a PCA capsule for a mesh collision —
+    # collision-primitive-study 8.5). Prefer the manifest; fall back to the lowered model only
+    # during onboarding, when the manifest has no geometry block yet.
+    geometry = list(robot.collision_geometry or []) or list(model.collision_geometry)
+
+    collision_spheres: dict[str, list[dict[str, object]]] = {}
+    for g in geometry:
+        collision_spheres[g.link_name] = [
+            {
+                "center": [round(c, _SPHERE_DP) for c in s.center],
+                "radius": round(s.radius, _SPHERE_DP),
+            }
+            for s in link_collision_spheres(g)
+        ]
+
+    pairs = {frozenset({a, b}) for a, b in model.allowed_collision_pairs}
+    if urdf_path is not None:
+        from openral_safety.urdf_lowering import acm_for_geometry
+
+        margin = float(getattr(robot.safety, "self_collision_margin_m", 0.0) or 0.0)
+        pairs |= acm_for_geometry(
+            urdf_path,
+            sphere_model_geometry(geometry),
+            srdf_path=None,  # the SRDF's hand-owned rows are already in `pairs`
+            margin_m=margin,
+        )
+
+    ignore: dict[str, set[str]] = {}
+    for pair in pairs:
+        a, b = sorted(pair)
+        ignore.setdefault(a, set()).add(b)
+        ignore.setdefault(b, set()).add(a)
+    self_collision_ignore = {k: sorted(v) for k, v in sorted(ignore.items())}
+
+    cfg: dict[str, object] = {
+        "robot_cfg": {
+            "kinematics": {
+                "base_link": robot.base_frame,
+                "collision_link_names": [g.link_name for g in geometry],
+                "collision_spheres": collision_spheres,
+                "self_collision_ignore": self_collision_ignore,
+                "cspace": {"joint_names": actuated_joint_names(robot)},
+            }
+        }
+    }
+
+    acm_note = (
+        "the kernel's matrix, widened with the pairs proved always-colliding for\n"
+        "# the *sphere* geometry below (a planner may be looser than the kernel, never tighter)"
+        if urdf_path is not None
+        else "the kernel's matrix verbatim — no URDF was given, so pairs that are\n"
+        "# always-colliding for these spheres but separable by the kernel are NOT exempt here"
+    )
+    header = (
+        "# GENERATED by `openral collision lower --emit-cumotion` — do not hand-edit.\n"
+        f"# Source ACM: {model.acm_source}. collision_spheres derive from the same lowered\n"
+        "# geometry the OpenRAL safety kernel checks, over-covered to spheres.\n"
+        f"# self_collision_ignore is {acm_note}.\n"
+        "# retract_config and accel/jerk limits are planner tuning — add + validate vs cuRobo.\n"
+    )
+    return header + yaml.safe_dump(cfg, sort_keys=False)

@@ -1,0 +1,30 @@
+<Solver name="DefaultTestSolver">
+  <FlawFilter component="HorizonFilter" policy="PartiallyContained"/>
+
+  <ThreatManager defaultPriority="0">
+    <FlawHandler component="StandardThreatHandler"/>
+    <!-- a slot token is ordered on its place point once pick/place have fixed which point: ordered first, a pick's
+         freed slot bound its support to whatever point came first -->
+    <FlawHandler component="StandardThreatHandler" class-match="Slot" priority="10"/>
+    <FlawFilter class-match="Reservoir"/>
+  </ThreatManager>
+
+  <OpenConditionManager defaultPriority="0">
+    <FlawHandler component="StandardOpenConditionHandler"/>
+    <!-- press's Stowed condition last, once the plan has fixed what comes before the press (a module swap): decided
+         first, it merged with the initial Stowed fact and the swap then failed deep in the search -->
+    <FlawHandler component="StandardOpenConditionHandler" class-match="Posture" predicate-match="Stowed"
+                 masterPredicate="press" priority="100"/>
+  </OpenConditionManager>
+
+  <UnboundVariableManager defaultPriority="0">
+    <FlawFilter var-match="start"/>
+    <FlawFilter var-match="end"/>
+    <FlawFilter var-match="duration"/>
+    <FlawFilter class-match="Reservoir" var-match="time"/>
+    <FlawFilter class-match="Reservoir" var-match="quantity"/>
+    <FlawFilter class-match="Reusable" var-match="quantity"/>
+    <FlawFilter component="InfiniteDynamicFilter"/>
+    <FlawHandler component="StandardVariableHandler"/>
+  </UnboundVariableManager>
+</Solver>
